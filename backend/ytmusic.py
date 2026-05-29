@@ -1,0 +1,634 @@
+from __future__ import annotations
+
+import re
+import hashlib
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+import yt_dlp
+from ytmusicapi import YTMusic
+
+from . import config
+from .state import read_state, update_state
+from .youtube import _cache_get, _cache_set, _entry_to_item
+from ._cookies import fallback_cookie_opts, get_cookie_opts, handle_cookie_error, pop_cookie_warning, secure_cache_after_write
+
+_MUSIC_SEARCH_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+_BASE_OPTS: dict[str, Any] = {
+    "quiet": True,
+    "skip_download": True,
+    "extract_flat": "in_playlist",
+    "ignoreerrors": True,
+    "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+}
+
+_MUSIC_HEADERS = {
+    "Origin": "https://music.youtube.com",
+    "Referer": "https://music.youtube.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    ),
+}
+_DEFAULT_MUSIC_API_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
+_DEFAULT_MUSIC_CLIENT_VERSION = "1.20240520.01.00"
+
+
+def _opts(extra: dict | None = None) -> dict[str, Any]:
+    merged = {**_BASE_OPTS, **(extra or {})}
+    merged.update(get_cookie_opts())
+    return merged
+
+
+def _flatten(entries: list) -> list[dict]:
+    result = []
+    for e in entries:
+        if not e:
+            continue
+        sub = e.get("entries")
+        if sub:
+            result.extend(x for x in sub if x)
+        else:
+            result.append(e)
+    return result
+
+
+def _to_items(entries: list) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    items = []
+    for e in entries:
+        if not e:
+            continue
+        item = _entry_to_item(e)
+        if not item.get("url") or item["url"] in seen:
+            continue
+        seen.add(item["url"])
+        items.append(item)
+    return items
+
+
+def _cookie_header_from_file(path: str) -> str:
+    cookie_path = Path(path)
+    pairs = []
+    for line in cookie_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("\t")
+        if len(parts) >= 7:
+            domain = parts[0].lstrip(".").lower()
+            if domain not in {"youtube.com", "music.youtube.com"} and not domain.endswith(".youtube.com"):
+                continue
+            pairs.append(f"{parts[5]}={parts[6]}")
+    return "; ".join(pairs)
+
+
+def _cookie_dict_from_file(path: str) -> dict[str, str]:
+    cookies = {}
+    cookie_path = Path(path)
+    for line in cookie_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split("\t")
+        if len(parts) >= 7:
+            cookies[parts[5]] = parts[6]
+    return cookies
+
+
+def _music_cookie_header() -> str:
+    opts = get_cookie_opts()
+    cookiefile = opts.get("cookiefile")
+    if not cookiefile:
+        raise ValueError(
+            "YouTube Music necesita un cookies.txt exportado o un cache privado ya generado. "
+            f"Guarda un archivo Netscape cookies.txt en {config.DATA_DIR / 'cookies'}."
+        )
+    return _cookie_header_from_file(str(cookiefile))
+
+
+def _music_cookiefile() -> str | None:
+    opts = get_cookie_opts()
+    cookiefile = opts.get("cookiefile")
+    if not cookiefile or not Path(str(cookiefile)).exists():
+        return None
+    return str(cookiefile)
+
+
+def _ytmusic_auth_headers() -> dict[str, str] | None:
+    cookiefile = _music_cookiefile()
+    if not cookiefile:
+        return None
+    cookies = _cookie_dict_from_file(cookiefile)
+    sapisid = cookies.get("SAPISID") or cookies.get("__Secure-3PAPISID") or cookies.get("__Secure-1PAPISID")
+    if not sapisid:
+        return None
+    origin = "https://music.youtube.com"
+    timestamp = str(int(time.time()))
+    digest = hashlib.sha1(f"{timestamp} {sapisid} {origin}".encode("utf-8")).hexdigest()
+    auth_cookie_names = {
+        "CONSENT",
+        "SOCS",
+        "SID",
+        "HSID",
+        "SSID",
+        "APISID",
+        "SAPISID",
+        "__Secure-1PAPISID",
+        "__Secure-3PAPISID",
+        "__Secure-1PSID",
+        "__Secure-3PSID",
+        "__Secure-1PSIDTS",
+        "__Secure-3PSIDTS",
+        "__Secure-1PSIDCC",
+        "__Secure-3PSIDCC",
+    }
+    cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items() if name in auth_cookie_names)
+    return {
+        "Cookie": cookie_header,
+        "Authorization": f"SAPISIDHASH {timestamp}_{digest}",
+        "x-origin": origin,
+        "X-Goog-AuthUser": "0",
+    }
+
+
+def _ytmusic_client(prefer_auth: bool = True) -> YTMusic:
+    try:
+        auth = _ytmusic_auth_headers() if prefer_auth else None
+    except Exception:
+        auth = None
+    return YTMusic(auth, language="es", location="EC")
+
+
+def _items_from_ytmusic_home(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    for row in rows:
+        for content in row.get("contents", []):
+            video_id = content.get("videoId")
+            playlist_id = content.get("playlistId")
+            browse_id = content.get("browseId")
+            uid = video_id or playlist_id or browse_id
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            thumbnails = content.get("thumbnails") or []
+            thumb = thumbnails[-1].get("url") if thumbnails else ""
+            if video_id:
+                url = f"https://music.youtube.com/watch?v={video_id}"
+            elif playlist_id:
+                url = f"https://music.youtube.com/playlist?list={playlist_id}"
+            else:
+                url = f"https://music.youtube.com/browse/{browse_id}"
+            items.append({
+                "id": uid,
+                "url": url,
+                "title": content.get("title") or "YouTube Music",
+                "channel": content.get("artists", [{}])[0].get("name") if content.get("artists") else content.get("description") or row.get("title") or "YouTube Music",
+                "channelUrl": None,
+                "duration": None,
+                "durationText": content.get("duration") or "--:--",
+                "thumbnail": thumb,
+                "viewCount": None,
+                "live": False,
+            })
+            if len(items) >= 40:
+                return items
+    return items
+
+
+def _playlists_from_ytmusicapi(playlists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    for playlist in playlists:
+        playlist_id = playlist.get("playlistId") or playlist.get("browseId")
+        if not playlist_id:
+            continue
+        thumbnails = playlist.get("thumbnails") or []
+        items.append({
+            "id": playlist_id,
+            "title": playlist.get("title") or "Playlist",
+            "url": f"https://music.youtube.com/playlist?list={playlist_id}",
+            "count": playlist.get("count") or playlist.get("trackCount") or 0,
+            "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+        })
+    return items
+
+
+def music_playlist_queue(playlist_id: str, limit: int = 100) -> dict[str, Any]:
+    """Resolve a YouTube Music playlist/mix into playable queue items."""
+    ytmusic = _ytmusic_client(prefer_auth=True)
+    errors: list[str] = []
+    title = "Playlist"
+    tracks: list[dict[str, Any]] = []
+
+    try:
+        data = ytmusic.get_playlist(playlist_id, limit=limit)
+        title = data.get("title") or title
+        tracks = data.get("tracks") or []
+    except Exception as exc:
+        errors.append(str(exc))
+
+    if not tracks:
+        try:
+            data = ytmusic.get_watch_playlist(playlistId=playlist_id, limit=limit)
+            title = data.get("title") or title
+            tracks = data.get("tracks") or []
+        except Exception as exc:
+            errors.append(str(exc))
+
+    items = [_track_to_queue_item(track) for track in tracks]
+    items = [item for item in items if item.get("url")]
+    if items:
+        return {"items": items, "title": title, "source": "ytmusic", "requiresLogin": False, "error": ""}
+
+    special = playlist_id in {"LM", "SE"} or playlist_id.startswith("RDTMAK")
+    message = (
+        "No se pudo leer esta playlist de YouTube Music. "
+        "Inicia sesion en el perfil Playzi con scripts\\login-youtube.ps1 y vuelve a intentar."
+        if special
+        else "No se encontraron canciones reproducibles en esta playlist de YouTube Music."
+    )
+    return {
+        "items": [],
+        "title": title,
+        "source": "ytmusic",
+        "requiresLogin": special,
+        "error": message,
+        "debug": errors[-2:],
+    }
+
+
+def _track_to_queue_item(track: dict[str, Any]) -> dict[str, Any]:
+    video_id = track.get("videoId")
+    thumbs = track.get("thumbnails") or track.get("thumbnail") or []
+    artists = track.get("artists") or []
+    artist_text = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+    if not artist_text and track.get("artist"):
+        artist_text = str(track["artist"])
+    return {
+        "id": video_id or "",
+        "title": track.get("title") or video_id or "Cancion",
+        "url": f"https://music.youtube.com/watch?v={video_id}" if video_id else "",
+        "thumbnail": thumbs[-1].get("url") if thumbs else "",
+        "channel": artist_text or "YouTube Music",
+        "durationText": track.get("duration") or track.get("length") or "--:--",
+    }
+
+
+def _music_context(client_version: str = "1.20240520.01.00") -> dict[str, Any]:
+    return {
+        "client": {
+            "clientName": "WEB_REMIX",
+            "clientVersion": client_version,
+            "hl": "es",
+            "gl": "EC",
+        }
+    }
+
+
+def _extract_initial_music_config(html: str) -> tuple[str, str]:
+    key_match = re.search(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"', html)
+    version_match = re.search(r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"', html)
+    if not key_match:
+        return _DEFAULT_MUSIC_API_KEY, _DEFAULT_MUSIC_CLIENT_VERSION
+    return key_match.group(1), version_match.group(1) if version_match else _DEFAULT_MUSIC_CLIENT_VERSION
+
+
+def _music_browse(browse_id: str) -> dict[str, Any]:
+    cookie_header = _music_cookie_header()
+    headers = {**_MUSIC_HEADERS, "Cookie": cookie_header}
+    with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
+        html = client.get("https://music.youtube.com/").text
+        api_key, client_version = _extract_initial_music_config(html)
+        response = client.post(
+            f"https://music.youtube.com/youtubei/v1/browse?key={api_key}",
+            json={"context": _music_context(client_version), "browseId": browse_id},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _text_from_runs(node: Any) -> str:
+    if not isinstance(node, dict):
+        return ""
+    if isinstance(node.get("simpleText"), str):
+        return node["simpleText"]
+    runs = node.get("runs") or []
+    return "".join(run.get("text", "") for run in runs if isinstance(run, dict)).strip()
+
+
+def _walk_renderers(node: Any, renderer_name: str) -> list[dict[str, Any]]:
+    found = []
+    if isinstance(node, dict):
+        renderer = node.get(renderer_name)
+        if isinstance(renderer, dict):
+            found.append(renderer)
+        for value in node.values():
+            found.extend(_walk_renderers(value, renderer_name))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_walk_renderers(value, renderer_name))
+    return found
+
+
+def _thumb_from_renderer(renderer: dict[str, Any]) -> str:
+    thumbnails = []
+    for item in _walk_values(renderer, "thumbnails"):
+        if isinstance(item, list):
+            thumbnails.extend(x for x in item if isinstance(x, dict))
+    if not thumbnails:
+        return ""
+    return thumbnails[-1].get("url", "")
+
+
+def _walk_values(node: Any, key: str) -> list[Any]:
+    found = []
+    if isinstance(node, dict):
+        if key in node:
+            found.append(node[key])
+        for value in node.values():
+            found.extend(_walk_values(value, key))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_walk_values(value, key))
+    return found
+
+
+def _music_items_from_browse(data: dict[str, Any]) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    renderers = _walk_renderers(data, "musicResponsiveListItemRenderer")
+    renderers.extend(_walk_renderers(data, "musicTwoRowItemRenderer"))
+    for renderer in renderers:
+        video_id = _first_value(renderer, "videoId")
+        if not video_id or video_id in seen:
+            continue
+        title = _first_flex_text(renderer) or _text_from_runs(renderer.get("title")) or "Sin titulo"
+        subtitle = _second_flex_text(renderer) or "YouTube Music"
+        seen.add(video_id)
+        items.append({
+            "id": video_id,
+            "url": f"https://music.youtube.com/watch?v={video_id}",
+            "title": title,
+            "channel": subtitle,
+            "channelUrl": None,
+            "duration": None,
+            "durationText": "--:--",
+            "thumbnail": _thumb_from_renderer(renderer) or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            "viewCount": None,
+            "live": False,
+        })
+        if len(items) >= 40:
+            break
+    return items
+
+
+def _music_playlists_from_browse(data: dict[str, Any]) -> list[dict[str, Any]]:
+    playlists = []
+    seen = set()
+    for renderer in _walk_renderers(data, "musicTwoRowItemRenderer"):
+        playlist_id = _first_value(renderer, "playlistId")
+        if not playlist_id or playlist_id in seen:
+            continue
+        seen.add(playlist_id)
+        playlists.append({
+            "id": playlist_id,
+            "title": _text_from_runs(renderer.get("title")) or "Playlist",
+            "url": f"https://music.youtube.com/playlist?list={playlist_id}",
+            "count": 0,
+            "thumbnail": _thumb_from_renderer(renderer),
+        })
+    return playlists
+
+
+def _first_value(node: Any, key: str) -> str:
+    for value in _walk_values(node, key):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _first_flex_text(renderer: dict[str, Any]) -> str:
+    columns = renderer.get("flexColumns") or []
+    if not columns:
+        return ""
+    return _text_from_runs(columns[0].get("musicResponsiveListItemFlexColumnRenderer", {}).get("text", {}))
+
+
+def _second_flex_text(renderer: dict[str, Any]) -> str:
+    columns = renderer.get("flexColumns") or []
+    if len(columns) < 2:
+        return ""
+    return _text_from_runs(columns[1].get("musicResponsiveListItemFlexColumnRenderer", {}).get("text", {}))
+
+
+# ── Recommendations ──────────────────────────────────────────────────────────
+
+def fetch_music_recommendations() -> dict[str, Any]:
+    used_stale_cookies = False
+    try:
+        items = _items_from_ytmusic_home(_ytmusic_client(prefer_auth=True).get_home(limit=8))
+    except Exception as exc:
+        fallback = fallback_cookie_opts(exc)
+        if not fallback:
+            handle_cookie_error(exc)
+            raise
+        used_stale_cookies = bool(fallback.pop("_used_stale_cookies", False))
+        try:
+            items = _items_from_ytmusic_home(_ytmusic_client(prefer_auth=True).get_home(limit=8))
+        except Exception as retry_exc:
+            handle_cookie_error(retry_exc)
+            raise
+    secure_cache_after_write()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def mutate(data):
+        data["musicRecommendations"] = items
+        data["musicRecomLastSync"] = now
+
+    update_state(mutate)
+    return {
+        "items": items,
+        "lastSync": now,
+        "usedStaleCookies": used_stale_cookies,
+        "warning": pop_cookie_warning(),
+    }
+
+
+def list_music_recommendations() -> dict[str, Any]:
+    data = read_state()
+    return {"items": data.get("musicRecommendations", []), "lastSync": data.get("musicRecomLastSync", "")}
+
+
+# ── Playlists ─────────────────────────────────────────────────────────────────
+
+def fetch_music_playlists() -> dict[str, Any]:
+    used_stale_cookies = False
+    try:
+        playlists = _playlists_from_ytmusicapi(_ytmusic_client(prefer_auth=True).get_library_playlists(limit=50))
+    except Exception as exc:
+        fallback = fallback_cookie_opts(exc)
+        if not fallback:
+            handle_cookie_error(exc)
+            raise
+        used_stale_cookies = bool(fallback.pop("_used_stale_cookies", False))
+        try:
+            playlists = _playlists_from_ytmusicapi(_ytmusic_client(prefer_auth=True).get_library_playlists(limit=50))
+        except Exception as retry_exc:
+            handle_cookie_error(retry_exc)
+            raise
+    secure_cache_after_write()
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def mutate(data):
+        data["musicPlaylists"] = playlists
+        data["musicPlaylistsLastSync"] = now
+
+    update_state(mutate)
+    return {
+        "items": playlists,
+        "lastSync": now,
+        "usedStaleCookies": used_stale_cookies,
+        "warning": pop_cookie_warning(),
+    }
+
+
+def list_music_playlists() -> dict[str, Any]:
+    data = read_state()
+    return {"items": data.get("musicPlaylists", []), "lastSync": data.get("musicPlaylistsLastSync", "")}
+
+
+def list_music_library() -> dict[str, Any]:
+    data = read_state().get("musicLibrary", {})
+    return {
+        "songs": data.get("songs", []),
+        "liked": data.get("liked", []),
+        "albums": data.get("albums", []),
+        "artists": data.get("artists", []),
+        "playlists": data.get("playlists", []),
+        "lastSync": data.get("lastSync", ""),
+        "error": data.get("error", ""),
+        "history": read_state().get("musicHistory", []),
+    }
+
+
+def refresh_music_library() -> dict[str, Any]:
+    client = _ytmusic_client(prefer_auth=True)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    result: dict[str, Any] = {
+        "songs": [],
+        "liked": [],
+        "albums": [],
+        "artists": [],
+        "playlists": [],
+        "history": [],
+        "lastSync": now,
+        "error": "",
+    }
+    errors = []
+    for key, loader in {
+        "songs": lambda: [_track_to_queue_item(x) for x in client.get_library_songs(limit=100)],
+        "liked": lambda: [_track_to_queue_item(x) for x in (client.get_liked_songs(limit=100).get("tracks") or [])],
+        "albums": lambda: _music_library_groups(client.get_library_albums(limit=50), "album"),
+        "artists": lambda: _music_library_groups(client.get_library_artists(limit=50), "artist"),
+        "playlists": lambda: _playlists_from_ytmusicapi(client.get_library_playlists(limit=50)),
+        "history": lambda: [_track_to_queue_item(x) for x in client.get_history()],
+    }.items():
+        try:
+            result[key] = loader()
+        except Exception as exc:
+            errors.append(f"{key}: {exc}")
+    result["error"] = " | ".join(errors[:3])
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["musicLibrary"] = {k: v for k, v in result.items() if k != "history"}
+        data["musicHistory"] = result["history"]
+
+    update_state(mutate)
+    return result
+
+
+def search_music(query: str, limit: int = 20, search_filter: str | None = None) -> list[dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        return []
+    cache_key = f"{query}|{search_filter or ''}|{limit}"
+    cached = _cache_get(_MUSIC_SEARCH_CACHE, cache_key)
+    if cached is not None:
+        return cached
+    client = _ytmusic_client(prefer_auth=True)
+    results = client.search(query, filter=search_filter, limit=limit)
+    items = []
+    for item in results:
+        video_id = item.get("videoId")
+        playlist_id = item.get("playlistId") or item.get("browseId")
+        thumbnails = item.get("thumbnails") or []
+        if video_id:
+            items.append({
+                "id": video_id,
+                "url": f"https://music.youtube.com/watch?v={video_id}",
+                "title": item.get("title") or video_id,
+                "channel": _artists_text(item) or item.get("artist") or item.get("category") or "YouTube Music",
+                "durationText": item.get("duration") or "--:--",
+                "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+                "source": "music",
+            })
+        elif playlist_id:
+            items.append({
+                "id": playlist_id,
+                "url": f"https://music.youtube.com/playlist?list={playlist_id}",
+                "title": item.get("title") or "Playlist",
+                "channel": item.get("author") or item.get("category") or "YouTube Music",
+                "durationText": "Playlist",
+                "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+                "source": "music",
+                "resultType": "playlist",
+            })
+    _cache_set(_MUSIC_SEARCH_CACHE, cache_key, items)
+    return items
+
+
+def fetch_playlist_songs(playlist_url: str) -> list[dict[str, Any]]:
+    try:
+        with yt_dlp.YoutubeDL(_opts({"playlistend": 150})) as ydl:
+            info = ydl.extract_info(playlist_url, download=False) or {}
+    except Exception as exc:
+        fallback = fallback_cookie_opts(exc)
+        if not fallback:
+            handle_cookie_error(exc)
+            raise
+        fallback.pop("_used_stale_cookies", None)
+        try:
+            with yt_dlp.YoutubeDL({**_BASE_OPTS, "playlistend": 150, **fallback}) as ydl:
+                info = ydl.extract_info(playlist_url, download=False) or {}
+        except Exception as retry_exc:
+            handle_cookie_error(retry_exc)
+            raise
+    secure_cache_after_write()
+    return _to_items(info.get("entries") or [])
+
+
+def _music_library_groups(items: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    result = []
+    for item in items:
+        thumbnails = item.get("thumbnails") or []
+        browse_id = item.get("browseId") or item.get("playlistId") or item.get("channelId") or ""
+        result.append({
+            "id": browse_id or item.get("title", ""),
+            "title": item.get("title") or kind.title(),
+            "channel": item.get("artist") or item.get("artists", [{}])[0].get("name", "") if item.get("artists") else "",
+            "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+            "source": "music",
+            "kind": kind,
+            "url": f"https://music.youtube.com/browse/{browse_id}" if browse_id else "",
+        })
+    return result
+
+
+def _artists_text(item: dict[str, Any]) -> str:
+    artists = item.get("artists") or []
+    return ", ".join(a.get("name", "") for a in artists if a.get("name"))
