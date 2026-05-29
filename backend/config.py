@@ -36,6 +36,10 @@ PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
 COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
 COOKIES_FILE = _str_env("COOKIES_FILE", "")
 
+# YouTube Music web client defaults (public values scraped from music.youtube.com)
+YTMUSIC_API_KEY = _str_env("YTMUSIC_API_KEY", "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw")
+YTMUSIC_CLIENT_VERSION = _str_env("YTMUSIC_CLIENT_VERSION", "1.20240520.01.00")
+
 
 _CONFIG_LOCK = threading.Lock()
 

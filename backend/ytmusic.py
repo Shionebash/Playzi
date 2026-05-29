@@ -33,8 +33,9 @@ _MUSIC_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
     ),
 }
-_DEFAULT_MUSIC_API_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
-_DEFAULT_MUSIC_CLIENT_VERSION = "1.20240520.01.00"
+# Fallback values loaded from config (sourced from music.youtube.com page — public web client keys)
+_DEFAULT_MUSIC_API_KEY = config.YTMUSIC_API_KEY
+_DEFAULT_MUSIC_CLIENT_VERSION = config.YTMUSIC_CLIENT_VERSION
 
 
 def _opts(extra: dict | None = None) -> dict[str, Any]:
