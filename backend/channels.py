@@ -114,6 +114,32 @@ def delete_channel(channel_id: str) -> None:
     update_state(mutate)
 
 
+def preview_channel(url: str) -> dict[str, Any]:
+    """Fetch a channel's recent videos by URL without persisting it."""
+    normalized = _videos_url(url)
+    followed = next((c for c in read_state()["channels"] if c["url"] == normalized), None)
+    info = _extract_channel(normalized)
+    channel_name = info.get("title") or (followed["name"] if followed else url)
+    items = []
+    for entry in info.get("entries") or []:
+        if not entry:
+            continue
+        item = _entry_to_item(entry)
+        if not item.get("url"):
+            continue
+        if followed:
+            item["sourceChannelId"] = followed["id"]
+            item["sourceChannelName"] = channel_name
+        items.append(item)
+    return {
+        "name": channel_name,
+        "url": normalized,
+        "channelId": followed["id"] if followed else None,
+        "alreadyFollowed": bool(followed),
+        "items": items,
+    }
+
+
 def _extract_channel(url: str) -> dict[str, Any]:
     opts = {
         "quiet": True,

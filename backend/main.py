@@ -20,7 +20,7 @@ from starlette.background import BackgroundTask
 
 from . import config
 from .autosync import get_sync_status, refresh_all, refresh_section, start_autosync
-from .channels import add_channel, delete_channel, list_channels, list_feed, refresh_all_channels, refresh_channel
+from .channels import add_channel, delete_channel, list_channels, list_feed, preview_channel, refresh_all_channels, refresh_channel
 from .collections import create_collection, delete_collection, list_collections
 from .history import delete_history_event
 from .playlists import add_item as playlist_add_item
@@ -316,6 +316,15 @@ def api_history_delete(event_id: str):
 @app.get("/api/channels")
 def api_channels():
     return {"items": list_channels()}
+
+
+@app.get("/api/channels/preview")
+def api_channels_preview(url: str):
+    try:
+        return preview_channel(url)
+    except Exception as exc:
+        logger.exception("Error al previsualizar canal: %s", url)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/channels")
