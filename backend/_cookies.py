@@ -125,8 +125,13 @@ def _looks_like_netscape_cookie_file(source: Path) -> bool:
     return False
 
 
-def get_cookie_opts() -> dict[str, Any]:
-    """Return yt-dlp cookie opts using Playzi's private cookie cache."""
+def get_cookie_opts(force: bool = False) -> dict[str, Any]:
+    """Return yt-dlp cookie opts using Playzi's private cookie cache.
+
+    When force=True with the managed 'playzi' profile, the fresh cache is
+    bypassed and cookies are re-exported from the persistent browser profile
+    (recovers from a stale cache when the profile still holds a live session).
+    """
     if not config.COOKIES_BROWSER and not config.COOKIES_FILE:
         raise ValueError(
             "No hay cookies configuradas. "
@@ -150,12 +155,22 @@ def get_cookie_opts() -> dict[str, Any]:
                 "Selecciona un navegador en Configuracion o usa un cookies.txt exportado."
             )
 
+    is_playzi = config.COOKIES_BROWSER.lower() == "playzi"
+
+    # On force with the managed profile, re-export from the browser profile
+    # directly (skip stale cache and static exported files).
+    if force and is_playzi:
+        invalidate_cache()
+        source = export_cookies(headless=True)
+        cache = _cache_from_file(source)
+        return {"cookiefile": str(cache)}
+
     exported = _find_exported_cookie_file()
     if exported:
         cache = _cache_from_file(exported)
         return {"cookiefile": str(cache)}
 
-    if config.COOKIES_BROWSER.lower() == "playzi":
+    if is_playzi:
         cache = _cache_path()
         if _cache_is_fresh():
             _secure_permissions(cache)

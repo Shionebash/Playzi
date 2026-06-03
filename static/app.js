@@ -18,6 +18,7 @@ const state = {
   musicPlaylists: [],
   musicPlaylistsLastSync: "",
   channelsLastSync: "",
+  musicAuthState: "",
   musicLibrary: { songs: [], liked: [], albums: [], artists: [], playlists: [], history: [], lastSync: "", error: "" },
   syncStatus: {},
   player: {
@@ -261,6 +262,7 @@ function applyBootstrap(data) {
   state.musicPlaylistsLastSync = data.musicPlaylists?.lastSync || "";
   state.musicLibrary = data.musicLibrary || state.musicLibrary;
   state.channelsLastSync = data.channelsLastSync || "";
+  state.musicAuthState = data.musicAuthState || "";
   state.syncStatus = data.syncStatus || {};
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
 }
@@ -542,10 +544,41 @@ function renderLibrary() {
   `;
 }
 
+async function _awaitLoginTask(taskId) {
+  if (!taskId) return;
+  // Poll the login task until the user closes the browser window.
+  for (let i = 0; i < 600; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let task;
+    try {
+      task = await api.get(`/api/tasks/${taskId}`);
+    } catch (_) { continue; }
+    if (task.status === "done") {
+      await refreshLists();
+      _musicSyncTriggered = false;
+      if (state.musicAuthState === "ok") {
+        toast("Sesión iniciada. Cargando tu contenido...");
+        try {
+          await api.post("/api/music/recommendations/refresh");
+          await api.post("/api/music/playlists/refresh");
+        } catch (_) {}
+      } else {
+        toast("La sesión sigue sin validar. Asegúrate de iniciar sesión completamente.");
+      }
+      if (state.view === "music") renderMusic();
+      return;
+    }
+    if (task.status === "error") {
+      toast(task.error || "Error al iniciar sesión");
+      return;
+    }
+  }
+}
+
 let _musicSyncTriggered = false;
 async function _autoTriggerMusicSync() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
-  if (!hasCookies || _musicSyncTriggered) return;
+  if (!hasCookies || _musicSyncTriggered || state.musicAuthState === "expired") return;
   const needsRecom = !state.musicRecomLastSync && !state.syncStatus?.sections?.musicRecommendations?.running;
   const needsPlaylists = !state.musicPlaylistsLastSync && !state.syncStatus?.sections?.musicPlaylists?.running;
   if (!needsRecom && !needsPlaylists) return;
@@ -559,8 +592,21 @@ async function _autoTriggerMusicSync() {
   }
 }
 
+function _musicAuthBanner() {
+  if (state.musicAuthState !== "expired") return "";
+  return `<div class="url-banner" style="margin-bottom:16px;border-color:oklch(.54 .20 25)">
+    <strong style="color:oklch(.62 .20 25)">⚠</strong>
+    <div style="min-width:0;flex:1">
+      <div class="url-banner-title" style="color:oklch(.62 .20 25)">Sesión de YouTube expirada</div>
+      <div class="url-banner-sub">Tu sesión ya no es válida. Vuelve a iniciar sesión para ver tus recomendaciones personalizadas.</div>
+    </div>
+    <button class="btn btn-primary" type="button" data-music-login>Iniciar sesión</button>
+  </div>`;
+}
+
 function renderMusic() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const expired = state.musicAuthState === "expired";
   const local = state.library.filter((item) => item.kind === "audio" || ["MP3", "OPUS", "M4A"].includes(String(item.format || "").toUpperCase()));
   $("#view-music").innerHTML = `
     <div class="section-hdr">
@@ -568,8 +614,11 @@ function renderMusic() {
       <button class="btn btn-primary" type="button" id="refreshMusicRecom">Actualizar</button>
     </div>
     ${!hasCookies ? `<div class="url-banner" style="margin-bottom:16px"><strong>⚙</strong><div style="min-width:0;flex:1"><div class="url-banner-title">Cookies requeridas</div><div class="url-banner-sub">Configura el navegador en Configuración.</div></div><button class="btn btn-ghost" type="button" data-view-go="config">Configurar</button></div>` : ""}
-    ${hasCookies ? syncNotice("musicRecommendations") : ""}
-    ${state.musicRecommendations.length
+    ${_musicAuthBanner()}
+    ${hasCookies && !expired ? syncNotice("musicRecommendations") : ""}
+    ${expired
+      ? `<div style="margin-bottom:32px">${empty("Contenido no personalizado", "Inicia sesión arriba para cargar tus recomendaciones reales.")}</div>`
+      : state.musicRecommendations.length
       ? `<div class="grid" style="margin-bottom:32px">${state.musicRecommendations.map(videoCard).join("")}</div>`
       : hasCookies ? `<div style="margin-bottom:32px">${
           state.musicRecomLastSync
@@ -2180,6 +2229,14 @@ function bindEvents() {
     if (musicFilter) {
       state.musicSearchFilter = musicFilter.dataset.musicFilter;
       await doSearch();
+      return;
+    }
+    if (ev.target.closest("[data-music-login]")) {
+      try {
+        const resp = await api.post("/api/music/login");
+        toast("Abriendo navegador... inicia sesión en YouTube y cierra la ventana al terminar.");
+        _awaitLoginTask(resp?.task?.id);
+      } catch (err) { toast(err.message); }
       return;
     }
     const searchScope = ev.target.closest("[data-search-scope]");

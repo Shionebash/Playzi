@@ -190,6 +190,16 @@ def api_config():
     return config.public_config()
 
 
+def _run_youtube_login() -> dict:
+    """Open a visible Chromium for the user to log into YouTube, then refresh cookies."""
+    from .managed_browser import open_login_browser
+    from .ytmusic import _get_validated_client
+
+    open_login_browser()  # blocks until the user closes the window
+    _client, state = _get_validated_client()
+    return {"authState": state}
+
+
 def _bootstrap_payload() -> dict:
     recommendations = list_recommendations()
     music_recommendations = list_music_recommendations()
@@ -209,6 +219,7 @@ def _bootstrap_payload() -> dict:
         "musicPlaylists": music_playlists,
         "musicLibrary": list_music_library(),
         "channelsLastSync": read_state_key("channelsLastSync"),
+        "musicAuthState": read_state_key("musicAuthState"),
         "syncStatus": get_sync_status(),
     }
 
@@ -654,6 +665,11 @@ def api_music_library():
 @app.post("/api/music/library/refresh")
 def api_music_library_refresh():
     return {"task": start_task("refresh-music-library", refresh_music_library)}
+
+
+@app.post("/api/music/login")
+def api_music_login():
+    return {"task": start_task("login-youtube", _run_youtube_login)}
 
 
 @app.get("/api/sync/status")

@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import yt_dlp
 from ytmusicapi import YTMusic
+from ytmusicapi.auth.types import AuthType
 
 from . import config
 from .state import read_state, update_state
@@ -130,24 +131,9 @@ def _ytmusic_auth_headers() -> dict[str, str] | None:
     origin = "https://music.youtube.com"
     timestamp = str(int(time.time()))
     digest = hashlib.sha1(f"{timestamp} {sapisid} {origin}".encode("utf-8")).hexdigest()
-    auth_cookie_names = {
-        "CONSENT",
-        "SOCS",
-        "SID",
-        "HSID",
-        "SSID",
-        "APISID",
-        "SAPISID",
-        "__Secure-1PAPISID",
-        "__Secure-3PAPISID",
-        "__Secure-1PSID",
-        "__Secure-3PSID",
-        "__Secure-1PSIDTS",
-        "__Secure-3PSIDTS",
-        "__Secure-1PSIDCC",
-        "__Secure-3PSIDCC",
-    }
-    cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items() if name in auth_cookie_names)
+    # Send all cookies from the file (like yt-dlp); filtering risks dropping
+    # session-validation cookies (LOGIN_INFO, SIDCC, etc.)
+    cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items())
     return {
         "Cookie": cookie_header,
         "Authorization": f"SAPISIDHASH {timestamp}_{digest}",
@@ -162,6 +148,46 @@ def _ytmusic_client(prefer_auth: bool = True) -> YTMusic:
     except Exception:
         auth = None
     return YTMusic(auth, language="es", location="EC")
+
+
+def _session_auth_state(client: YTMusic) -> str:
+    """Return "ok" if the YouTube session is authenticated server-side, else "expired"."""
+    if client.auth_type != AuthType.BROWSER:
+        return "expired"
+    try:
+        info = client.get_account_info()
+        return "ok" if info and info.get("accountName") else "expired"
+    except Exception:
+        return "expired"
+
+
+def _set_music_auth_state(state: str) -> None:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def mutate(data):
+        data["musicAuthState"] = state
+        data["musicAuthCheckedAt"] = now
+
+    update_state(mutate)
+
+
+def _get_validated_client() -> tuple[YTMusic, str]:
+    """Build a YTMusic client and verify the session is really logged in.
+
+    If anonymous and using the managed 'playzi' profile, force a cookie re-export
+    (recovers when the cache was merely stale). Returns (client, "ok"|"expired").
+    """
+    client = _ytmusic_client(prefer_auth=True)
+    state = _session_auth_state(client)
+    if state != "ok" and config.COOKIES_BROWSER.lower() == "playzi":
+        try:
+            get_cookie_opts(force=True)
+            client = _ytmusic_client(prefer_auth=True)
+            state = _session_auth_state(client)
+        except Exception:
+            pass
+    _set_music_auth_state(state)
+    return client, state
 
 
 def _items_from_ytmusic_home(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -428,10 +454,29 @@ def _second_flex_text(renderer: dict[str, Any]) -> str:
 
 # ── Recommendations ──────────────────────────────────────────────────────────
 
+_SESSION_EXPIRED_WARNING = (
+    "Tu sesión de YouTube expiró. Vuelve a iniciar sesión para ver tu contenido personalizado."
+)
+
+
 def fetch_music_recommendations() -> dict[str, Any]:
+    client, auth_state = _get_validated_client()
+    if auth_state != "ok":
+        # Don't overwrite saved content with anonymous/generic data.
+        # Advance the timestamp so autosync respects the interval (avoids
+        # re-launching the headless browser every cycle).
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        update_state(lambda d: d.update({"musicRecomLastSync": now}))
+        data = read_state()
+        return {
+            "items": data.get("musicRecommendations", []),
+            "lastSync": now,
+            "authState": auth_state,
+            "warning": _SESSION_EXPIRED_WARNING,
+        }
     used_stale_cookies = False
     try:
-        items = _items_from_ytmusic_home(_ytmusic_client(prefer_auth=True).get_home(limit=8))
+        items = _items_from_ytmusic_home(client.get_home(limit=8))
     except Exception as exc:
         fallback = fallback_cookie_opts(exc)
         if not fallback:
@@ -454,6 +499,7 @@ def fetch_music_recommendations() -> dict[str, Any]:
     return {
         "items": items,
         "lastSync": now,
+        "authState": "ok",
         "usedStaleCookies": used_stale_cookies,
         "warning": pop_cookie_warning(),
     }
@@ -467,9 +513,20 @@ def list_music_recommendations() -> dict[str, Any]:
 # ── Playlists ─────────────────────────────────────────────────────────────────
 
 def fetch_music_playlists() -> dict[str, Any]:
+    client, auth_state = _get_validated_client()
+    if auth_state != "ok":
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        update_state(lambda d: d.update({"musicPlaylistsLastSync": now}))
+        data = read_state()
+        return {
+            "items": data.get("musicPlaylists", []),
+            "lastSync": now,
+            "authState": auth_state,
+            "warning": _SESSION_EXPIRED_WARNING,
+        }
     used_stale_cookies = False
     try:
-        playlists = _playlists_from_ytmusicapi(_ytmusic_client(prefer_auth=True).get_library_playlists(limit=50))
+        playlists = _playlists_from_ytmusicapi(client.get_library_playlists(limit=50))
     except Exception as exc:
         fallback = fallback_cookie_opts(exc)
         if not fallback:
@@ -493,6 +550,7 @@ def fetch_music_playlists() -> dict[str, Any]:
     return {
         "items": playlists,
         "lastSync": now,
+        "authState": "ok",
         "usedStaleCookies": used_stale_cookies,
         "warning": pop_cookie_warning(),
     }
@@ -518,7 +576,10 @@ def list_music_library() -> dict[str, Any]:
 
 
 def refresh_music_library() -> dict[str, Any]:
-    client = _ytmusic_client(prefer_auth=True)
+    client, auth_state = _get_validated_client()
+    if auth_state != "ok":
+        data = read_state().get("musicLibrary", {})
+        return {**data, "authState": auth_state, "error": _SESSION_EXPIRED_WARNING}
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     result: dict[str, Any] = {
         "songs": [],

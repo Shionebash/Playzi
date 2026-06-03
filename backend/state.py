@@ -37,6 +37,8 @@ DEFAULT_STATE: dict[str, Any] = {
     "musicPlaylists": [],
     "musicPlaylistsLastSync": "",
     "channelsLastSync": "",
+    "musicAuthState": "",
+    "musicAuthCheckedAt": "",
     "musicLibrary": {
         "songs": [],
         "liked": [],
