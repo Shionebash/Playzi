@@ -534,6 +534,85 @@ function renderChannels() {
   `;
 }
 
+// Normalize a channel URL like the backend `_videos_url` so we can match it
+// against followed channels (state.channels[].url is stored normalized).
+function _normalizeChannelUrl(url) {
+  let clean = (url || "").trim();
+  if (!clean) return "";
+  if (!clean.startsWith("http")) clean = "https://www.youtube.com/@" + clean.replace(/^@/, "");
+  if (clean.includes("youtube.com") && !/\/(videos|streams|shorts)\/?$/.test(clean)) {
+    clean = clean.replace(/\/$/, "") + "/videos";
+  }
+  return clean;
+}
+
+function findFollowedChannel(channelUrl) {
+  if (!channelUrl) return null;
+  const norm = _normalizeChannelUrl(channelUrl);
+  const bare = channelUrl.replace(/\/$/, "");
+  return state.channels.find((c) => c.url === norm)
+    || state.channels.find((c) => c.url && c.url.replace(/\/videos$/, "") === bare)
+    || null;
+}
+
+function _followButtonHtml(channelUrl, name) {
+  if (!channelUrl) return "";
+  const ch = findFollowedChannel(channelUrl);
+  if (ch) {
+    return `<button class="btn btn-ghost" type="button" data-unfollow-channel="${escapeHtml(ch.id)}">Siguiendo ✓</button>`;
+  }
+  return `<button class="btn btn-ghost" type="button" data-add-channel="${escapeHtml(channelUrl)}" data-add-channel-name="${escapeHtml(name || "")}">＋ Seguir canal</button>`;
+}
+
+async function openChannelPreview(url, name) {
+  if (!url) return;
+  state._lastChannelPreview = { url, name };
+  setView("channels");
+  $("#view-channels").innerHTML = `
+    <div class="section-hdr"><span class="section-title">${escapeHtml(name || "Canal")}</span></div>
+    ${empty("Cargando…", "Obteniendo videos del canal.")}`;
+  try {
+    const data = await api.get(`/api/channels/preview?url=${encodeURIComponent(url)}`);
+    _renderChannelPreview(data);
+  } catch (err) {
+    $("#view-channels").innerHTML = `
+      <div class="section-hdr">
+        <span class="section-title">${escapeHtml(name || "Canal")}</span>
+        <button class="btn btn-ghost" type="button" id="backToChannels">← Canales</button>
+      </div>
+      ${empty("Error", err.message)}`;
+    const b = $("#backToChannels");
+    if (b) b.onclick = () => renderChannels();
+  }
+}
+
+function _refreshAfterFollowChange() {
+  if (state.view === "watch") {
+    _updateWatchMeta();
+  } else if (state.view === "channels" && state._lastChannelPreview) {
+    openChannelPreview(state._lastChannelPreview.url, state._lastChannelPreview.name);
+  }
+}
+
+function _renderChannelPreview(data) {
+  const followBtn = data.alreadyFollowed
+    ? `<button class="btn btn-ghost" type="button" data-unfollow-channel="${escapeHtml(data.channelId)}">Siguiendo ✓</button>`
+    : `<button class="btn btn-primary" type="button" data-add-channel="${escapeHtml(data.url)}" data-add-channel-name="${escapeHtml(data.name || "")}">＋ Seguir canal</button>`;
+  $("#view-channels").innerHTML = `
+    <div class="section-hdr">
+      <span class="section-title">${escapeHtml(data.name || "Canal")}</span>
+      <div style="display:flex;gap:8px">
+        ${followBtn}
+        <button class="btn btn-ghost" type="button" id="backToChannels">← Canales</button>
+      </div>
+    </div>
+    ${data.items.length
+      ? `<div class="grid">${data.items.map(videoCard).join("")}</div>`
+      : empty("Sin videos", "Este canal no tiene videos recientes.")}`;
+  const b = $("#backToChannels");
+  if (b) b.onclick = () => renderChannels();
+}
+
 function renderLibrary() {
   const visible = state.library.slice(0, _libraryLimit);
   const hasMore = state.library.length > _libraryLimit;
@@ -829,6 +908,9 @@ function _videoLayoutHtml() {
       <div class="watch-main">
         <div class="watch-video-wrap">
           <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline></video>
+          <div id="webPlayerOverlay" class="player-overlay" style="display:none">
+            <div class="player-overlay-spinner"></div>
+          </div>
         </div>
         <div id="watch-info"></div>
       </div>
@@ -880,6 +962,7 @@ function _musicLayoutHtml() {
             <input type="range" id="musicVolume" class="volume-slider" min="0" max="1" step="0.05" value="1">
           </div>
           <div class="music-actions">
+            <span id="musicFollow"></span>
             <button class="btn btn-ghost" type="button" data-watch-download="audio">Descargar</button>
             <button class="btn btn-ghost" type="button" id="toggleAudioOnly">Solo audio</button>
             <button class="btn btn-ghost" type="button" id="playerExternal">Abrir externo</button>
@@ -948,21 +1031,39 @@ function _updateWatchMeta(error = "") {
   }
 }
 
+function _updateVideoOverlay(error = "") {
+  const overlay = $("#webPlayerOverlay");
+  if (!overlay) return;
+  if (state.player.loading && !error) {
+    const thumb = state.player.current?.thumbnail;
+    overlay.style.backgroundImage = thumb ? `url("${thumbSrc(thumb)}")` : "";
+    overlay.style.display = "flex";
+  } else {
+    overlay.style.display = "none";
+  }
+}
+
 function _updateVideoMeta(error = "") {
+  _updateVideoOverlay(error);
   const el = $("#watch-info");
   if (!el) return;
   const item = state.player.current;
   const title = item?.title || item?.url || "...";
   const channel = item?.channel || "";
+  const channelUrl = item?.channelUrl || "";
   const duration = item?.durationText || "";
+  const channelHtml = channelUrl
+    ? `<span class="channel-link" data-watch-channel="${escapeHtml(channelUrl)}" data-watch-channel-name="${escapeHtml(channel)}">${escapeHtml(channel)}</span>`
+    : escapeHtml(channel);
   const hasPrev = state.player.index > 0;
   const hasNext = state.player.index < state.player.queue.length - 1;
   el.innerHTML = `
     <div class="watch-title">${escapeHtml(title)}</div>
-    <div class="watch-channel">${escapeHtml(channel)}${duration ? ` · ${escapeHtml(duration)}` : ""}</div>
+    <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}</div>
     <div class="watch-actions">
       <button class="btn btn-ghost" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>⏮ Anterior</button>
       <button class="btn btn-ghost" type="button" id="watchNext" ${hasNext ? "" : "disabled"}>Siguiente ⏭</button>
+      ${_followButtonHtml(channelUrl, channel)}
       ${_playerCtrlsHtml()}
       <button class="btn btn-primary" type="button" data-watch-download="video">Descargar</button>
       <button class="btn btn-ghost" type="button" data-watch-download="audio">Audio</button>
@@ -985,8 +1086,16 @@ function _updateMusicMeta(error = "") {
   const prevBtn = $("#watchPrev");
   const nextBtn = $("#watchNext");
 
+  const channel = item?.channel || "";
+  const channelUrl = item?.channelUrl || "";
   if (titleEl) titleEl.textContent = item?.title || "...";
-  if (artistEl) artistEl.textContent = item?.channel || "";
+  if (artistEl) {
+    artistEl.innerHTML = channelUrl
+      ? `<span class="channel-link" data-watch-channel="${escapeHtml(channelUrl)}" data-watch-channel-name="${escapeHtml(channel)}">${escapeHtml(channel)}</span>`
+      : escapeHtml(channel);
+  }
+  const followEl = $("#musicFollow");
+  if (followEl) followEl.innerHTML = _followButtonHtml(channelUrl, channel);
 
   if (artEl) {
     const thumb = item?.thumbnail;
@@ -1104,6 +1213,7 @@ function _updateWatchRelated() {
           <div class="queue-title">${escapeHtml(item.title || "")}</div>
           <div class="queue-meta">${escapeHtml(channelName)}${item.durationText ? ` · ${escapeHtml(item.durationText)}` : ""}</div>
         </div>
+        <button class="queue-add" type="button" data-related-queue-url="${escapeHtml(itemUrl)}" title="Añadir a la cola">＋</button>
       </div>
     `;
   }).join("");
@@ -1375,6 +1485,23 @@ async function _loadMusicItem(item, loadId) {
   _updateWatchQueue();
   _updateWatchRelated();
   _updateMediaSession();
+  _prefetchNextItem();
+}
+
+// Warm the backend cache for the next queue item so advancing has no gap.
+const _prefetchedUrls = new Set();
+function _prefetchNextItem() {
+  const next = state.player.queue[state.player.index + 1];
+  if (!next || !next.url || _prefetchedUrls.has(next.url)) return;
+  _prefetchedUrls.add(next.url);
+  const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+  const quality = encodeURIComponent(state.config?.playbackQuality || "best");
+  const endpoint = isAudio
+    ? `/api/player/audio?url=${encodeURIComponent(next.url)}`
+    : next.manifestUrl
+      ? next.manifestUrl
+      : `/api/player/manifest.mpd?url=${encodeURIComponent(next.url)}&quality=${quality}`;
+  fetch(endpoint).catch(() => {});
 }
 
 async function _loadVideoItem(item, loadId) {
@@ -1393,6 +1520,7 @@ async function _loadVideoItem(item, loadId) {
   _updateWatchQueue();
   _updateWatchRelated();
   _updateMediaSession();
+  _prefetchNextItem();
 }
 
 async function ensureVideoPlayer() {
@@ -1700,6 +1828,10 @@ function videoCard(item) {
     channelBtn = `<button class="btn btn-ghost" type="button" data-add-channel="${escapeHtml(item.channelUrl)}" data-add-channel-name="${escapeHtml(channelName)}" title="Suscribirse al canal">＋ Canal</button>`;
   }
 
+  const channelNameHtml = (item.channelUrl && channelName)
+    ? `<span class="channel-link" data-watch-channel="${escapeHtml(item.channelUrl)}" data-watch-channel-name="${escapeHtml(channelName)}">${escapeHtml(channelName)}</span>`
+    : escapeHtml(channelName);
+
   return `
     <article class="card">
       <div class="thumb">
@@ -1708,7 +1840,7 @@ function videoCard(item) {
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(item.title)}</div>
-        <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${escapeHtml(channelName)}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
+        <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
       </div>
       <div class="card-actions">
         ${isPlaylist ? `<button class="btn btn-primary" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : `<button class="btn btn-primary" type="button" data-download="video" data-id="${id}">Descargar</button>`}
@@ -1789,6 +1921,37 @@ function allVideoItems() {
 
 function findVideo(id) {
   return allVideoItems().find((item) => String(item.feedId || item.id || item.url) === String(id));
+}
+
+// Warm the backend cache when the user hovers a result, so the click feels
+// instant. Debounced; one prefetch in flight; never re-warms the same URL.
+function _setupHoverPrefetch() {
+  let hoverTimer = null;
+  let inFlight = null;
+  document.body.addEventListener("mouseover", (ev) => {
+    // Trigger anywhere on the card (thumbnail/title), not just the Play button.
+    const card = ev.target.closest(".card");
+    const playBtn = card?.querySelector("[data-play-default]");
+    if (!playBtn) return;
+    const item = findVideo(playBtn.dataset.id);
+    if (!item || !item.url || _prefetchedUrls.has(item.url)) return;
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => {
+      if (_prefetchedUrls.has(item.url)) return;
+      _prefetchedUrls.add(item.url);
+      if (inFlight) inFlight.abort();
+      inFlight = new AbortController();
+      const isAudio = String(item.url).includes("music.youtube.com");
+      const quality = encodeURIComponent(state.config?.playbackQuality || "best");
+      const endpoint = isAudio
+        ? `/api/player/audio?url=${encodeURIComponent(item.url)}`
+        : `/api/player/manifest.mpd?url=${encodeURIComponent(item.url)}&quality=${quality}`;
+      fetch(endpoint, { signal: inFlight.signal }).catch(() => {});
+    }, 200);
+  });
+  document.body.addEventListener("mouseout", (ev) => {
+    if (ev.target.closest(".card")) clearTimeout(hoverTimer);
+  });
 }
 
 function openDownloadModal(item, kind, presetCollection = "") {
@@ -2224,6 +2387,7 @@ function bindEvents() {
     }
   });
 
+  _setupHoverPrefetch();
   document.body.addEventListener("click", async (ev) => {
     const musicFilter = ev.target.closest("[data-music-filter]");
     if (musicFilter) {
@@ -2363,9 +2527,28 @@ function bindEvents() {
         });
         await refreshLists();
         toast(`Canal agregado: ${addChannel.dataset.addChannelName}`);
+        _refreshAfterFollowChange();
       } catch (err) {
         toast(err.message);
       }
+      return;
+    }
+    const unfollowChannel = ev.target.closest("[data-unfollow-channel]");
+    if (unfollowChannel) {
+      try {
+        await api.delete(`/api/channels/${unfollowChannel.dataset.unfollowChannel}`);
+        await refreshLists();
+        toast("Dejaste de seguir el canal");
+        _refreshAfterFollowChange();
+      } catch (err) {
+        toast(err.message);
+      }
+      return;
+    }
+    const watchChannel = ev.target.closest("[data-watch-channel]");
+    if (watchChannel) {
+      openChannelPreview(watchChannel.dataset.watchChannel, watchChannel.dataset.watchChannelName);
+      return;
     }
     const viewChannel = ev.target.closest("[data-view-channel]");
     if (viewChannel) {
@@ -2519,6 +2702,18 @@ function bindEvents() {
     if (queueItem) {
       const idx = Number(queueItem.dataset.queueIdx);
       await loadWebPlayerItem(idx);
+    }
+    const relatedQueue = ev.target.closest("[data-related-queue-url]");
+    if (relatedQueue) {
+      ev.stopPropagation();
+      const url = relatedQueue.dataset.relatedQueueUrl;
+      const ctx = state.player.sourceContext || "search";
+      const allItems = ctx === "music"
+        ? state.musicRecommendations
+        : [...state.recommendations, ...state.feed, ...state.results];
+      const found = allItems.find((i) => String(i.url || i.feedId || "") === url);
+      addToQueue(found || { url, title: url });
+      return;
     }
     const relatedItem = ev.target.closest("[data-related-url]");
     if (relatedItem) {

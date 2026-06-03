@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import html
+import json
+import re
 import struct
+import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -101,25 +104,118 @@ def resolve_playlist(url: str, quality: str | None = None) -> dict[str, Any]:
 _INFO_CACHE: dict[str, tuple[float, dict]] = {}  # url -> (timestamp, info)
 _MANIFEST_CACHE: dict[str, tuple[float, str]] = {}
 _SEGMENT_RANGE_CACHE: dict[str, tuple[float, tuple[str, str]]] = {}
-_CACHE_TTL = 300  # 5 minutes
-_CACHE_MAX = 20
+_CACHE_TTL = 18000  # 5 hours — googlevideo URLs include `expire` (~6h)
+_CACHE_MAX = 150
+
+_INFO_CACHE_FILE = config.DATA_DIR / "player_cache.json"
+_INFO_CACHE_LOCK = threading.Lock()
+_INFO_CACHE_LOADED = False
+# Single-flight: concurrent extractions for the same URL share one yt-dlp call
+# instead of each paying the ~3.5s nsig cost (e.g. /info + /manifest fired together).
+_INFLIGHT: dict[str, threading.Event] = {}
+_INFLIGHT_LOCK = threading.Lock()
+# Drop cached stream URLs this many seconds before their real `expire` to avoid
+# serving a URL that dies mid-playback.
+_EXPIRE_MARGIN = 300
+
+
+def _min_expire(info: dict[str, Any]) -> int | None:
+    """Earliest `expire` epoch across the info's format URLs, or None."""
+    expires: list[int] = []
+    for fmt in info.get("formats") or []:
+        url = fmt.get("url") or ""
+        match = re.search(r"[?&/]expire[=/](\d+)", url)
+        if match:
+            expires.append(int(match.group(1)))
+    return min(expires) if expires else None
+
+
+def _info_expired(info: dict[str, Any]) -> bool:
+    expire = _min_expire(info)
+    return expire is not None and time.time() > (expire - _EXPIRE_MARGIN)
+
+
+def _load_info_cache() -> None:
+    global _INFO_CACHE_LOADED
+    with _INFO_CACHE_LOCK:
+        if _INFO_CACHE_LOADED:
+            return
+        _INFO_CACHE_LOADED = True
+        try:
+            raw = json.loads(_INFO_CACHE_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now = time.monotonic()
+        for url, info in (raw or {}).items():
+            if not isinstance(info, dict) or _info_expired(info):
+                continue
+            _INFO_CACHE[url] = (now, info)
+
+
+def _save_info_cache() -> None:
+    with _INFO_CACHE_LOCK:
+        payload = {}
+        for url, (_, info) in _INFO_CACHE.items():
+            try:
+                payload[url] = yt_dlp.YoutubeDL.sanitize_info(info)
+            except Exception:
+                continue
+        try:
+            config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = _INFO_CACHE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(_INFO_CACHE_FILE)
+        except OSError:
+            pass
+
+
+def _fresh_cached(url: str) -> dict[str, Any] | None:
+    cached = _cache_get(_INFO_CACHE, url)
+    if cached is not None and not _info_expired(cached):
+        return cached
+    if cached is not None:
+        _INFO_CACHE.pop(url, None)
+    return None
 
 
 def _extract_info(url: str) -> dict[str, Any]:
-    now = time.monotonic()
-    cached = _cache_get(_INFO_CACHE, url)
+    _load_info_cache()
+    cached = _fresh_cached(url)
     if cached is not None:
         return cached
-    opts = {
-        "quiet": True,
-        "skip_download": True,
-        "noplaylist": True,
-        **javascript_runtime_opts(),
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        result = ydl.extract_info(url, download=False) or {}
-    _cache_set(_INFO_CACHE, url, result)
-    return result
+
+    # Single-flight: first caller extracts, others wait and reuse its result.
+    with _INFLIGHT_LOCK:
+        event = _INFLIGHT.get(url)
+        is_owner = event is None
+        if is_owner:
+            event = threading.Event()
+            _INFLIGHT[url] = event
+
+    if not is_owner:
+        event.wait(timeout=60)
+        cached = _fresh_cached(url)
+        if cached is not None:
+            return cached
+        # Owner failed or timed out — fall through and extract ourselves.
+
+    try:
+        opts = {
+            "quiet": True,
+            "skip_download": True,
+            "noplaylist": True,
+            **javascript_runtime_opts(),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            result = ydl.extract_info(url, download=False) or {}
+        _cache_set(_INFO_CACHE, url, result)
+        _save_info_cache()
+        return result
+    finally:
+        if is_owner:
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.pop(url, None)
+            event.set()
 
 
 def _select_formats(info: dict[str, Any], quality: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
