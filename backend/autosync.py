@@ -125,7 +125,10 @@ def _refresh_due_sections() -> None:
         data = read_state()
         for section, meta in _SECTIONS.items():
             if _section_is_due(data, meta):
-                _run_section(section)
+                try:
+                    _run_section(section)
+                except Exception:
+                    logger.exception("Error sincronizando seccion: %s", section)
                 data = read_state()
     finally:
         _REFRESH_LOCK.release()

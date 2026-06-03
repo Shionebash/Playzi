@@ -202,6 +202,7 @@ function setView(view) {
   $(`#view-${view}`).classList.remove("hidden");
   $$(".nav-item[data-view]").forEach((el) => el.classList.toggle("active", el.dataset.view === view));
   render();
+  if (view === "music") _autoTriggerMusicSync();
 }
 
 function applySidebarState() {
@@ -541,6 +542,23 @@ function renderLibrary() {
   `;
 }
 
+let _musicSyncTriggered = false;
+async function _autoTriggerMusicSync() {
+  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  if (!hasCookies || _musicSyncTriggered) return;
+  const needsRecom = !state.musicRecomLastSync && !state.syncStatus?.sections?.musicRecommendations?.running;
+  const needsPlaylists = !state.musicPlaylistsLastSync && !state.syncStatus?.sections?.musicPlaylists?.running;
+  if (!needsRecom && !needsPlaylists) return;
+  _musicSyncTriggered = true;
+  try {
+    if (needsRecom) await api.post("/api/music/recommendations/refresh");
+    if (needsPlaylists) await api.post("/api/music/playlists/refresh");
+    toast("Cargando YT Music en segundo plano...");
+  } catch (_) {
+    _musicSyncTriggered = false;
+  }
+}
+
 function renderMusic() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
   const local = state.library.filter((item) => item.kind === "audio" || ["MP3", "OPUS", "M4A"].includes(String(item.format || "").toUpperCase()));
@@ -553,7 +571,11 @@ function renderMusic() {
     ${hasCookies ? syncNotice("musicRecommendations") : ""}
     ${state.musicRecommendations.length
       ? `<div class="grid" style="margin-bottom:32px">${state.musicRecommendations.map(videoCard).join("")}</div>`
-      : hasCookies ? `<div style="margin-bottom:32px">${empty("Sin recomendaciones", "Playzi las cargará automáticamente cuando el sync termine.")}</div>` : ""}
+      : hasCookies ? `<div style="margin-bottom:32px">${
+          state.musicRecomLastSync
+            ? empty("Sin recomendaciones", "El sync no devolvió contenido. Intenta de nuevo con Actualizar.")
+            : empty("Recomendaciones no cargadas", "Haz clic en Actualizar para cargar tu feed de YouTube Music.")
+        }</div>` : ""}
 
     <div class="section-hdr" style="margin-top:8px">
       <span class="section-title">Mis Playlists ${state.musicPlaylistsLastSync ? `<span class="meta" style="font-size:10px;margin-left:6px">· ${escapeHtml(state.musicPlaylistsLastSync)}</span>` : ""}</span>
