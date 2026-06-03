@@ -161,6 +161,26 @@ def metadata_for_url(url: str) -> dict[str, Any]:
     return item
 
 
+def fetch_radio_items(url: str) -> list[dict[str, Any]]:
+    video_id = _youtube_id(url)
+    if not video_id:
+        return []
+    mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "playlistend": 26,
+        "ignoreerrors": True,
+        **javascript_runtime_opts(),
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(mix_url, download=False) or {}
+    entries = info.get("entries") or []
+    # Skip first entry (it's the current video)
+    return [_entry_to_item(e) for e in entries[1:] if e]
+
+
 def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any | None:
     cached = cache.get(key)
     if not cached:

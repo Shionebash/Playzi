@@ -7,11 +7,16 @@ Servidor web local para descargar y reproducir contenido de YouTube y YouTube Mu
 - Buscar y descargar videos/audio de YouTube
 - Explorar y reproducir YouTube Music
 - Gestión de listas de reproducción y colecciones
-- Suscripciones a canales con sincronización automática
-- Reproductor web integrado (Shaka Player / Video.js)
+- Suscripciones a canales con sincronización automática (cada 3 horas, paralela)
+- Reproductor web integrado (Video.js + DASH)
 - Reproducción directa en MPV o VLC
 - Autenticación con cuenta de Google via navegador gestionado (Playwright)
-- Historial de reproducción y recomendaciones
+- Historial de reproducción y recomendaciones personalizadas
+- **Cola de reproducción**: shuffle, repeat (ninguno / uno / todos), autoplay al terminar
+- **Añadir a cola** desde cualquier card sin interrumpir la reproducción actual
+- **Teclas multimedia del sistema** (MediaSession API): play/pause/next/prev desde teclado o SO
+- **Radio/Autoplay**: al terminar la cola carga un mix relacionado automáticamente
+- Atajos de teclado en el reproductor: `Space` play/pausa · `←/→` seek · `N/P` siguiente/anterior · `S` shuffle · `R` repeat
 
 ## Requisitos
 

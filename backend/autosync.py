@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from . import config
+from .channels import refresh_all_channels
 from .recommendations import fetch_recommendations
 from .state import read_state, update_state
 from .ytmusic import fetch_music_playlists, fetch_music_recommendations
@@ -24,7 +25,26 @@ _STARTED = False
 
 SectionRunner = Callable[[], dict[str, Any]]
 
+def _refresh_channels_for_sync() -> dict[str, Any]:
+    data = read_state()
+    if not data.get("channels"):
+        now = _now()
+        update_state(lambda d: d.update({"channelsLastSync": now}))
+        return {"lastSync": now}
+    refresh_all_channels()
+    now = _now()
+    update_state(lambda d: d.update({"channelsLastSync": now}))
+    return {"lastSync": now}
+
+
 _SECTIONS: dict[str, dict[str, Any]] = {
+    "channels": {
+        "label": "Canales",
+        "last_sync_key": "channelsLastSync",
+        "items_key": "feed",
+        "interval": 3 * 60 * 60,
+        "runner": _refresh_channels_for_sync,
+    },
     "recommendations": {
         "label": "YouTube Para ti",
         "last_sync_key": "recommendationsLastSync",

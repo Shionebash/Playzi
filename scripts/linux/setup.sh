@@ -10,6 +10,7 @@ fi
 
 "$VENV/bin/python" -m pip install --upgrade pip
 "$VENV/bin/python" -m pip install -r "$ROOT/requirements.txt"
+"$VENV/bin/python" -m playwright install chromium --with-deps 2>/dev/null || true
 
 ENV_PATH="$ROOT/.env"
 if [ ! -f "$ENV_PATH" ]; then

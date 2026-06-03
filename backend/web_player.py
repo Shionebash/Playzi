@@ -46,8 +46,16 @@ def manifest(url: str, quality: str | None = None) -> str:
     audio_codec = html.escape(audio.get("acodec") or "mp4a.40.2")
     video_url = html.escape(_proxy_url(video))
     audio_url = html.escape(_proxy_url(audio))
-    video_init, video_index = _segment_ranges(video)
-    audio_init, audio_index = _segment_ranges(audio)
+    video_ranges = _segment_ranges(video)
+    audio_ranges = _segment_ranges(audio)
+    if not video_ranges or not audio_ranges:
+        fmt_id = video.get("format_id") or audio.get("format_id") or "?"
+        raise RuntimeError(
+            f"No se encontraron rangos DASH (init/index) para el formato {fmt_id}. "
+            "El video puede estar en un formato no compatible con el reproductor web."
+        )
+    video_init, video_index = video_ranges
+    audio_init, audio_index = audio_ranges
     width = int(video.get("width") or 1280)
     height = int(video.get("height") or 720)
     bandwidth_v = int((video.get("tbr") or 2000) * 1000)
@@ -58,8 +66,8 @@ def manifest(url: str, quality: str | None = None) -> str:
     <AdaptationSet id="video" contentType="video" mimeType="{video_mime}" codecs="{video_codec}" width="{width}" height="{height}" frameRate="{int(video.get('fps') or 30)}" startWithSAP="1" subsegmentAlignment="true">
       <Representation id="{html.escape(str(video.get('format_id') or 'video'))}" bandwidth="{bandwidth_v}" width="{width}" height="{height}">
         <BaseURL>{video_url}</BaseURL>
-        <SegmentBase indexRange="{video_index}" indexRangeExact="true">
-          <Initialization range="{video_init}" />
+        <SegmentBase indexRange="{html.escape(video_index)}" indexRangeExact="true">
+          <Initialization range="{html.escape(video_init)}" />
         </SegmentBase>
       </Representation>
     </AdaptationSet>
@@ -67,8 +75,8 @@ def manifest(url: str, quality: str | None = None) -> str:
       <Representation id="{html.escape(str(audio.get('format_id') or 'audio'))}" bandwidth="{bandwidth_a}" audioSamplingRate="{int(audio.get('asr') or 44100)}">
         <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="{int(audio.get('audio_channels') or 2)}" />
         <BaseURL>{audio_url}</BaseURL>
-        <SegmentBase indexRange="{audio_index}" indexRangeExact="true">
-          <Initialization range="{audio_init}" />
+        <SegmentBase indexRange="{html.escape(audio_index)}" indexRangeExact="true">
+          <Initialization range="{html.escape(audio_init)}" />
         </SegmentBase>
       </Representation>
     </AdaptationSet>
@@ -139,10 +147,11 @@ def _select_formats(info: dict[str, Any], quality: str | None = None) -> tuple[d
 
 
 def _is_browser_video_candidate(fmt: dict[str, Any]) -> bool:
+    # Only MP4 container — VHS requires ISOBMFF SIDX for DASH; WebM uses EBML Cues (incompatible)
     ext = (fmt.get("ext") or "").lower()
     codec = (fmt.get("vcodec") or "").lower()
-    return ext in {"mp4", "webm"} and (
-        codec.startswith("avc1") or codec.startswith("vp9") or codec.startswith("av01")
+    return ext == "mp4" and (
+        codec.startswith("avc1") or codec.startswith("av01")
     )
 
 
@@ -156,10 +165,9 @@ def _is_browser_audio_candidate(fmt: dict[str, Any]) -> bool:
 
 def _video_score(fmt: dict[str, Any]) -> tuple:
     codec = (fmt.get("vcodec") or "").lower()
-    ext = (fmt.get("ext") or "").lower()
-    codec_bonus = 3 if codec.startswith("avc1") else 2 if codec.startswith("vp9") else 1
-    ext_bonus = 1 if ext == "mp4" else 0
-    return (int(fmt.get("height") or 0), int(fmt.get("fps") or 0), codec_bonus, ext_bonus, float(fmt.get("tbr") or 0))
+    # Prefer avc1 (widest compat) then av01; height is primary, codec secondary
+    codec_bonus = 2 if codec.startswith("avc1") else 1
+    return (int(fmt.get("height") or 0), int(fmt.get("fps") or 0), codec_bonus, float(fmt.get("tbr") or 0))
 
 
 def _audio_score(fmt: dict[str, Any]) -> tuple:
@@ -189,41 +197,60 @@ def _proxy_url(fmt: dict[str, Any]) -> str:
     return f"/api/player/proxy?src={quote(fmt['url'], safe='')}"
 
 
-def _segment_ranges(fmt: dict[str, Any]) -> tuple[str, str]:
+def _segment_ranges(fmt: dict[str, Any]) -> tuple[str, str] | None:
+    """Return (init_range, index_range) or None if format doesn't have ISOBMFF sidx."""
     cache_key = fmt.get("url", "")
     cached = _cache_get(_SEGMENT_RANGE_CACHE, cache_key)
     if cached is not None:
-        return cached
-    headers = dict(fmt.get("http_headers") or {})
-    headers["Range"] = "bytes=0-1048575"
-    with httpx.Client(follow_redirects=True, timeout=30) as client:
-        response = client.get(fmt["url"], headers=headers)
-        response.raise_for_status()
-    data = response.content
-    boxes = []
-    pos = 0
-    while pos + 8 <= len(data):
-        size = struct.unpack(">I", data[pos:pos + 4])[0]
-        box_type = data[pos + 4:pos + 8].decode("latin1")
-        header_size = 8
-        if size == 1:
-            if pos + 16 > len(data):
+        return cached if (cached[0] or cached[1]) else None
+
+    # Prefer HTTP header hints (fast path, no extra request)
+    init_range = fmt.get("init_range") or {}
+    index_range = fmt.get("index_range") or {}
+    if init_range.get("end") and index_range.get("start") and index_range.get("end"):
+        init_str = f"{init_range.get('start', 0)}-{init_range['end']}"
+        idx_str = f"{index_range['start']}-{index_range['end']}"
+        result = (init_str, idx_str)
+        _cache_set(_SEGMENT_RANGE_CACHE, cache_key, result)
+        return result
+
+    # Fall back to byte-range probe
+    try:
+        headers = dict(fmt.get("http_headers") or {})
+        headers["Range"] = "bytes=0-2097151"  # 2 MB — sidx may be past 1 MB
+        with httpx.Client(follow_redirects=True, timeout=30) as client:
+            response = client.get(fmt["url"], headers=headers)
+            response.raise_for_status()
+        data = response.content
+        boxes = []
+        pos = 0
+        while pos + 8 <= len(data):
+            size = struct.unpack(">I", data[pos:pos + 4])[0]
+            box_type = data[pos + 4:pos + 8].decode("latin1")
+            header_size = 8
+            if size == 1:
+                if pos + 16 > len(data):
+                    break
+                size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+                header_size = 16
+            if size < header_size or size > 100_000_000:
                 break
-            size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
-            header_size = 16
-        if size < header_size:
-            break
-        boxes.append((box_type, pos, pos + size - 1))
-        pos += size
-        if box_type == "sidx":
-            break
-    moov = next((box for box in boxes if box[0] == "moov"), None)
-    sidx = next((box for box in boxes if box[0] == "sidx"), None)
-    if not moov or not sidx:
-        raise RuntimeError(f"No se pudieron detectar rangos DASH para formato {fmt.get('format_id')}")
-    ranges = (f"0-{moov[2]}", f"{sidx[1]}-{sidx[2]}")
-    _cache_set(_SEGMENT_RANGE_CACHE, cache_key, ranges)
-    return ranges
+            boxes.append((box_type, pos, pos + size - 1))
+            pos += size
+            if box_type == "sidx":
+                break
+        moov = next((box for box in boxes if box[0] == "moov"), None)
+        sidx = next((box for box in boxes if box[0] == "sidx"), None)
+        if moov and sidx:
+            result = (f"0-{moov[2]}", f"{sidx[1]}-{sidx[2]}")
+            _cache_set(_SEGMENT_RANGE_CACHE, cache_key, result)
+            return result
+    except Exception:
+        pass
+
+    # No sidx found — signal that SegmentBase should be omitted
+    _cache_set(_SEGMENT_RANGE_CACHE, cache_key, ("", ""))
+    return None
 
 
 def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any | None:

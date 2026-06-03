@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -37,9 +38,14 @@ def export_cookies(headless: bool = True) -> Path:
         context.close()
 
     if not _has_login_cookie(cookies):
+        login_script = (
+            "scripts\\windows\\login-youtube.ps1"
+            if sys.platform == "win32"
+            else "scripts/linux/login-youtube.sh"
+        )
         raise RuntimeError(
             "El perfil administrado de Playzi no tiene sesion de YouTube. "
-            "Ejecuta scripts\\login-youtube.ps1 e inicia sesion una vez."
+            f"Ejecuta {login_script} e inicia sesion una vez."
         )
 
     _write_netscape_cookie_file(exported_cookies_path(), cookies)

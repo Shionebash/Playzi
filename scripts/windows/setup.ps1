@@ -17,6 +17,7 @@ if (!(Test-Path $Venv)) {
 $VenvPython = Join-Path $Venv "Scripts\python.exe"
 & $VenvPython -m pip install --upgrade pip
 & $VenvPython -m pip install -r (Join-Path $Root "requirements.txt")
+& $VenvPython -m playwright install chromium 2>&1 | Out-Null
 
 $EnvPath = Join-Path $Root ".env"
 if (!(Test-Path $EnvPath)) {

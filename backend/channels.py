@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import time
 import uuid
 from typing import Any
@@ -90,12 +91,18 @@ def refresh_channel(channel_id: str) -> dict[str, Any]:
 
 
 def refresh_all_channels() -> list[dict[str, Any]]:
-    refreshed = []
-    for channel in list_channels():
-        try:
-            refreshed.append(refresh_channel(channel["id"]))
-        except Exception:
-            refreshed.append(next(c for c in read_state()["channels"] if c["id"] == channel["id"]))
+    channels = list_channels()
+    if not channels:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="playzi-ch") as executor:
+        futures = {executor.submit(refresh_channel, c["id"]): c["id"] for c in channels}
+        refreshed = []
+        for future in concurrent.futures.as_completed(futures):
+            channel_id = futures[future]
+            try:
+                refreshed.append(future.result())
+            except Exception:
+                refreshed.append(next(c for c in read_state()["channels"] if c["id"] == channel_id))
     return refreshed
 
 

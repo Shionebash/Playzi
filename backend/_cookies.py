@@ -42,37 +42,35 @@ def _secure_permissions(path: Path) -> None:
     """Restrict cookie cache to the current user only."""
     if not path.exists():
         return
-    if sys.platform != "win32":
+    if sys.platform == "win32":
+        username = os.environ.get("USERNAME", "")
+        if not username:
+            return
+        domain = os.environ.get("USERDOMAIN", "")
+        user = f"{domain}\\{username}" if domain else username
+        try:
+            subprocess.run(
+                [
+                    "icacls",
+                    str(path),
+                    "/inheritance:r",
+                    "/grant:r",
+                    f"{user}:F",
+                    "/remove:g",
+                    "Users",
+                    "Everyone",
+                    "Authenticated Users",
+                ],
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            pass
+    else:
         try:
             path.chmod(0o600)
         except OSError:
             pass
-        return
-
-    username = os.environ.get("USERNAME", "")
-    if not username:
-        return
-    domain = os.environ.get("USERDOMAIN", "")
-    user = f"{domain}\\{username}" if domain else username
-
-    try:
-        subprocess.run(
-            [
-                "icacls",
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"{user}:F",
-                "/remove:g",
-                "Users",
-                "Everyone",
-                "Authenticated Users",
-            ],
-            check=False,
-            capture_output=True,
-        )
-    except OSError:
-        pass
 
 
 def _cache_from_file(source: Path) -> Path:

@@ -17,6 +17,7 @@ const state = {
   musicRecomLastSync: "",
   musicPlaylists: [],
   musicPlaylistsLastSync: "",
+  channelsLastSync: "",
   musicLibrary: { songs: [], liked: [], albums: [], artists: [], playlists: [], history: [], lastSync: "", error: "" },
   syncStatus: {},
   player: {
@@ -27,6 +28,10 @@ const state = {
     loading: false,
     sourceContext: "search",
     audioOnly: false,
+    shuffle: false,
+    repeat: "none",
+    autoplay: localStorage.getItem("playzi-autoplay") !== "0",
+    _originalQueue: [],
     _listenerAbort: null,
     _loadingId: 0,
   },
@@ -175,6 +180,7 @@ function _destroyPlayer() {
   }
   state.player.current = null;
   state.player.queue = [];
+  state.player._originalQueue = [];
   state.player.loading = false;
   state.player.audioOnly = false;
   state.player.sourceContext = "search";
@@ -253,6 +259,7 @@ function applyBootstrap(data) {
   state.musicPlaylists = data.musicPlaylists?.items || [];
   state.musicPlaylistsLastSync = data.musicPlaylists?.lastSync || "";
   state.musicLibrary = data.musicLibrary || state.musicLibrary;
+  state.channelsLastSync = data.channelsLastSync || "";
   state.syncStatus = data.syncStatus || {};
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
 }
@@ -495,8 +502,12 @@ function _uniqueByUrl(items) {
 }
 
 function renderChannels() {
+  const lastSync = state.channelsLastSync || "";
   $("#view-channels").innerHTML = `
-    <div class="section-hdr"><span class="section-title">Canales</span><span class="meta">${state.channels.length} canales</span></div>
+    <div class="section-hdr">
+      <span class="section-title">Canales ${lastSync ? `<span class="meta" style="font-size:10px;margin-left:8px">· sync: ${escapeHtml(lastSync)}</span>` : ""}</span>
+      <span class="meta">${state.channels.length} canales</span>
+    </div>
     <form class="inline-form" id="channelForm">
       <input class="form-input" name="url" placeholder="@canal o URL del canal" required>
       <input class="form-input" name="name" placeholder="Nombre opcional">
@@ -784,9 +795,14 @@ function _musicLayoutHtml() {
             <span id="musicDuration" class="music-time">0:00</span>
           </div>
           <div class="music-controls">
+            <button class="music-ctrl-sm" id="ctrlShuffle" type="button" title="Aleatorio">⇄</button>
             <button class="music-btn" id="watchPrev" type="button" title="Anterior">⏮</button>
             <button class="music-btn music-btn--play" id="musicPlayPause" type="button" title="Play/Pausa">▶</button>
             <button class="music-btn" id="watchNext" type="button" title="Siguiente">⏭</button>
+            <button class="music-ctrl-sm" id="ctrlRepeat" type="button" title="Repetir">↻</button>
+          </div>
+          <div class="music-extra-ctrl">
+            <button class="btn btn-ghost btn-player-ctrl" type="button" id="ctrlAutoplay" title="Autoplay">∞</button>
           </div>
           <div class="music-volume">
             <span class="music-vol-icon" id="musicVolIcon">🔊</span>
@@ -841,11 +857,7 @@ function renderWatch() {
       const sig = { signal: ac.signal };
       // music: ended listener on native <audio>
       const media = $("#webPlayerAudio");
-      media.addEventListener("ended", () => {
-        if (state.player.index < state.player.queue.length - 1) {
-          loadWebPlayerItem(state.player.index + 1);
-        }
-      }, sig);
+      media.addEventListener("ended", () => { _onTrackEnded(); }, sig);
       _setupMusicListeners(sig);
     }
     // video: ended listener added inside ensureVideoPlayer()
@@ -880,6 +892,7 @@ function _updateVideoMeta(error = "") {
     <div class="watch-actions">
       <button class="btn btn-ghost" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>⏮ Anterior</button>
       <button class="btn btn-ghost" type="button" id="watchNext" ${hasNext ? "" : "disabled"}>Siguiente ⏭</button>
+      ${_playerCtrlsHtml()}
       <button class="btn btn-primary" type="button" data-watch-download="video">Descargar</button>
       <button class="btn btn-ghost" type="button" data-watch-download="audio">Audio</button>
       <button class="btn btn-ghost" type="button" id="toggleAudioOnly">Solo audio</button>
@@ -918,6 +931,7 @@ function _updateMusicMeta(error = "") {
 
   if (prevBtn) prevBtn.disabled = state.player.index <= 0;
   if (nextBtn) nextBtn.disabled = state.player.index >= state.player.queue.length - 1;
+  _updatePlayerControls();
 
   const toggleBtn = $("#toggleAudioOnly");
   if (toggleBtn) toggleBtn.textContent = state.player.audioOnly ? "Ver video" : "Solo audio";
@@ -971,11 +985,13 @@ function _setupMusicListeners(sig) {
   audio.addEventListener("play", () => {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "⏸";
+    if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
   }, sig);
 
   audio.addEventListener("pause", () => {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "▶";
+    if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
   }, sig);
 
   const wrap = $("#musicProgressWrap");
@@ -1055,9 +1071,178 @@ function _itemToQueueEntry(item) {
   };
 }
 
+// ── Player controls: shuffle / repeat / autoplay / queue ─────────────────────
+
+function toggleShuffle() {
+  if (!state.player.shuffle) {
+    state.player._originalQueue = [...state.player.queue];
+    const current = state.player.queue[state.player.index];
+    const rest = state.player.queue.filter((_, i) => i !== state.player.index);
+    for (let i = rest.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    state.player.queue = [current, ...rest];
+    state.player.index = 0;
+    state.player.shuffle = true;
+  } else {
+    const current = state.player.current;
+    state.player.queue = [...state.player._originalQueue];
+    state.player.index = state.player.queue.findIndex((item) => item.url === current?.url);
+    if (state.player.index === -1) state.player.index = 0;
+    state.player._originalQueue = [];
+    state.player.shuffle = false;
+  }
+  _updateWatchQueue();
+  _updatePlayerControls();
+}
+
+function cycleRepeat() {
+  const modes = ["none", "one", "all"];
+  const i = modes.indexOf(state.player.repeat);
+  state.player.repeat = modes[(i + 1) % 3];
+  _updatePlayerControls();
+}
+
+function toggleAutoplay() {
+  state.player.autoplay = !state.player.autoplay;
+  localStorage.setItem("playzi-autoplay", state.player.autoplay ? "1" : "0");
+  _updatePlayerControls();
+}
+
+function _updatePlayerControls() {
+  const shuffleBtn = $("#ctrlShuffle");
+  const repeatBtn = $("#ctrlRepeat");
+  const autoplayBtn = $("#ctrlAutoplay");
+  if (shuffleBtn) {
+    shuffleBtn.classList.toggle("btn-player-ctrl-on", state.player.shuffle);
+    shuffleBtn.title = state.player.shuffle ? "Aleatorio: activo" : "Aleatorio";
+  }
+  if (repeatBtn) {
+    const repeat = state.player.repeat;
+    repeatBtn.classList.toggle("btn-player-ctrl-on", repeat !== "none");
+    repeatBtn.textContent = repeat === "one" ? "↻¹" : "↻";
+    repeatBtn.title = repeat === "none" ? "Repetir" : repeat === "one" ? "Repetir: una" : "Repetir: todas";
+  }
+  if (autoplayBtn) {
+    autoplayBtn.classList.toggle("btn-player-ctrl-on", state.player.autoplay);
+    autoplayBtn.title = state.player.autoplay ? "Autoplay: activo" : "Autoplay";
+  }
+}
+
+function _playerCtrlsHtml() {
+  const sh = state.player.shuffle;
+  const rep = state.player.repeat;
+  const ap = state.player.autoplay;
+  return `
+    <button class="btn btn-ghost btn-player-ctrl ${sh ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlShuffle" title="${sh ? "Aleatorio: activo" : "Aleatorio"}">⇄</button>
+    <button class="btn btn-ghost btn-player-ctrl ${rep !== "none" ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlRepeat" title="${rep === "none" ? "Repetir" : rep === "one" ? "Repetir: una" : "Repetir: todas"}">${rep === "one" ? "↻¹" : "↻"}</button>
+    <button class="btn btn-ghost btn-player-ctrl ${ap ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlAutoplay" title="${ap ? "Autoplay: activo" : "Autoplay"}">∞</button>
+  `;
+}
+
+async function _onTrackEnded() {
+  if (state.player.repeat === "one") {
+    loadWebPlayerItem(state.player.index);
+    return;
+  }
+  if (state.player.index < state.player.queue.length - 1) {
+    loadWebPlayerItem(state.player.index + 1);
+    return;
+  }
+  if (state.player.repeat === "all" && state.player.queue.length > 0) {
+    loadWebPlayerItem(0);
+    return;
+  }
+  if (state.player.autoplay && state.player.current?.url) {
+    try {
+      const data = await api.get(`/api/radio?url=${encodeURIComponent(state.player.current.url)}`);
+      if (data.items?.length) {
+        toast("Autoplay: cargando mix relacionado...");
+        state.player.queue.push(...data.items);
+        if (state.player.shuffle) state.player._originalQueue.push(...data.items);
+        _updateWatchQueue();
+        loadWebPlayerItem(state.player.index + 1);
+      }
+    } catch (_) {}
+  }
+}
+
+function addToQueue(item) {
+  const entry = _itemToQueueEntry(item);
+  if (!state.player.current) {
+    const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
+    openWatchQueue([entry], 0, ctx);
+    return;
+  }
+  state.player.queue.push(entry);
+  if (state.player.shuffle) state.player._originalQueue.push(entry);
+  _updateWatchQueue();
+  toast("Añadido a la cola");
+}
+
+function playNext(item) {
+  const entry = _itemToQueueEntry(item);
+  if (!state.player.current) {
+    const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
+    openWatchQueue([entry], 0, ctx);
+    return;
+  }
+  state.player.queue.splice(state.player.index + 1, 0, entry);
+  if (state.player.shuffle) state.player._originalQueue.push(entry);
+  _updateWatchQueue();
+  toast("Se reproducirá a continuación");
+}
+
+function _updateMediaSession() {
+  if (!navigator.mediaSession) return;
+  const item = state.player.current;
+  if (!item) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: item.title || "",
+    artist: item.channel || "",
+    artwork: item.thumbnail
+      ? [{ src: thumbSrc(item.thumbnail), sizes: "480x360", type: "image/jpeg" }]
+      : [],
+  });
+  const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+  const audioEl = isAudio ? $("#webPlayerAudio") : null;
+  const vjs = !isAudio ? state.player.vjs : null;
+  navigator.mediaSession.setActionHandler("play", () => {
+    if (audioEl) audioEl.play().catch(() => {});
+    else if (vjs) vjs.play();
+    navigator.mediaSession.playbackState = "playing";
+  });
+  navigator.mediaSession.setActionHandler("pause", () => {
+    if (audioEl) audioEl.pause();
+    else if (vjs) vjs.pause();
+    navigator.mediaSession.playbackState = "paused";
+  });
+  navigator.mediaSession.setActionHandler("previoustrack", () => {
+    if (state.player.index > 0) loadWebPlayerItem(state.player.index - 1);
+  });
+  navigator.mediaSession.setActionHandler("nexttrack", () => {
+    if (state.player.index < state.player.queue.length - 1) loadWebPlayerItem(state.player.index + 1);
+    else _onTrackEnded();
+  });
+  navigator.mediaSession.setActionHandler("seekbackward", (d) => {
+    const s = d?.seekOffset ?? 10;
+    if (audioEl) audioEl.currentTime = Math.max(0, audioEl.currentTime - s);
+    else if (vjs) vjs.currentTime(Math.max(0, vjs.currentTime() - s));
+  });
+  navigator.mediaSession.setActionHandler("seekforward", (d) => {
+    const s = d?.seekOffset ?? 10;
+    if (audioEl) audioEl.currentTime = Math.min(audioEl.duration || Infinity, audioEl.currentTime + s);
+    else if (vjs) vjs.currentTime(Math.min(vjs.duration() || Infinity, vjs.currentTime() + s));
+  });
+  navigator.mediaSession.playbackState = "playing";
+}
+
 async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   state.player.audioOnly = false;
   state.player.sourceContext = sourceContext;
+  state.player.shuffle = false;
+  state.player._originalQueue = [];
   if (queue.length === 1 && isUrl(queue[0].url) && queue[0].url.includes("list=") && !queue[0].url.includes("watch?v=")) {
     toast("Cargando cola...");
     try {
@@ -1118,6 +1303,7 @@ async function _loadMusicItem(item, loadId) {
   _updateWatchMeta();
   _updateWatchQueue();
   _updateWatchRelated();
+  _updateMediaSession();
 }
 
 async function _loadVideoItem(item, loadId) {
@@ -1135,6 +1321,7 @@ async function _loadVideoItem(item, loadId) {
   _updateWatchMeta();
   _updateWatchQueue();
   _updateWatchRelated();
+  _updateMediaSession();
 }
 
 async function ensureVideoPlayer() {
@@ -1155,14 +1342,14 @@ async function ensureVideoPlayer() {
   state.player.vjs = player;
   player.on("error", () => {
     const err = player.error();
-    toast(err?.message || "Error del reproductor");
-    _updateWatchMeta(err?.message || "Error de reproducción");
+    const code = err?.code;
+    const msg = code === 4
+      ? "Formato no compatible con el reproductor web. Prueba con un reproductor externo (MPV/VLC) o baja la calidad."
+      : (err?.message || "Error de reproducción");
+    toast(msg);
+    _updateWatchMeta(msg);
   });
-  player.on("ended", () => {
-    if (state.player.index < state.player.queue.length - 1) {
-      loadWebPlayerItem(state.player.index + 1);
-    }
-  });
+  player.on("ended", () => { _onTrackEnded(); });
   // Restore / persist volume
   player.ready(() => {
     const savedVol = localStorage.getItem("playzi-volume");
@@ -1455,7 +1642,8 @@ function videoCard(item) {
       <div class="card-actions">
         ${isPlaylist ? `<button class="btn btn-primary" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : `<button class="btn btn-primary" type="button" data-download="video" data-id="${id}">Descargar</button>`}
         ${isPlaylist ? "" : `<button class="btn btn-ghost" type="button" data-download="audio" data-id="${id}">Audio</button>`}
-        <button class="btn btn-ghost" type="button" data-play-default data-id="${id}">Reproducir</button>
+        <button class="btn btn-ghost" type="button" data-play-default data-id="${id}">▶ Play</button>
+        ${!isPlaylist ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
         <button class="btn btn-ghost" type="button"
           data-add-to-playlist="${escapeHtml(item.url || item.feedId || '')}"
           data-playlist-title="${escapeHtml(item.title || '')}"
@@ -2004,6 +2192,11 @@ function bindEvents() {
       const item = findVideo(play.dataset.id);
       if (item) await openWatchQueue([_itemToQueueEntry(item)], 0, state.view);
     }
+    const addToQueueBtn = ev.target.closest("[data-add-to-queue]");
+    if (addToQueueBtn) {
+      const item = findVideo(addToQueueBtn.dataset.id);
+      if (item) addToQueue(item);
+    }
     const local = ev.target.closest("[data-local-play-default]");
     if (local) await playTarget(local.dataset.path, null, local.dataset.path);
 
@@ -2271,6 +2464,9 @@ function bindEvents() {
     if (ev.target.closest("#watchNext") && state.player.index < state.player.queue.length - 1) {
       await loadWebPlayerItem(state.player.index + 1);
     }
+    if (ev.target.closest("#ctrlShuffle")) { toggleShuffle(); }
+    if (ev.target.closest("#ctrlRepeat")) { cycleRepeat(); }
+    if (ev.target.closest("#ctrlAutoplay")) { toggleAutoplay(); }
     if (ev.target.closest("#playerExternal") && state.player.current?.url) {
       const cur = state.player.current;
       await playTarget(cur.url, state.config?.defaultPlayer || "mpv", cur.title, cur.thumbnail, cur.channel);
@@ -2327,8 +2523,13 @@ function bindEvents() {
       else if (vjs) vjs.currentTime(Math.min(vjs.duration() || Infinity, vjs.currentTime() + 10));
     } else if (ev.code === "KeyN") {
       if (state.player.index < state.player.queue.length - 1) await loadWebPlayerItem(state.player.index + 1);
+      else _onTrackEnded();
     } else if (ev.code === "KeyP") {
       if (state.player.index > 0) await loadWebPlayerItem(state.player.index - 1);
+    } else if (ev.code === "KeyS") {
+      toggleShuffle();
+    } else if (ev.code === "KeyR") {
+      cycleRepeat();
     }
   });
 }

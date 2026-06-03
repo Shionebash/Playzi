@@ -26,6 +26,7 @@ from .history import delete_history_event
 from .playlists import add_item as playlist_add_item
 from .playlists import create_playlist, delete_playlist, import_playlist, list_playlists, remove_item as playlist_remove_item, rename_playlist, reorder_items as reorder_playlist_items, sync_playlist
 from .downloads import cancel_download, delete_download, list_download_status, list_downloads, list_history, list_library, start_download
+from .state import read_state_key
 from .player import _resolve_vlc_stream, playlist_entries, play, resolve_stream_info
 from .recommendations import list_recommendations
 from .tasks import get_task, list_tasks, start_task
@@ -36,7 +37,7 @@ from .ytmusic import (
     fetch_playlist_songs, list_music_library, list_music_playlists, list_music_recommendations,
     refresh_music_library, search_music,
 )
-from .youtube import search
+from .youtube import fetch_radio_items, search
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,7 @@ def _bootstrap_payload() -> dict:
         "musicRecommendations": music_recommendations,
         "musicPlaylists": music_playlists,
         "musicLibrary": list_music_library(),
+        "channelsLastSync": read_state_key("channelsLastSync"),
         "syncStatus": get_sync_status(),
     }
 
@@ -590,6 +592,16 @@ def api_playlist_m3u(url: str, quality: str | None = None):
         )
         lines.append(stream_url)
     return Response("\n".join(lines) + "\n", media_type="audio/x-mpegurl")
+
+
+@app.get("/api/radio")
+def api_radio(url: str):
+    try:
+        items = fetch_radio_items(url)
+        return {"items": items}
+    except Exception as exc:
+        logger.exception("Error al obtener radio mix")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/recommendations")
