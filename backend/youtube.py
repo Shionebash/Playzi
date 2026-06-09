@@ -119,7 +119,8 @@ def search(query: str, limit: int | None = None) -> list[dict[str, Any]]:
     if not query:
         return []
     effective_limit = limit or YTDLP_SEARCH_LIMIT
-    cached = _cache_get(_SEARCH_CACHE, query)
+    cache_key = f"{query}|{effective_limit}"
+    cached = _cache_get(_SEARCH_CACHE, cache_key)
     if cached is not None:
         return cached
     target = query if is_youtube_url(query) else f"ytsearch{effective_limit}:{query}"
@@ -140,7 +141,7 @@ def search(query: str, limit: int | None = None) -> list[dict[str, Any]]:
         items = [_entry_to_item(e) for e in entries if e]
     else:
         items = [_entry_to_item(info)]
-    _cache_set(_SEARCH_CACHE, query, items)
+    _cache_set(_SEARCH_CACHE, cache_key, items)
     return items
 
 

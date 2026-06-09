@@ -116,6 +116,15 @@ body.sidebar-collapsed .nav-item b { display: none; }
   display: flex; flex-direction: column; gap: 4px;
 }
 
+.nav-item.auth-status > .auth-dot {
+  width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0;
+  background: var(--tx3); margin: 0 6px;
+}
+.auth-status .auth-label { overflow: hidden; text-overflow: ellipsis; }
+.nav-item.auth-status.auth-ok > .auth-dot { background: oklch(.65 .17 150); box-shadow: 0 0 6px oklch(.65 .17 150 / .6); }
+.auth-status.auth-ok { color: var(--tx); }
+.nav-item.auth-status.auth-off > .auth-dot { background: oklch(.62 .20 25); }
+
 /* Color picker */
 .color-picker-group {
   display: flex; gap: 6px; padding: 7px 10px;
@@ -212,6 +221,12 @@ body.sidebar-collapsed .color-picker-group { opacity: 0; pointer-events: none; }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(235px, 1fr));
   gap: 13px;
+}
+.search-result-group {
+  margin-bottom: 24px;
+}
+.search-result-group:last-child {
+  margin-bottom: 0;
 }
 .card {
   overflow: hidden; border-radius: 14px; background: var(--bg2);

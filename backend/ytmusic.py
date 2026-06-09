@@ -150,44 +150,46 @@ def _ytmusic_client(prefer_auth: bool = True) -> YTMusic:
     return YTMusic(auth, language="es", location="EC")
 
 
-def _session_auth_state(client: YTMusic) -> str:
-    """Return "ok" if the YouTube session is authenticated server-side, else "expired"."""
+def _session_auth_state(client: YTMusic) -> tuple[str, str]:
+    """Return ("ok", accountName) if authenticated server-side, else ("expired", "")."""
     if client.auth_type != AuthType.BROWSER:
-        return "expired"
+        return "expired", ""
     try:
         info = client.get_account_info()
-        return "ok" if info and info.get("accountName") else "expired"
+        name = (info or {}).get("accountName") or ""
+        return ("ok", name) if name else ("expired", "")
     except Exception:
-        return "expired"
+        return "expired", ""
 
 
-def _set_music_auth_state(state: str) -> None:
+def _set_music_auth_state(state: str, account_name: str = "") -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
     def mutate(data):
         data["musicAuthState"] = state
         data["musicAuthCheckedAt"] = now
+        data["musicAccountName"] = account_name if state == "ok" else ""
 
     update_state(mutate)
 
 
-def _get_validated_client() -> tuple[YTMusic, str]:
+def _get_validated_client() -> tuple[YTMusic, str, str]:
     """Build a YTMusic client and verify the session is really logged in.
 
     If anonymous and using the managed 'playzi' profile, force a cookie re-export
-    (recovers when the cache was merely stale). Returns (client, "ok"|"expired").
+    (recovers when the cache was merely stale). Returns (client, "ok"|"expired", accountName).
     """
     client = _ytmusic_client(prefer_auth=True)
-    state = _session_auth_state(client)
+    state, account_name = _session_auth_state(client)
     if state != "ok" and config.COOKIES_BROWSER.lower() == "playzi":
         try:
             get_cookie_opts(force=True)
             client = _ytmusic_client(prefer_auth=True)
-            state = _session_auth_state(client)
+            state, account_name = _session_auth_state(client)
         except Exception:
             pass
-    _set_music_auth_state(state)
-    return client, state
+    _set_music_auth_state(state, account_name)
+    return client, state, account_name
 
 
 def _items_from_ytmusic_home(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -460,7 +462,7 @@ _SESSION_EXPIRED_WARNING = (
 
 
 def fetch_music_recommendations() -> dict[str, Any]:
-    client, auth_state = _get_validated_client()
+    client, auth_state, _account = _get_validated_client()
     if auth_state != "ok":
         # Don't overwrite saved content with anonymous/generic data.
         # Advance the timestamp so autosync respects the interval (avoids
@@ -513,7 +515,7 @@ def list_music_recommendations() -> dict[str, Any]:
 # ── Playlists ─────────────────────────────────────────────────────────────────
 
 def fetch_music_playlists() -> dict[str, Any]:
-    client, auth_state = _get_validated_client()
+    client, auth_state, _account = _get_validated_client()
     if auth_state != "ok":
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         update_state(lambda d: d.update({"musicPlaylistsLastSync": now}))
@@ -576,7 +578,7 @@ def list_music_library() -> dict[str, Any]:
 
 
 def refresh_music_library() -> dict[str, Any]:
-    client, auth_state = _get_validated_client()
+    client, auth_state, _account = _get_validated_client()
     if auth_state != "ok":
         data = read_state().get("musicLibrary", {})
         return {**data, "authState": auth_state, "error": _SESSION_EXPIRED_WARNING}
@@ -627,7 +629,9 @@ def search_music(query: str, limit: int = 20, search_filter: str | None = None) 
     items = []
     for item in results:
         video_id = item.get("videoId")
-        playlist_id = item.get("playlistId") or item.get("browseId")
+        browse_id = item.get("browseId")
+        result_type = _music_result_type(item)
+        playlist_id = item.get("playlistId") or (browse_id if result_type == "playlist" else None)
         thumbnails = item.get("thumbnails") or []
         if video_id:
             items.append({
@@ -638,6 +642,7 @@ def search_music(query: str, limit: int = 20, search_filter: str | None = None) 
                 "durationText": item.get("duration") or "--:--",
                 "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
                 "source": "music",
+                "resultType": "track" if result_type in {"song", "track"} else "video",
             })
         elif playlist_id:
             items.append({
@@ -649,6 +654,28 @@ def search_music(query: str, limit: int = 20, search_filter: str | None = None) 
                 "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
                 "source": "music",
                 "resultType": "playlist",
+            })
+        elif browse_id and result_type == "artist":
+            items.append({
+                "id": browse_id,
+                "url": f"https://music.youtube.com/browse/{browse_id}",
+                "title": item.get("title") or item.get("artist") or "Artista",
+                "channel": item.get("subscribers") or item.get("category") or "Artista",
+                "durationText": "Artista",
+                "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+                "source": "music",
+                "resultType": "artist",
+            })
+        elif browse_id and result_type == "album":
+            items.append({
+                "id": browse_id,
+                "url": f"https://music.youtube.com/browse/{browse_id}",
+                "title": item.get("title") or "Album",
+                "channel": _artists_text(item) or item.get("artist") or item.get("category") or "YouTube Music",
+                "durationText": "Album",
+                "thumbnail": thumbnails[-1].get("url") if thumbnails else "",
+                "source": "music",
+                "resultType": "album",
             })
     _cache_set(_MUSIC_SEARCH_CACHE, cache_key, items)
     return items
@@ -694,3 +721,35 @@ def _music_library_groups(items: list[dict[str, Any]], kind: str) -> list[dict[s
 def _artists_text(item: dict[str, Any]) -> str:
     artists = item.get("artists") or []
     return ", ".join(a.get("name", "") for a in artists if a.get("name"))
+
+
+def _music_result_type(item: dict[str, Any]) -> str:
+    raw = str(item.get("resultType") or item.get("category") or "").strip().lower()
+    normalized = {
+        "songs": "song",
+        "canciones": "song",
+        "song": "song",
+        "tracks": "track",
+        "track": "track",
+        "videos": "video",
+        "video": "video",
+        "artists": "artist",
+        "artistas": "artist",
+        "artist": "artist",
+        "albums": "album",
+        "albumes": "album",
+        "álbumes": "album",
+        "album": "album",
+        "playlists": "playlist",
+        "listas": "playlist",
+        "playlist": "playlist",
+    }.get(raw)
+    if normalized:
+        return normalized
+    if item.get("videoId"):
+        return "song" if item.get("duration") else "video"
+    if item.get("playlistId"):
+        return "playlist"
+    if item.get("browseId"):
+        return "artist"
+    return ""

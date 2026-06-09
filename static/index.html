@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <script src="/static/playzi-theme-init.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=7">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
   <div class="shell" id="shell">
@@ -28,6 +28,7 @@
       <button type="button" class="nav-item" data-view="history"><span>↺</span><span>Historial</span></button>
       <button type="button" class="nav-item" data-view="config"><span>⚙</span><span>Configuración</span></button>
       <div class="sidebar-bottom">
+        <button type="button" class="nav-item auth-status auth-off" id="authStatus" title="Inicia sesión en YouTube"><span class="auth-dot"></span><span class="auth-label">No conectado</span></button>
         <button type="button" class="nav-item" id="themeBtn"><span id="themeIcon" style="display:flex;align-items:center;justify-content:center;width:20px;flex-shrink:0"></span><span>Tema</span></button>
       </div>
     </aside>
@@ -64,6 +65,6 @@
   <div id="toast" class="toast hidden"></div>
   <link rel="stylesheet" href="/static/vendor/video-js.min.css">
   <script defer src="/static/vendor/video.min.js"></script>
-  <script defer src="/static/app.js?v=8"></script>
+  <script defer src="/static/app.js?v=9"></script>
 </body>
 </html>

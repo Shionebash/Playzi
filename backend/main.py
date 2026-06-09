@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
@@ -13,7 +14,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -180,9 +181,28 @@ class TaskStartResponse(BaseModel):
     task: dict
 
 
+_ASSET_VERSION_RE = re.compile(r'(/static/([^"\'?]+\.(?:js|css)))(?:\?v=[^"\']*)?')
+
+
+def _versioned_index() -> str:
+    """Serve index.html with cache-bust query strings derived from each asset's
+    mtime, so editing a .js/.css invalidates the browser cache automatically."""
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def repl(match: re.Match) -> str:
+        path, rel = match.group(1), match.group(2)
+        try:
+            version = int((STATIC_DIR / rel).stat().st_mtime)
+        except OSError:
+            return match.group(0)
+        return f"{path}?v={version}"
+
+    return _ASSET_VERSION_RE.sub(repl, html)
+
+
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return HTMLResponse(_versioned_index())
 
 
 @app.get("/api/config")
@@ -196,8 +216,21 @@ def _run_youtube_login() -> dict:
     from .ytmusic import _get_validated_client
 
     open_login_browser()  # blocks until the user closes the window
-    _client, state = _get_validated_client()
-    return {"authState": state}
+    _client, state, account_name = _get_validated_client()
+    return {"authState": state, "accountName": account_name}
+
+
+def _run_silent_auth_refresh() -> dict:
+    """Re-export cookies headless from the persistent profile and revalidate.
+
+    Never opens a visible browser. If the managed profile itself lost its Google
+    session, _get_validated_client returns "expired" and the frontend falls back
+    to the visible login flow.
+    """
+    from .ytmusic import _get_validated_client
+
+    _client, state, account_name = _get_validated_client()
+    return {"authState": state, "accountName": account_name}
 
 
 def _bootstrap_payload() -> dict:
@@ -220,6 +253,7 @@ def _bootstrap_payload() -> dict:
         "musicLibrary": list_music_library(),
         "channelsLastSync": read_state_key("channelsLastSync"),
         "musicAuthState": read_state_key("musicAuthState"),
+        "musicAccountName": read_state_key("musicAccountName"),
         "syncStatus": get_sync_status(),
     }
 
@@ -251,14 +285,15 @@ def api_config_update(payload: ConfigUpdate):
 def api_search(q: str, scope: str | None = None, search_filter: str | None = None, limit: int | None = None):
     try:
         selected = (scope or "all").lower()
-        music_limit = limit or 20
         if selected == "music":
+            music_limit = limit or 30
             return {"items": search_music(q, limit=music_limit, search_filter=search_filter)}
         if selected == "youtube":
-            return {"items": search(q, limit=limit)}
-        _music_limit = max(6, config.YTDLP_SEARCH_LIMIT // 2)
-        yt_fut = _SEARCH_POOL.submit(search, q)
-        mus_fut = _SEARCH_POOL.submit(lambda: search_music(q, limit=_music_limit))
+            return {"items": search(q, limit=limit or config.YTDLP_SEARCH_LIMIT)}
+        yt_limit = limit or config.YTDLP_SEARCH_LIMIT
+        music_limit = limit or max(30, config.YTDLP_SEARCH_LIMIT)
+        yt_fut = _SEARCH_POOL.submit(search, q, yt_limit)
+        mus_fut = _SEARCH_POOL.submit(lambda: search_music(q, limit=music_limit))
         yt_items = yt_fut.result(timeout=60)
         try:
             music_items = mus_fut.result(timeout=60)
@@ -679,6 +714,11 @@ def api_music_library_refresh():
 @app.post("/api/music/login")
 def api_music_login():
     return {"task": start_task("login-youtube", _run_youtube_login)}
+
+
+@app.post("/api/music/auth/refresh")
+def api_music_auth_refresh():
+    return {"task": start_task("auth-refresh", _run_silent_auth_refresh)}
 
 
 @app.get("/api/sync/status")

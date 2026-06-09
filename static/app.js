@@ -19,6 +19,7 @@ const state = {
   musicPlaylistsLastSync: "",
   channelsLastSync: "",
   musicAuthState: "",
+  musicAccountName: "",
   musicLibrary: { songs: [], liked: [], albums: [], artists: [], playlists: [], history: [], lastSync: "", error: "" },
   syncStatus: {},
   player: {
@@ -59,6 +60,7 @@ let _dragSrc = null;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
+const DEFAULT_MUSIC_SEARCH_LIMIT = 30;
 
 const api = {
   async get(path) {
@@ -238,9 +240,22 @@ async function loadAll() {
   try {
     applyBootstrap(await api.get("/api/bootstrap"));
     render();
+    _silentAuthRefresh();
   } catch (err) {
     toast(err.message);
   }
+}
+
+// On startup, silently revalidate the session against the persistent browser
+// profile. Never opens a visible browser (that's only the on-click fallback).
+async function _silentAuthRefresh() {
+  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  if (!hasCookies) return;
+  try {
+    const resp = await api.post("/api/music/auth/refresh");
+    await _pollTask(resp?.task?.id, 60);
+    await refreshLists();
+  } catch (_) {}
 }
 
 function applyBootstrap(data) {
@@ -263,6 +278,7 @@ function applyBootstrap(data) {
   state.musicLibrary = data.musicLibrary || state.musicLibrary;
   state.channelsLastSync = data.channelsLastSync || "";
   state.musicAuthState = data.musicAuthState || "";
+  state.musicAccountName = data.musicAccountName || "";
   state.syncStatus = data.syncStatus || {};
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
 }
@@ -322,7 +338,8 @@ async function doSearch() {
     const scope = state.searchScope === "all" ? "" : `&scope=${encodeURIComponent(state.searchScope)}`;
     const filter = (state.searchScope === "music" && state.musicSearchFilter)
       ? `&search_filter=${encodeURIComponent(state.musicSearchFilter)}` : "";
-    const data = await api.get(`/api/search?q=${encodeURIComponent(q)}${scope}${filter}`);
+    const limit = `&limit=${encodeURIComponent(searchLimitForScope(state.searchScope))}`;
+    const data = await api.get(`/api/search?q=${encodeURIComponent(q)}${scope}${filter}${limit}`);
     state.results = data.items || [];
   } catch (err) {
     toast(err.message);
@@ -334,6 +351,13 @@ async function doSearch() {
 function _matchesQuery(item, q) {
   const hay = `${item.title || item.name || ""} ${item.channel || ""} ${item.collection || ""}`.toLowerCase();
   return hay.includes(q.toLowerCase());
+}
+
+function searchLimitForScope(scope) {
+  const configured = Number(state.config?.searchLimit || 0);
+  if (scope === "youtube") return configured || 12;
+  if (scope === "music") return Math.max(DEFAULT_MUSIC_SEARCH_LIMIT, configured || 0);
+  return Math.max(DEFAULT_MUSIC_SEARCH_LIMIT, configured || 0);
 }
 
 function playlistResultItem(pl) {
@@ -352,6 +376,7 @@ function playlistResultItem(pl) {
 
 function render() {
   $("#downloadBadge").textContent = state.downloads.filter((d) => !["done", "error"].includes(d.status)).length || "";
+  renderAuthStatus();
   if (state.view === "home") renderHome();
   if (state.view === "search") renderSearch();
   if (state.view === "recom") renderRecom();
@@ -459,8 +484,26 @@ function renderSearch(loading = false) {
     ${!q ? empty("Busca por texto o pega una URL", "También puedes agregar canales para mejorar tus recomendaciones locales.") : ""}
     ${q && loading ? empty("Consultando YouTube", "yt-dlp está obteniendo metadata.") : ""}
     ${q && !loading && state.results.length === 0 ? empty("Sin resultados", "Prueba otra búsqueda o revisa la URL.") : ""}
-    ${state.results.length ? `<div class="grid">${state.results.map(videoCard).join("")}</div>` : ""}
+    ${state.results.length ? searchResultsHtml(state.results) : ""}
   `;
+}
+
+function searchResultsHtml(items) {
+  const shouldGroup = items.some((item) => item.source === "music" && ["track", "video", "artist", "playlist", "album"].includes(item.resultType || ""));
+  if (!shouldGroup) return `<div class="grid">${items.map(videoCard).join("")}</div>`;
+  const groups = [
+    ["Canciones", items.filter((item) => item.source === "music" && ["track", "video"].includes(item.resultType || ""))],
+    ["Artistas", items.filter((item) => item.source === "music" && item.resultType === "artist")],
+    ["Playlists", items.filter((item) => item.source === "music" && item.resultType === "playlist")],
+    ["Albumes", items.filter((item) => item.source === "music" && item.resultType === "album")],
+    ["YouTube", items.filter((item) => item.source !== "music")],
+  ].filter(([, groupItems]) => groupItems.length);
+  return groups.map(([title, groupItems]) => `
+    <section class="search-result-group">
+      <div class="section-hdr"><span class="section-title">${escapeHtml(title)}</span><span class="meta">${groupItems.length}</span></div>
+      <div class="grid">${groupItems.map(videoCard).join("")}</div>
+    </section>
+  `).join("");
 }
 
 function renderRecom() {
@@ -623,34 +666,69 @@ function renderLibrary() {
   `;
 }
 
-async function _awaitLoginTask(taskId) {
-  if (!taskId) return;
-  // Poll the login task until the user closes the browser window.
-  for (let i = 0; i < 600; i++) {
+async function _pollTask(taskId, maxTicks = 600) {
+  // Poll a background task until it finishes; returns the final task or null.
+  if (!taskId) return null;
+  for (let i = 0; i < maxTicks; i++) {
     await new Promise((r) => setTimeout(r, 2000));
     let task;
     try {
       task = await api.get(`/api/tasks/${taskId}`);
     } catch (_) { continue; }
-    if (task.status === "done") {
-      await refreshLists();
-      _musicSyncTriggered = false;
-      if (state.musicAuthState === "ok") {
-        toast("Sesión iniciada. Cargando tu contenido...");
-        try {
-          await api.post("/api/music/recommendations/refresh");
-          await api.post("/api/music/playlists/refresh");
-        } catch (_) {}
-      } else {
-        toast("La sesión sigue sin validar. Asegúrate de iniciar sesión completamente.");
-      }
-      if (state.view === "music") renderMusic();
+    if (task.status === "done" || task.status === "error") return task;
+  }
+  return null;
+}
+
+async function _onAuthSettled(silent = false) {
+  // Refresh state after an auth task; if logged in, pull music content.
+  await refreshLists();
+  _musicSyncTriggered = false;
+  if (state.musicAuthState === "ok") {
+    toast(state.musicAccountName ? `Conectado como ${state.musicAccountName}` : "Sesión iniciada.");
+    try {
+      await api.post("/api/music/recommendations/refresh");
+      await api.post("/api/music/playlists/refresh");
+    } catch (_) {}
+  } else if (!silent) {
+    toast("La sesión sigue sin validar. Asegúrate de iniciar sesión completamente.");
+  }
+  if (state.view === "music") renderMusic();
+}
+
+async function _awaitLoginTask(taskId) {
+  const task = await _pollTask(taskId);
+  if (!task) return;
+  if (task.status === "error") {
+    toast(task.error || "Error al iniciar sesión");
+    return;
+  }
+  await _onAuthSettled();
+}
+
+// Silent-first login: try a headless cookie re-export from the persistent
+// profile; only open the visible Chromium if that profile lost its session.
+let _loginFlowBusy = false;
+async function startLoginFlow() {
+  if (_loginFlowBusy) return;
+  _loginFlowBusy = true;
+  try {
+    toast("Reconectando con tu sesión...");
+    const resp = await api.post("/api/music/auth/refresh");
+    const task = await _pollTask(resp?.task?.id, 60);
+    await refreshLists();
+    if (state.musicAuthState === "ok") {
+      await _onAuthSettled(true);
       return;
     }
-    if (task.status === "error") {
-      toast(task.error || "Error al iniciar sesión");
-      return;
-    }
+    // Profile itself is logged out -> fall back to the visible browser login.
+    const visible = await api.post("/api/music/login");
+    toast("Abriendo navegador... inicia sesión en YouTube y cierra la ventana al terminar.");
+    await _awaitLoginTask(visible?.task?.id);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    _loginFlowBusy = false;
   }
 }
 
@@ -669,6 +747,18 @@ async function _autoTriggerMusicSync() {
   } catch (_) {
     _musicSyncTriggered = false;
   }
+}
+
+function renderAuthStatus() {
+  const el = $("#authStatus");
+  if (!el) return;
+  const ok = state.musicAuthState === "ok";
+  const name = state.musicAccountName || "";
+  el.classList.toggle("auth-ok", ok);
+  el.classList.toggle("auth-off", !ok);
+  const label = ok ? (name || "Conectado") : "No conectado";
+  el.title = ok ? `Conectado como ${name || "tu cuenta"}` : "Inicia sesión en YouTube";
+  el.innerHTML = `<span class="auth-dot"></span><span class="auth-label">${escapeHtml(label)}</span>`;
 }
 
 function _musicAuthBanner() {
@@ -1816,6 +1906,8 @@ async function closeWebPlayer() {
 function videoCard(item) {
   const id = escapeHtml(item.feedId || item.id || item.url);
   const isPlaylist = item.resultType === "playlist" || /[?&]list=/.test(item.url || "");
+  const isArtist = item.resultType === "artist";
+  const isAlbum = item.resultType === "album";
   const channelName = item.sourceChannelName
     || (item.sourceChannelId ? state.channels.find((c) => c.id === item.sourceChannelId)?.name : null)
     || (item.channel !== "YouTube" ? item.channel : null)
@@ -1843,20 +1935,35 @@ function videoCard(item) {
         <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
       </div>
       <div class="card-actions">
-        ${isPlaylist ? `<button class="btn btn-primary" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : `<button class="btn btn-primary" type="button" data-download="video" data-id="${id}">Descargar</button>`}
-        ${isPlaylist ? "" : `<button class="btn btn-ghost" type="button" data-download="audio" data-id="${id}">Audio</button>`}
-        <button class="btn btn-ghost" type="button" data-play-default data-id="${id}">▶ Play</button>
-        ${!isPlaylist ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
-        <button class="btn btn-ghost" type="button"
+        ${isArtist ? `<button class="btn btn-primary" type="button" data-artist-songs="${escapeHtml(item.title || "")}">Ver canciones</button>` : ""}
+        ${isPlaylist ? `<button class="btn btn-primary" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : ""}
+        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-primary" type="button" data-download="video" data-id="${id}">Descargar</button>` : ""}
+        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-download="audio" data-id="${id}">Audio</button>` : ""}
+        ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-play-default data-id="${id}">▶ Play</button>` : ""}
+        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
+        ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button"
           data-add-to-playlist="${escapeHtml(item.url || item.feedId || '')}"
           data-playlist-title="${escapeHtml(item.title || '')}"
           data-playlist-thumb="${escapeHtml(item.thumbnail || '')}"
           data-playlist-channel="${escapeHtml(typeof channelName === 'string' ? channelName : '')}"
-          data-playlist-duration="${escapeHtml(item.durationText || '')}">+ Lista</button>
+          data-playlist-duration="${escapeHtml(item.durationText || '')}">+ Lista</button>` : ""}
         ${channelBtn}
       </div>
     </article>
   `;
+}
+
+function resultLabel(item) {
+  if (item.source === "music") {
+    return ({
+      track: "YT Music - Cancion",
+      video: "YT Music - Video",
+      artist: "YT Music - Artista",
+      playlist: "YT Music - Playlist",
+      album: "YT Music - Album",
+    }[item.resultType] || "YT Music");
+  }
+  return sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube"));
 }
 
 function libraryCard(item) {
@@ -2246,11 +2353,11 @@ function openAddSongToPlaylistModal(plId) {
       let scopeParam = addScope === "all" ? "" : `&scope=${encodeURIComponent(addScope)}`;
       if (addScope === "music") {
         if (addMusicFilter) scopeParam += `&search_filter=${encodeURIComponent(addMusicFilter)}`;
-        scopeParam += "&limit=25";
+        scopeParam += `&limit=${DEFAULT_MUSIC_SEARCH_LIMIT}`;
       }
       if (addScope === "youtube") scopeParam += "&limit=20";
       const data = await api.get(`/api/search?q=${encodeURIComponent(q)}${scopeParam}`);
-      const items = (data.items || []).filter((i) => i.url && !i.url.includes("list="));
+      const items = (data.items || []).filter((i) => i.url && !i.url.includes("list=") && i.resultType !== "artist" && i.resultType !== "album" && !i.url.includes("/browse/"));
         if (!items.length) { resultsEl.innerHTML = `<p class="meta" style="padding:8px 0">Sin resultados.</p>`; return; }
         const itemMap = new Map(items.map((i) => [i.url, i]));
         resultsEl.innerHTML = `<div class="add-song-list">${items.map((item) => `
@@ -2395,18 +2502,27 @@ function bindEvents() {
       await doSearch();
       return;
     }
-    if (ev.target.closest("[data-music-login]")) {
-      try {
-        const resp = await api.post("/api/music/login");
-        toast("Abriendo navegador... inicia sesión en YouTube y cierra la ventana al terminar.");
-        _awaitLoginTask(resp?.task?.id);
-      } catch (err) { toast(err.message); }
+    if (ev.target.closest("[data-music-login]") || ev.target.closest("#authStatus")) {
+      if (state.musicAuthState === "ok") {
+        setView("music");
+        return;
+      }
+      startLoginFlow();
       return;
     }
     const searchScope = ev.target.closest("[data-search-scope]");
     if (searchScope) {
       state.searchScope = searchScope.dataset.searchScope;
       state.musicSearchFilter = "";
+      await doSearch();
+      return;
+    }
+    const artistSongs = ev.target.closest("[data-artist-songs]");
+    if (artistSongs) {
+      state.query = artistSongs.dataset.artistSongs || "";
+      state.searchScope = "music";
+      state.musicSearchFilter = "songs";
+      $("#searchInput").value = state.query;
       await doSearch();
       return;
     }
