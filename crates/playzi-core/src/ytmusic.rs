@@ -298,7 +298,43 @@ impl YtMusicClient {
         store: Option<&StateStore>,
     ) -> Result<Vec<MediaItem>> {
         let data = self.browse("FEmusic_home").await?;
-        let items = parse_music_items(&data, 40);
+        let playlists = parse_music_playlists(&data, 16);
+        let songs = parse_music_items(&data, 40);
+
+        let mut items: Vec<MediaItem> = Vec::new();
+        let mut seen = HashSet::new();
+        for p in playlists {
+            if seen.insert(p.id.clone()) {
+                let is_mix = p.id.starts_with("RD");
+                items.push(MediaItem {
+                    id: p.id,
+                    url: p.url,
+                    title: p.title,
+                    channel: if p.subtitle.is_empty() {
+                        "YouTube Music".into()
+                    } else {
+                        p.subtitle
+                    },
+                    channel_url: None,
+                    duration: None,
+                    duration_text: if is_mix { "Mix".into() } else { "Playlist".into() },
+                    thumbnail: if p.thumbnail.is_empty() {
+                        None
+                    } else {
+                        Some(p.thumbnail)
+                    },
+                    view_count: None,
+                    live: false,
+                    members_only: false,
+                    result_type: Some(if is_mix { "mix".into() } else { "playlist".into() }),
+                });
+            }
+        }
+        for song in songs {
+            if seen.insert(song.id.clone()) {
+                items.push(song);
+            }
+        }
 
         if let Some(st) = store {
             let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -448,7 +484,7 @@ pub fn parse_music_items(data: &Value, limit: usize) -> Vec<MediaItem> {
             url: format!("https://music.youtube.com/watch?v={video_id}"),
             title,
             channel: subtitle,
-            channel_url: None,
+            channel_url: extract_music_channel_url(renderer),
             duration,
             duration_text: duration_text_raw.unwrap_or_else(|| "--:--".into()),
             thumbnail: Some(thumbnail),
@@ -517,6 +553,37 @@ fn extract_duration_from_subtitle(subtitle: &str) -> Option<String> {
         .rev()
         .find(|part| parse_duration_text(part).is_some())
         .map(ToString::to_string)
+}
+
+fn extract_music_channel_url(node: &Value) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if let Some(bid) = map
+                .get("browseEndpoint")
+                .and_then(|b| b.get("browseId"))
+                .and_then(Value::as_str)
+            {
+                if bid.starts_with("UC") && bid.len() >= 20 {
+                    return Some(format!("https://www.youtube.com/channel/{bid}"));
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = extract_music_channel_url(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = extract_music_channel_url(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn first_string_field(node: &Value, key: &str) -> Option<String> {

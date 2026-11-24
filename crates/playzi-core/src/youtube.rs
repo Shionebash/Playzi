@@ -311,6 +311,7 @@ impl YouTubeClient {
                 cookies,
             )
             .await?;
+        let mixes = parse_recommended_mixes(&data);
         let mut items = parse_channel_videos(&data, "", "");
         let mut seen: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
         for item in parse_lockup_videos(&data) {
@@ -318,12 +319,18 @@ impl YouTubeClient {
                 items.push(item);
             }
         }
-        let limited: Vec<MediaItem> = items.into_iter().take(40).collect();
+        let mut combined: Vec<MediaItem> = mixes.into_iter().take(16).collect();
+        let mut combined_ids: HashSet<String> = combined.iter().map(|i| i.id.clone()).collect();
+        for item in items.into_iter().take(40) {
+            if combined_ids.insert(item.id.clone()) {
+                combined.push(item);
+            }
+        }
 
         if let Some(st) = store {
-            if !limited.is_empty() {
+            if !combined.is_empty() {
                 let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                let serialized: Vec<Value> = limited
+                let serialized: Vec<Value> = combined
                     .iter()
                     .filter_map(|i| serde_json::to_value(i).ok())
                     .collect();
@@ -335,7 +342,7 @@ impl YouTubeClient {
             }
         }
 
-        Ok(limited)
+        Ok(combined)
     }
 
     /// Fetches YouTube Radio Mix (`RD<videoId>`) items via `/youtubei/v1/next`, skipping the seed video.
@@ -344,19 +351,49 @@ impl YouTubeClient {
             return Ok(Vec::new());
         };
         let playlist_id = format!("RD{video_id}");
+        self.fetch_next_playlist_items(Some(&video_id), &playlist_id, limit, true, None)
+            .await
+    }
+
+    /// Fetches items for a YouTube Mix / Radio playlist URL (`list=RD...`, `RDMM`, etc.)
+    /// via InnerTube `/youtubei/v1/next` using optional cookies, keeping the seed track.
+    pub async fn fetch_mix_items_with_cookies(
+        &self,
+        url: &str,
+        limit: usize,
+        cookies: Option<&CookieJar>,
+    ) -> Result<Vec<MediaItem>> {
+        let Some(playlist_id) = extract_playlist_id_from_url(url) else {
+            return Ok(Vec::new());
+        };
+        let video_id = extract_video_id(url);
+        self.fetch_next_playlist_items(video_id.as_deref(), &playlist_id, limit, false, cookies)
+            .await
+    }
+
+    async fn fetch_next_playlist_items(
+        &self,
+        video_id: Option<&str>,
+        playlist_id: &str,
+        limit: usize,
+        skip_seed: bool,
+        cookies: Option<&CookieJar>,
+    ) -> Result<Vec<MediaItem>> {
+        let mut payload = json!({ "playlistId": playlist_id });
+        if let Some(vid) = video_id.filter(|v| !v.is_empty()) {
+            payload["videoId"] = Value::String(vid.to_string());
+        }
         let data = self
-            .post_innertube(
-                "next",
-                json!({
-                    "videoId": video_id,
-                    "playlistId": playlist_id,
-                }),
-            )
+            .post_innertube_with_cookies("next", payload, cookies)
             .await?;
 
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        seen.insert(video_id);
+        if skip_seed {
+            if let Some(vid) = video_id {
+                seen.insert(vid.to_string());
+            }
+        }
 
         for renderer in walk_renderers(&data, "playlistPanelVideoRenderer") {
             let Some(vid) = renderer.get("videoId").and_then(Value::as_str) else {
@@ -444,7 +481,15 @@ impl YouTubeClient {
         }
         let page = page.max(1);
         let page_size = page_size.clamp(5, 60);
-        let base = resolve_channel_base(url)?;
+        let resolved_input = if extract_video_id(url).is_some() && !url.contains("/channel/") && !url.contains("/@") {
+            let meta = self.metadata_for_url(url).await?;
+            meta.channel_url.ok_or_else(|| {
+                CoreError::NotFound("No se pudo identificar el canal de este video".into())
+            })?
+        } else {
+            url.to_string()
+        };
+        let base = resolve_channel_base(&resolved_input)?;
 
         let cache_key = format!("{base}|{tab}|{page}|{page_size}");
         if let Some(mut cached) = self.browse_cache.get(&cache_key) {
@@ -936,22 +981,16 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             .and_then(Value::as_str)
             .unwrap_or("YouTube")
             .to_string();
+        let channel_url = extract_lockup_channel_url(lockup);
         let (duration, duration_text_raw, live) = extract_duration_and_live(lockup);
-        let thumbnail = lockup
-            .pointer("/contentImage/thumbnailViewModel/image/sources")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.last())
-            .and_then(|s| s.get("url"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| Some(default_thumbnail(video_id)));
+        let thumbnail = lockup_thumbnail(lockup).or_else(|| Some(default_thumbnail(video_id)));
 
         items.push(MediaItem {
             id: video_id.to_string(),
             url: format!("https://www.youtube.com/watch?v={video_id}"),
             title,
             channel,
-            channel_url: None,
+            channel_url,
             duration,
             duration_text: duration_text_raw.unwrap_or_else(|| {
                 if live {
@@ -967,6 +1006,231 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             result_type: None,
         });
     }
+    items
+}
+
+fn lockup_thumbnail(lockup: &Value) -> Option<String> {
+    for ptr in [
+        "/contentImage/thumbnailViewModel/image/sources",
+        "/contentImage/collectionThumbnailViewModel/primaryThumbnail/thumbnailViewModel/image/sources",
+    ] {
+        if let Some(url) = lockup
+            .pointer(ptr)
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.last())
+            .and_then(|s| s.get("url"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+fn extract_lockup_channel_url(lockup: &Value) -> Option<String> {
+    let scope = lockup.get("metadata").unwrap_or(lockup);
+    find_channel_url_in_value(scope)
+}
+
+fn find_channel_url_in_value(node: &Value) -> Option<String> {
+    match node {
+        Value::Object(map) => {
+            if let Some(be) = map.get("browseEndpoint") {
+                if let Some(bid) = be.get("browseId").and_then(Value::as_str) {
+                    if bid.starts_with("UC") && bid.len() >= 20 {
+                        return Some(format!("https://www.youtube.com/channel/{bid}"));
+                    }
+                }
+                if let Some(canon) = be.get("canonicalBaseUrl").and_then(Value::as_str) {
+                    if canon.starts_with("/@")
+                        || canon.starts_with("/channel/")
+                        || canon.starts_with("/c/")
+                        || canon.starts_with("/user/")
+                    {
+                        return Some(format!("https://www.youtube.com{canon}"));
+                    }
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = find_channel_url_in_value(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_channel_url_in_value(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_string_field<'a>(node: &'a Value, key: &str) -> Option<&'a str> {
+    match node {
+        Value::Object(map) => {
+            if let Some(val) = map.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                return Some(val);
+            }
+            for v in map.values() {
+                if let Some(found) = find_string_field(v, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = find_string_field(item, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub fn extract_playlist_id_from_url(url: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"[?&]list=([A-Za-z0-9_-]+)").unwrap());
+    re.captures(url)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+fn parse_recommended_mixes(data: &Value) -> Vec<MediaItem> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    for lockup in walk_renderers(data, "lockupViewModel") {
+        if is_ad_renderer(lockup) {
+            continue;
+        }
+        let content_type = lockup
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let content_id = lockup
+            .get("contentId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let is_mix_or_playlist = content_type.contains("PLAYLIST")
+            || content_type.contains("MIX")
+            || content_type.contains("RADIO")
+            || content_id.starts_with("RD")
+            || content_id.starts_with("PL")
+            || content_id.starts_with("OLAK");
+        if !is_mix_or_playlist {
+            continue;
+        }
+
+        let watch_ep = lockup.pointer("/rendererContext/commandContext/onTap/innertubeCommand/watchEndpoint");
+        let playlist_id = watch_ep
+            .and_then(|w| w.get("playlistId"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!content_id.is_empty()).then_some(content_id))
+            .or_else(|| find_string_field(lockup, "playlistId"));
+
+        let Some(pid) = playlist_id else {
+            continue;
+        };
+        if !seen.insert(pid.to_string()) {
+            continue;
+        }
+
+        let seed_vid = watch_ep
+            .and_then(|w| w.get("videoId"))
+            .and_then(Value::as_str)
+            .filter(|s| s.len() == 11);
+
+        let url = if let Some(vid) = seed_vid {
+            format!("https://www.youtube.com/watch?v={vid}&list={pid}")
+        } else {
+            format!("https://www.youtube.com/playlist?list={pid}")
+        };
+
+        let title = lockup
+            .pointer("/metadata/lockupMetadataViewModel/title/content")
+            .and_then(Value::as_str)
+            .unwrap_or("Mix de YouTube")
+            .to_string();
+
+        let is_mix = pid.starts_with("RD") || content_type.contains("MIX") || content_type.contains("RADIO");
+        let channel = lockup
+            .pointer("/metadata/lockupMetadataViewModel/metadata/contentMetadataViewModel/metadataRows/0/metadataParts/0/text/content")
+            .and_then(Value::as_str)
+            .unwrap_or(if is_mix { "YouTube Mix" } else { "Playlist de YouTube" })
+            .to_string();
+
+        let thumbnail = lockup_thumbnail(lockup).or_else(|| seed_vid.map(default_thumbnail));
+
+        items.push(MediaItem {
+            id: pid.to_string(),
+            url,
+            title,
+            channel,
+            channel_url: extract_lockup_channel_url(lockup),
+            duration: None,
+            duration_text: if is_mix { "Mix".into() } else { "Playlist".into() },
+            thumbnail,
+            view_count: None,
+            live: false,
+            members_only: false,
+            result_type: Some(if is_mix { "mix".into() } else { "playlist".into() }),
+        });
+    }
+
+    for key in ["radioRenderer", "compactRadioRenderer"] {
+        for renderer in walk_renderers(data, key) {
+            if is_ad_renderer(renderer) {
+                continue;
+            }
+            let Some(pid) = renderer.get("playlistId").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if !seen.insert(pid.to_string()) {
+                continue;
+            }
+            let seed_vid = renderer
+                .pointer("/navigationEndpoint/watchEndpoint/videoId")
+                .and_then(Value::as_str)
+                .filter(|s| s.len() == 11);
+            let url = if let Some(vid) = seed_vid {
+                format!("https://www.youtube.com/watch?v={vid}&list={pid}")
+            } else {
+                format!("https://www.youtube.com/playlist?list={pid}")
+            };
+            let title = text_from_node(renderer.get("title")).unwrap_or_else(|| "Mix de YouTube".into());
+            let channel = text_from_node(renderer.get("longBylineText"))
+                .or_else(|| text_from_node(renderer.get("shortBylineText")))
+                .unwrap_or_else(|| "YouTube Mix".into());
+            let thumbnail = last_thumbnail_url(renderer.get("thumbnail"))
+                .or_else(|| seed_vid.map(default_thumbnail));
+            items.push(MediaItem {
+                id: pid.to_string(),
+                url,
+                title,
+                channel,
+                channel_url: extract_browse_channel_url(renderer),
+                duration: None,
+                duration_text: "Mix".into(),
+                thumbnail,
+                view_count: None,
+                live: false,
+                members_only: false,
+                result_type: Some("mix".into()),
+            });
+        }
+    }
+
     items
 }
 
@@ -1614,5 +1878,104 @@ mod tests {
 
         let lockup_items = parse_lockup_videos(&feed);
         assert!(lockup_items.is_empty(), "adSlotRenderer lockup must be filtered out");
+    }
+
+    #[test]
+    fn extracts_channel_url_and_recommended_mixes_from_lockups() {
+        let feed = json!({
+            "contents": [
+                {
+                    "lockupViewModel": {
+                        "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                        "contentId": "dQw4w9WgXcQ",
+                        "contentImage": {
+                            "thumbnailViewModel": {
+                                "image": { "sources": [{ "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" }] }
+                            }
+                        },
+                        "metadata": {
+                            "lockupMetadataViewModel": {
+                                "title": { "content": "Never Gonna Give You Up" },
+                                "image": {
+                                    "decoratedAvatarViewModel": {
+                                        "rendererContext": {
+                                            "commandContext": {
+                                                "onTap": {
+                                                    "innertubeCommand": {
+                                                        "browseEndpoint": {
+                                                            "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+                                                            "canonicalBaseUrl": "/@RickAstleyYT"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                "metadata": {
+                                    "contentMetadataViewModel": {
+                                        "metadataRows": [{
+                                            "metadataParts": [{ "text": { "content": "Rick Astley" } }]
+                                        }]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                        "contentId": "RDMM",
+                        "rendererContext": {
+                            "commandContext": {
+                                "onTap": {
+                                    "innertubeCommand": {
+                                        "watchEndpoint": {
+                                            "videoId": "dQw4w9WgXcQ",
+                                            "playlistId": "RDMM"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "contentImage": {
+                            "collectionThumbnailViewModel": {
+                                "primaryThumbnail": {
+                                    "thumbnailViewModel": {
+                                        "image": { "sources": [{ "url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg" }] }
+                                    }
+                                }
+                            }
+                        },
+                        "metadata": {
+                            "lockupMetadataViewModel": {
+                                "title": { "content": "My Mix" },
+                                "metadata": {
+                                    "contentMetadataViewModel": {
+                                        "metadataRows": [{
+                                            "metadataParts": [{ "text": { "content": "Rick Astley, a-ha and more" } }]
+                                        }]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let videos = parse_lockup_videos(&feed);
+        assert_eq!(videos.len(), 1);
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://www.youtube.com/channel/UCuAXFkgsw1L7xaCfnd5JJOw")
+        );
+
+        let mixes = parse_recommended_mixes(&feed);
+        assert_eq!(mixes.len(), 1);
+        assert_eq!(mixes[0].id, "RDMM");
+        assert_eq!(mixes[0].result_type.as_deref(), Some("mix"));
+        assert_eq!(mixes[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDMM");
     }
 }

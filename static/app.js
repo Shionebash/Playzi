@@ -622,9 +622,34 @@ function searchResultsHtml(items) {
   `).join("");
 }
 
+function _isRecommendedMix(item) {
+  return item?.resultType === "mix"
+    || item?.resultType === "playlist"
+    || /[?&]list=/.test(String(item?.url || ""));
+}
+
+function _resolveItemChannelUrl(item) {
+  if (!item) return "";
+  if (item.channelUrl) return item.channelUrl;
+  if (item.sourceChannelId) {
+    const ch = state.channels.find((c) => c.id === item.sourceChannelId);
+    if (ch?.url) return ch.url;
+  }
+  const url = String(item.url || "");
+  const isPlaylist = _isRecommendedMix(item);
+  if (!isPlaylist && /(?:youtube\.com\/watch\?v=|youtu\.be\/)/i.test(url)) {
+    return url;
+  }
+  return "";
+}
+
 function renderRecom() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
-  const mixedFeed = _uniqueByUrl([...state.recommendations, ...state.feed]);
+  const mixes = _uniqueByUrl(state.recommendations.filter(_isRecommendedMix));
+  const mixedFeed = _uniqueByUrl([
+    ...state.recommendations.filter((item) => !_isRecommendedMix(item)),
+    ...state.feed,
+  ]);
   $("#view-recom").innerHTML = `
     <div class="section-hdr">
       <span class="section-title">Para ti ${state.recommendationsLastSync ? `<span class="meta" style="font-size:10px;margin-left:8px">· ${escapeHtml(state.recommendationsLastSync)}</span>` : ""}</span>
@@ -643,11 +668,20 @@ function renderRecom() {
         <button class="btn btn-ghost" type="button" data-view-go="config">Configurar</button>
       </div>` : ""}
     ${hasCookies ? syncNotice("recommendations") : ""}
+    ${mixes.length ? `
+      <div class="section-hdr" style="margin-top:4px;margin-bottom:12px">
+        <span class="section-title">Mixes y playlists para ti</span>
+        <span class="meta">${mixes.length} mixes</span>
+      </div>
+      <div class="grid" style="margin-bottom:28px">${mixes.map(videoCard).join("")}</div>
+    ` : ""}
     ${mixedFeed.length
-      ? `<div class="grid">${mixedFeed.map(videoCard).join("")}</div>`
-      : hasCookies
-        ? empty("Sin feed cargado", "Actualiza recomendaciones o canales para llenar Para ti.")
-        : empty("Configura cookies primero", "Necesitas seleccionar el navegador con tu sesión de YouTube.")}
+      ? `${mixes.length ? `<div class="section-hdr" style="margin-top:4px;margin-bottom:12px"><span class="section-title">Videos recomendados</span></div>` : ""}<div class="grid">${mixedFeed.map(videoCard).join("")}</div>`
+      : (!mixes.length
+        ? (hasCookies
+          ? empty("Sin feed cargado", "Actualiza recomendaciones o canales para llenar Para ti.")
+          : empty("Configura cookies primero", "Necesitas seleccionar el navegador con tu sesión de YouTube."))
+        : "")}
   `;
 }
 
@@ -1241,6 +1275,8 @@ function renderMusic() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
   const expired = state.musicAuthState === "expired";
   const local = state.library.filter((item) => item.kind === "audio" || ["MP3", "OPUS", "M4A"].includes(String(item.format || "").toUpperCase()));
+  const musicMixes = _uniqueByUrl(state.musicRecommendations.filter(_isRecommendedMix));
+  const musicTracks = _uniqueByUrl(state.musicRecommendations.filter((item) => !_isRecommendedMix(item)));
   $("#view-music").innerHTML = `
     <div class="section-hdr">
       <span class="section-title">YT Music — Recomendadas ${state.musicRecomLastSync ? `<span class="meta" style="font-size:10px;margin-left:6px">· ${escapeHtml(state.musicRecomLastSync)}</span>` : ""}</span>
@@ -1249,11 +1285,18 @@ function renderMusic() {
     ${!hasCookies ? `<div class="url-banner" style="margin-bottom:16px"><strong>⚙</strong><div style="min-width:0;flex:1"><div class="url-banner-title">Cookies requeridas</div><div class="url-banner-sub">Configura el navegador en Configuración.</div></div><button class="btn btn-ghost" type="button" data-view-go="config">Configurar</button></div>` : ""}
     ${_musicAuthBanner()}
     ${hasCookies && !expired ? syncNotice("musicRecommendations") : ""}
+    ${!expired && musicMixes.length ? `
+      <div class="section-hdr" style="margin-top:4px;margin-bottom:12px">
+        <span class="section-title">Mixes y playlists para ti</span>
+        <span class="meta">${musicMixes.length} mixes</span>
+      </div>
+      <div class="grid" style="margin-bottom:28px">${musicMixes.map(videoCard).join("")}</div>
+    ` : ""}
     ${expired
       ? `<div style="margin-bottom:32px">${empty("Contenido no personalizado", "Inicia sesión arriba para cargar tus recomendaciones reales.")}</div>`
-      : state.musicRecommendations.length
-      ? `<div class="grid" style="margin-bottom:32px">${state.musicRecommendations.map(videoCard).join("")}</div>`
-      : hasCookies ? `<div style="margin-bottom:32px">${
+      : musicTracks.length
+      ? `<div class="grid" style="margin-bottom:32px">${musicTracks.map(videoCard).join("")}</div>`
+      : (!musicMixes.length && hasCookies) ? `<div style="margin-bottom:32px">${
           state.musicRecomLastSync
             ? empty("Sin recomendaciones", "El sync no devolvió contenido. Intenta de nuevo con Actualizar.")
             : empty("Recomendaciones no cargadas", "Haz clic en Actualizar para cargar tu feed de YouTube Music.")
@@ -1660,9 +1703,10 @@ function _updateVideoMeta(error = "") {
   const title = item?.title || item?.url || "...";
   const channel = item?.channel || "";
   const channelUrl = item?.channelUrl || "";
+  const browseChannelUrl = _resolveItemChannelUrl(item);
   const duration = item?.durationText || "";
-  const channelHtml = channelUrl
-    ? `<span class="channel-link" data-watch-channel="${escapeHtml(channelUrl)}" data-watch-channel-name="${escapeHtml(channel)}">${escapeHtml(channel)}</span>`
+  const channelHtml = (browseChannelUrl && channel)
+    ? `<span class="channel-link" data-watch-channel="${escapeHtml(browseChannelUrl)}" data-watch-channel-name="${escapeHtml(channel)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channel)}</span>`
     : escapeHtml(channel);
   const hasPrev = state.player.index > 0;
   const hasNext = state.player.index < state.player.queue.length - 1;
@@ -1760,10 +1804,11 @@ function _updateMusicMeta(error = "") {
 
   const channel = item?.channel || "";
   const channelUrl = item?.channelUrl || "";
+  const browseChannelUrl = _resolveItemChannelUrl(item);
   if (titleEl) titleEl.textContent = item?.title || "...";
   if (artistEl) {
-    artistEl.innerHTML = channelUrl
-      ? `<span class="channel-link" data-watch-channel="${escapeHtml(channelUrl)}" data-watch-channel-name="${escapeHtml(channel)}">${escapeHtml(channel)}</span>`
+    artistEl.innerHTML = (browseChannelUrl && channel)
+      ? `<span class="channel-link" data-watch-channel="${escapeHtml(browseChannelUrl)}" data-watch-channel-name="${escapeHtml(channel)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channel)}</span>`
       : escapeHtml(channel);
   }
   const followEl = $("#musicFollow");
@@ -2191,7 +2236,14 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   state.player.sourceContext = sourceContext;
   state.player.shuffle = false;
   state.player._originalQueue = [];
-  if (queue.length === 1 && isUrl(queue[0].url) && queue[0].url.includes("list=") && !queue[0].url.includes("watch?v=")) {
+  const singleItem = queue.length === 1 ? queue[0] : null;
+  const shouldExpandPlaylist = Boolean(
+    singleItem
+    && isUrl(singleItem.url)
+    && singleItem.url.includes("list=")
+    && (!singleItem.url.includes("watch?v=") || _isRecommendedMix(singleItem) || /[?&]list=RD/.test(singleItem.url))
+  );
+  if (shouldExpandPlaylist) {
     toast("Cargando cola...");
     try {
       const data = await api.post("/api/player/playlist", { url: queue[0].url, quality: state.config?.playbackQuality || "best" });
@@ -2790,7 +2842,7 @@ async function closeWebPlayer() {
 
 function videoCard(item) {
   const id = escapeHtml(item.feedId || item.id || item.url);
-  const isPlaylist = item.resultType === "playlist" || /[?&]list=/.test(item.url || "");
+  const isPlaylist = _isRecommendedMix(item);
   const isArtist = item.resultType === "artist";
   const isAlbum = item.resultType === "album";
   const channelName = item.sourceChannelName
@@ -2805,8 +2857,15 @@ function videoCard(item) {
     channelBtn = `<button class="btn btn-ghost" type="button" data-add-channel="${escapeHtml(item.channelUrl)}" data-add-channel-name="${escapeHtml(channelName)}" title="Suscribirse al canal">＋ Canal</button>`;
   }
 
-  const channelNameHtml = (item.channelUrl && channelName)
-    ? `<span class="channel-link" data-watch-channel="${escapeHtml(item.channelUrl)}" data-watch-channel-name="${escapeHtml(channelName)}">${escapeHtml(channelName)}</span>`
+  const resolvedChannelUrl = _resolveItemChannelUrl(item);
+  const clickableChannel = Boolean(
+    resolvedChannelUrl
+    && channelName
+    && !isPlaylist
+    && !["YouTube", "YouTube Music", "YouTube Mix", "Playlist de YouTube"].includes(channelName)
+  );
+  const channelNameHtml = clickableChannel
+    ? `<span class="channel-link" data-watch-channel="${escapeHtml(resolvedChannelUrl)}" data-watch-channel-name="${escapeHtml(channelName)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channelName)}</span>`
     : escapeHtml(channelName);
 
   return `

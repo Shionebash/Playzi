@@ -645,6 +645,25 @@ pub async fn dispatch_api_request(
                 .get("limit")
                 .and_then(Value::as_u64)
                 .unwrap_or(100) as usize;
+            let pid = extract_playlist_id(&url);
+            if pid.starts_with("RD") {
+                let snap = runtime.config.snapshot();
+                let configured = if snap.cookies_file.trim().is_empty() {
+                    None
+                } else {
+                    Some(snap.cookies_file.as_str())
+                };
+                let jar = runtime.cookie_store().load_jar(configured).ok();
+                if let Ok(mix_items) = runtime
+                    .youtube
+                    .fetch_mix_items_with_cookies(&url, limit.min(50), jar.as_ref())
+                    .await
+                {
+                    if !mix_items.is_empty() {
+                        return Ok(json!({ "items": mix_items, "requiresLogin": false }));
+                    }
+                }
+            }
             let items = runtime
                 .player
                 .resolve_playlist(&url, limit)
