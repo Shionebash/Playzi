@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import time
 import uuid
 from typing import Any
@@ -9,6 +10,8 @@ import yt_dlp
 
 from .state import read_state, update_state
 from .youtube import _entry_to_item
+
+logger = logging.getLogger(__name__)
 
 
 def list_channels() -> list[dict[str, Any]]:
@@ -102,6 +105,8 @@ def refresh_all_channels() -> list[dict[str, Any]]:
             try:
                 refreshed.append(future.result())
             except Exception:
+                # refresh_channel ya guardo el error en el canal; aqui solo log
+                logger.warning("Fallo el refresh del canal %s", channel_id, exc_info=True)
                 refreshed.append(next(c for c in read_state()["channels"] if c["id"] == channel_id))
     return refreshed
 

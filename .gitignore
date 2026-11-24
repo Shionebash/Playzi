@@ -5,3 +5,5 @@ media/
 __pycache__/
 *.pyc
 *.pyo
+target/
+crates/playzi-desktop/dist/

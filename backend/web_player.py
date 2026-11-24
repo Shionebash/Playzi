@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 import struct
 import threading
@@ -13,10 +14,13 @@ import httpx
 import yt_dlp
 
 from . import config
+from ._cookies import get_cookie_opts
 from .player import playlist_entries
 from .ytmusic import music_playlist_queue
 from .youtube import _entry_to_item
 from .ytdlp_opts import javascript_runtime_opts
+
+logger = logging.getLogger(__name__)
 
 
 def player_info(url: str, quality: str | None = None) -> dict[str, Any]:
@@ -33,13 +37,14 @@ def player_info(url: str, quality: str | None = None) -> dict[str, Any]:
     }
 
 
-def manifest(url: str, quality: str | None = None) -> str:
-    cache_key = f"{url}|{quality or config.PLAYBACK_QUALITY or 'best'}"
+def manifest(url: str, quality: str | None = None, audio_lang: str | None = None) -> str:
+    cache_key = f"{url}|{quality or config.PLAYBACK_QUALITY or 'best'}|{audio_lang or ''}"
     cached = _cache_get(_MANIFEST_CACHE, cache_key)
     if cached is not None:
         return cached
-    info = _extract_info(url)
-    video, audio = _select_formats(info, quality)
+    # Con audio_lang, video y audio salen del info multi (mismo cliente, URLs coherentes)
+    info = _extract_info_multi(url) if audio_lang else _extract_info(url)
+    video, audio = _select_formats(info, quality, audio_lang)
     duration = float(info.get("duration") or video.get("duration") or audio.get("duration") or 0)
     if duration <= 0:
         duration = 36000
@@ -93,12 +98,17 @@ def manifest(url: str, quality: str | None = None) -> str:
 def resolve_playlist(url: str, quality: str | None = None) -> dict[str, Any]:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    if parsed.hostname == "music.youtube.com" and query.get("list"):
-        result = music_playlist_queue(query["list"][0], limit=100)
-        return _with_manifest_urls(result, quality)
+    playlist_id = (query.get("list") or [""])[0]
+    # Mixes/radios (RD*) are "unviewable" for yt-dlp's playlist extractor on any
+    # host; the music watch-playlist API resolves them, so route them there too.
+    if playlist_id and (parsed.hostname == "music.youtube.com" or playlist_id.startswith("RD")):
+        result = music_playlist_queue(playlist_id, limit=100)
+        if result.get("items") or parsed.hostname == "music.youtube.com":
+            return _with_manifest_urls(result, quality)
 
     entries = playlist_entries(url, limit=100)
-    return _with_manifest_urls({"items": entries, "title": "Playlist", "source": "youtube", "requiresLogin": False, "error": ""}, quality)
+    error = "" if entries else "No se pudieron leer los videos de esta playlist."
+    return _with_manifest_urls({"items": entries, "title": "Playlist", "source": "youtube", "requiresLogin": False, "error": error}, quality)
 
 
 _INFO_CACHE: dict[str, tuple[float, dict]] = {}  # url -> (timestamp, info)
@@ -108,15 +118,16 @@ _CACHE_TTL = 18000  # 5 hours — googlevideo URLs include `expire` (~6h)
 _CACHE_MAX = 150
 
 _INFO_CACHE_FILE = config.DATA_DIR / "player_cache.json"
-_INFO_CACHE_LOCK = threading.Lock()
+_INFO_CACHE_LOCK = threading.RLock()
+_CACHE_LOCK = threading.RLock()
 _INFO_CACHE_LOADED = False
 # Single-flight: concurrent extractions for the same URL share one yt-dlp call
 # instead of each paying the ~3.5s nsig cost (e.g. /info + /manifest fired together).
 _INFLIGHT: dict[str, threading.Event] = {}
 _INFLIGHT_LOCK = threading.Lock()
 # Drop cached stream URLs this many seconds before their real `expire` to avoid
-# serving a URL that dies mid-playback.
-_EXPIRE_MARGIN = 300
+# serving a URL that dies mid-playback (15 min covers long videos started near expiry).
+_EXPIRE_MARGIN = 900
 
 
 def _min_expire(info: dict[str, Any]) -> int | None:
@@ -154,8 +165,10 @@ def _load_info_cache() -> None:
 
 def _save_info_cache() -> None:
     with _INFO_CACHE_LOCK:
+        with _CACHE_LOCK:
+            snapshot = list(_INFO_CACHE.items())
         payload = {}
-        for url, (_, info) in _INFO_CACHE.items():
+        for url, (_, info) in snapshot:
             try:
                 payload[url] = yt_dlp.YoutubeDL.sanitize_info(info)
             except Exception:
@@ -174,7 +187,8 @@ def _fresh_cached(url: str) -> dict[str, Any] | None:
     if cached is not None and not _info_expired(cached):
         return cached
     if cached is not None:
-        _INFO_CACHE.pop(url, None)
+        with _CACHE_LOCK:
+            _INFO_CACHE.pop(url, None)
     return None
 
 
@@ -206,6 +220,14 @@ def _extract_info(url: str) -> dict[str, Any]:
             "noplaylist": True,
             **javascript_runtime_opts(),
         }
+        if config.COOKIES_BROWSER or config.COOKIES_FILE:
+            try:
+                cookie_opts = {
+                    k: v for k, v in get_cookie_opts().items() if not k.startswith("_")
+                }
+                opts.update(cookie_opts)
+            except Exception:
+                pass
         with yt_dlp.YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=False) or {}
         _cache_set(_INFO_CACHE, url, result)
@@ -218,7 +240,86 @@ def _extract_info(url: str) -> dict[str, Any]:
             event.set()
 
 
-def _select_formats(info: dict[str, Any], quality: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+# Multi-audio (dubs): el cliente por defecto de yt-dlp 2026 no devuelve pistas
+# dobladas; web_embedded si (con runtime JS). Extraccion separada, solo bajo
+# demanda, para no tocar la latencia del arranque normal.
+_MULTI_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _multi_opts() -> dict[str, Any]:
+    base = javascript_runtime_opts()
+    extractor_args = {k: dict(v) for k, v in (base.get("extractor_args") or {}).items()}
+    youtube_args = extractor_args.setdefault("youtube", {})
+    youtube_args["player_client"] = ["web_embedded"]
+    return {
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+        **base,
+        "extractor_args": extractor_args,
+    }
+
+
+def _extract_info_multi(url: str) -> dict[str, Any]:
+    cached = _cache_get(_MULTI_INFO_CACHE, url)
+    if cached is not None and not _info_expired(cached):
+        return cached
+    if cached is not None:
+        _MULTI_INFO_CACHE.pop(url, None)
+
+    flight_key = f"multi|{url}"
+    with _INFLIGHT_LOCK:
+        event = _INFLIGHT.get(flight_key)
+        is_owner = event is None
+        if is_owner:
+            event = threading.Event()
+            _INFLIGHT[flight_key] = event
+
+    if not is_owner:
+        event.wait(timeout=90)
+        cached = _cache_get(_MULTI_INFO_CACHE, url)
+        if cached is not None and not _info_expired(cached):
+            return cached
+
+    try:
+        with yt_dlp.YoutubeDL(_multi_opts()) as ydl:
+            result = ydl.extract_info(url, download=False) or {}
+        _cache_set(_MULTI_INFO_CACHE, url, result)
+        return result
+    finally:
+        if is_owner:
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.pop(flight_key, None)
+            event.set()
+
+
+_TRACK_NOTE_CLEAN_RE = re.compile(r",?\s*(low|medium|high|DRC)\b|\s*\(default\)|\s*original", re.I)
+
+
+def audio_tracks(url: str) -> dict[str, Any]:
+    """Idiomas de audio disponibles (dubs) para un video."""
+    info = _extract_info_multi(url)
+    tracks: dict[str, dict[str, Any]] = {}
+    for fmt in info.get("formats") or []:
+        if not fmt.get("url") or fmt.get("acodec") in (None, "none") or fmt.get("vcodec") not in (None, "none"):
+            continue
+        if str(fmt.get("format_id") or "").endswith("-drc"):
+            continue
+        lang = fmt.get("language") or ""
+        if not lang or lang in tracks:
+            continue
+        note = fmt.get("format_note") or ""
+        name = _TRACK_NOTE_CLEAN_RE.sub("", note).strip(" ,") or lang
+        tracks[lang] = {
+            "lang": lang,
+            "name": name,
+            "default": "original" in note.lower(),
+        }
+    ordered = sorted(tracks.values(), key=lambda t: (not t["default"], t["name"].lower()))
+    return {"tracks": ordered}
+
+
+def _select_formats(info: dict[str, Any], quality: str | None = None, audio_lang: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     max_height = _quality_height(quality or config.PLAYBACK_QUALITY or "best")
     formats = info.get("formats") or []
     videos = [
@@ -232,6 +333,16 @@ def _select_formats(info: dict[str, Any], quality: str | None = None) -> tuple[d
         if f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
         and _is_browser_audio_candidate(f)
     ]
+    if audio_lang:
+        by_lang = [
+            f for f in audios
+            if not str(f.get("format_id") or "").endswith("-drc")
+            and str(f.get("language") or "").startswith(audio_lang)
+        ]
+        if by_lang:
+            # Manifest DASH necesita cajas ISOBMFF: preferir m4a/mp4 si existen
+            mp4_only = [f for f in by_lang if (f.get("ext") or "").lower() in {"m4a", "mp4"}]
+            audios = mp4_only or by_lang
     if not videos or not audios:
         requested = info.get("requested_formats") or []
         if len(requested) >= 2:
@@ -341,8 +452,12 @@ def _segment_ranges(fmt: dict[str, Any]) -> tuple[str, str] | None:
             result = (f"0-{moov[2]}", f"{sidx[1]}-{sidx[2]}")
             _cache_set(_SEGMENT_RANGE_CACHE, cache_key, result)
             return result
+        logger.warning(
+            "Formato %s sin cajas moov/sidx en los primeros 2MB (boxes=%s)",
+            fmt.get("format_id"), [b[0] for b in boxes],
+        )
     except Exception:
-        pass
+        logger.warning("Fallo el probe de rangos DASH para formato %s", fmt.get("format_id"), exc_info=True)
 
     # No sidx found — signal that SegmentBase should be omitted
     _cache_set(_SEGMENT_RANGE_CACHE, cache_key, ("", ""))
@@ -350,24 +465,26 @@ def _segment_ranges(fmt: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any | None:
-    cached = cache.get(key)
-    if not cached:
-        return None
-    ts, value = cached
-    if time.monotonic() - ts > _CACHE_TTL:
-        cache.pop(key, None)
-        return None
-    return value
+    with _CACHE_LOCK:
+        cached = cache.get(key)
+        if not cached:
+            return None
+        ts, value = cached
+        if time.monotonic() - ts > _CACHE_TTL:
+            cache.pop(key, None)
+            return None
+        return value
 
 
 def _cache_set(cache: dict[str, tuple[float, Any]], key: str, value: Any) -> None:
     if not key:
         return
-    if len(cache) >= _CACHE_MAX:
-        oldest = sorted(cache.items(), key=lambda kv: kv[1][0])
-        for old_key, _ in oldest[:len(cache) - _CACHE_MAX + 1]:
-            cache.pop(old_key, None)
-    cache[key] = (time.monotonic(), value)
+    with _CACHE_LOCK:
+        if len(cache) >= _CACHE_MAX:
+            oldest = sorted(cache.items(), key=lambda kv: kv[1][0])
+            for old_key, _ in oldest[:len(cache) - _CACHE_MAX + 1]:
+                cache.pop(old_key, None)
+        cache[key] = (time.monotonic(), value)
 
 
 def audio_info(url: str) -> dict[str, Any]:

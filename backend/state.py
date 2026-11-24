@@ -8,7 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from .config import STATE_FILE, ensure_dirs
+from . import config
 
 
 _LOCK = threading.RLock()
@@ -69,30 +69,30 @@ def _clone(value: Any) -> Any:
 
 
 def _state_file_changed() -> bool:
-    return _CACHE_FILE != STATE_FILE
+    return _CACHE_FILE != config.STATE_FILE
 
 
 def _read_unlocked() -> dict[str, Any]:
     global _CACHE, _CACHE_FILE
-    ensure_dirs()
+    config.ensure_dirs()
     if _CACHE is not None and not _state_file_changed():
         return _CACHE
-    if not STATE_FILE.exists():
-        STATE_FILE.write_text(json.dumps(DEFAULT_STATE, indent=2), encoding="utf-8")
+    if not config.STATE_FILE.exists():
+        config.STATE_FILE.write_text(json.dumps(DEFAULT_STATE, indent=2), encoding="utf-8")
         _CACHE = _clone(DEFAULT_STATE)
-        _CACHE_FILE = STATE_FILE
+        _CACHE_FILE = config.STATE_FILE
         return _CACHE
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(config.STATE_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        backup = STATE_FILE.with_suffix(".json.bak")
-        STATE_FILE.replace(backup)
+        backup = config.STATE_FILE.with_suffix(".json.bak")
+        config.STATE_FILE.replace(backup)
         data = _clone(DEFAULT_STATE)
     for key, value in DEFAULT_STATE.items():
         data.setdefault(key, _clone(value))
     _trim_state(data)
     _CACHE = data
-    _CACHE_FILE = STATE_FILE
+    _CACHE_FILE = config.STATE_FILE
     return data
 
 
@@ -106,11 +106,11 @@ def _trim_state(data: dict[str, Any]) -> None:
 
 def _write_unlocked(data: dict[str, Any]) -> None:
     global _DIRTY, _LAST_WRITE
-    ensure_dirs()
+    config.ensure_dirs()
     _trim_state(data)
-    tmp = Path(str(STATE_FILE) + ".tmp")
+    tmp = Path(str(config.STATE_FILE) + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    tmp.replace(config.STATE_FILE)
     _DIRTY = False
     _LAST_WRITE = time.monotonic()
 
@@ -139,7 +139,7 @@ def write_state(data: dict[str, Any]) -> None:
     global _CACHE, _CACHE_FILE
     with _LOCK:
         _CACHE = _clone(data)
-        _CACHE_FILE = STATE_FILE
+        _CACHE_FILE = config.STATE_FILE
         _write_unlocked(_CACHE)
 
 
@@ -149,7 +149,7 @@ def update_state(mutator, *, volatile: bool = False):
         data = _read_unlocked()
         result = mutator(data)
         _CACHE = data
-        _CACHE_FILE = STATE_FILE
+        _CACHE_FILE = config.STATE_FILE
         if volatile and time.monotonic() - _LAST_WRITE < _WRITE_INTERVAL_SECONDS:
             _DIRTY = True
             _schedule_flush_unlocked()

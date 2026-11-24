@@ -36,10 +36,40 @@ const state = {
     _originalQueue: [],
     _listenerAbort: null,
     _loadingId: 0,
+    audioTracks: null,
+    audioLang: null,
+    native: null,
+    capabilities: null,
   },
   config: null,
   theme: localStorage.getItem("playzi-theme") || "dark",
   sidebarCollapsed: localStorage.getItem("playzi-sidebar-collapsed") === "1",
+  channelView: { url: "", name: "", tab: "videos", items: [], page: 1, hasMore: false, loading: false, meta: null, error: "" },
+  artistView: { channelId: "", name: "", data: null, loading: false, error: "" },
+  userProfile: { userId: "", displayName: "", googleAccountName: "" },
+  friends: [],
+  party: {
+    active: false,
+    role: "idle",
+    connected: false,
+    roomCode: "",
+    hostUserId: "",
+    hostName: "",
+    bindPort: null,
+    localWsUrl: "",
+    publicWsUrl: "",
+    inviteUrl: "",
+    tunnelRunning: false,
+    tunnelError: "",
+    queuePolicy: "all",
+    allowedQueueUserIds: [],
+    canSelfQueue: false,
+    selfUserId: "",
+    participants: [],
+    queue: [],
+    playback: { currentIndex: null, isPlaying: false, positionSecs: 0, updatedAtMs: 0, playbackRate: 1, repeat: "none", shuffle: false, version: 0 },
+    lastError: "",
+  },
 };
 
 const COLOR_PRESETS = [
@@ -62,13 +92,30 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 const DEFAULT_MUSIC_SEARCH_LIMIT = 30;
 
+const IS_TAURI = Boolean(window.__TAURI__?.core?.invoke);
+
+async function tauriRequest(method, path, body = null) {
+  try {
+    return await window.__TAURI__.core.invoke("api_request", {
+      method,
+      path,
+      body,
+    });
+  } catch (err) {
+    if (err instanceof Error) throw err;
+    throw new Error(typeof err === "string" ? err : err?.message || String(err));
+  }
+}
+
 const api = {
   async get(path) {
+    if (IS_TAURI) return tauriRequest("GET", path, null);
     const res = await fetch(path);
     if (!res.ok) throw new Error(await errorText(res));
     return res.json();
   },
   async post(path, body = {}) {
+    if (IS_TAURI) return tauriRequest("POST", path, body);
     const res = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -78,6 +125,7 @@ const api = {
     return res.json();
   },
   async patch(path, body = {}) {
+    if (IS_TAURI) return tauriRequest("PATCH", path, body);
     const res = await fetch(path, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -87,6 +135,7 @@ const api = {
     return res.json();
   },
   async delete(path) {
+    if (IS_TAURI) return tauriRequest("DELETE", path, null);
     const res = await fetch(path, { method: "DELETE" });
     if (!res.ok) throw new Error(await errorText(res));
     return res.json();
@@ -99,6 +148,32 @@ async function errorText(res) {
     return json.detail || res.statusText;
   } catch {
     return res.statusText;
+  }
+}
+
+function _isMembersOnlyError(msg) {
+  if (!msg) return false;
+  return /members[- ]only|join this channel|subscriber_only|solo para miembros|solo miembros/i.test(String(msg));
+}
+
+function _markMembersOnlyByUrl(url) {
+  if (!url) return;
+  const lists = [
+    state.feed,
+    state.recom,
+    state.results,
+    state.channelView?.items,
+    state.player?.queue,
+    state.player?.related,
+  ];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      if (entry && entry.url === url) entry.membersOnly = true;
+    }
+  }
+  if (state.player?.current?.url === url) {
+    state.player.current.membersOnly = true;
   }
 }
 
@@ -123,7 +198,35 @@ function thumbSrc(url) {
   const normalized = normalizeThumbUrl(url);
   if (!normalized) return "";
   if (normalized.startsWith("/") && !normalized.startsWith("//")) return normalized;
+  if (IS_TAURI) {
+    const base = (location.protocol === "http:" && location.hostname.endsWith("localhost"))
+      ? "http://playzi-thumb.localhost/"
+      : "playzi-thumb://localhost/";
+    return `${base}?url=${encodeURIComponent(normalized)}`;
+  }
   return `/api/thumbnail?url=${encodeURIComponent(normalized)}`;
+}
+
+function streamProxyUrl(rawUrl) {
+  if (!rawUrl) return "";
+  if (IS_TAURI) {
+    const base = (location.protocol === "http:" && location.hostname.endsWith("localhost"))
+      ? "http://playzi-stream.localhost/"
+      : "playzi-stream://localhost/";
+    return `${base}?url=${encodeURIComponent(rawUrl)}`;
+  }
+  return rawUrl;
+}
+
+function streamMasterProxyUrl(videoUrl, audioUrl) {
+  if (!videoUrl || !audioUrl) return streamProxyUrl(videoUrl || audioUrl || "");
+  if (IS_TAURI) {
+    const base = (location.protocol === "http:" && location.hostname.endsWith("localhost"))
+      ? "http://playzi-stream.localhost/"
+      : "playzi-stream://localhost/";
+    return `${base}master.m3u8?v=${encodeURIComponent(videoUrl)}&a=${encodeURIComponent(audioUrl)}`;
+  }
+  return videoUrl;
 }
 
 function thumbAttrs(url, eager = false) {
@@ -210,6 +313,11 @@ function setView(view) {
 
 function applySidebarState() {
   document.body.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  const toggleBtn = $("#sidebarToggle");
+  if (toggleBtn) {
+    toggleBtn.setAttribute("aria-expanded", String(!state.sidebarCollapsed));
+    toggleBtn.title = state.sidebarCollapsed ? "Expandir barra lateral" : "Colapsar barra lateral";
+  }
 }
 
 function toggleSidebar() {
@@ -280,6 +388,8 @@ function applyBootstrap(data) {
   state.musicAuthState = data.musicAuthState || "";
   state.musicAccountName = data.musicAccountName || "";
   state.syncStatus = data.syncStatus || {};
+  state.userProfile = data.userProfile || state.userProfile;
+  state.friends = data.friends || state.friends;
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
 }
 
@@ -376,6 +486,7 @@ function playlistResultItem(pl) {
 
 function render() {
   $("#downloadBadge").textContent = state.downloads.filter((d) => !["done", "error"].includes(d.status)).length || "";
+  _updatePartyBadge();
   renderAuthStatus();
   if (state.view === "home") renderHome();
   if (state.view === "search") renderSearch();
@@ -386,8 +497,11 @@ function render() {
   if (state.view === "collections") renderCollections();
   if (state.view === "downloads") renderDownloads();
   if (state.view === "history") renderHistory();
+  if (state.view === "party") renderParty();
   if (state.view === "config") renderConfig();
   if (state.view === "watch") renderWatch();
+  if (state.view === "channel") renderChannelView();
+  if (state.view === "artist") renderArtistView();
 }
 
 function syncNotice(section) {
@@ -454,7 +568,8 @@ function renderSearch(loading = false) {
           <div class="url-banner-title">URL de YouTube detectada</div>
           <div class="url-banner-sub">${escapeHtml(q)}</div>
         </div>
-        <button class="btn btn-primary" type="button" data-url-download="video">Descargar</button>
+        <button class="btn btn-primary" type="button" data-url-play>▶ Reproducir</button>
+        <button class="btn btn-ghost" type="button" data-url-download="video">Descargar</button>
         <button class="btn btn-ghost" type="button" data-url-download="audio">Audio</button>
       </div>` : ""}
     <div class="section-hdr">
@@ -607,53 +722,267 @@ function _followButtonHtml(channelUrl, name) {
   return `<button class="btn btn-ghost" type="button" data-add-channel="${escapeHtml(channelUrl)}" data-add-channel-name="${escapeHtml(name || "")}">＋ Seguir canal</button>`;
 }
 
-async function openChannelPreview(url, name) {
+// ── Channel view (browse full uploads) ───────────────────────────────────────
+
+const CHANNEL_TABS = [["videos", "Videos"], ["shorts", "Shorts"], ["streams", "Directos"], ["playlists", "Playlists"], ["releases", "Lanzamientos"]];
+let _channelObserver = null;
+let _channelLoadId = 0;
+
+async function openChannelView(url, name, tab = "videos") {
   if (!url) return;
-  state._lastChannelPreview = { url, name };
-  setView("channels");
-  $("#view-channels").innerHTML = `
-    <div class="section-hdr"><span class="section-title">${escapeHtml(name || "Canal")}</span></div>
-    ${empty("Cargando…", "Obteniendo videos del canal.")}`;
+  const cv = state.channelView;
+  if (cv.url !== url) cv._triedReleases = false;
+  cv.url = url;
+  cv.name = name || "";
+  cv.tab = tab;
+  cv.items = [];
+  cv.page = 1;
+  cv.hasMore = false;
+  cv.loading = true;
+  cv.meta = null;
+  cv.error = "";
+  setView("channel");
+  renderChannelView();
+  await _fetchChannelPage(1);
+}
+
+async function _fetchChannelPage(page) {
+  const cv = state.channelView;
+  const loadId = ++_channelLoadId;
+  cv.loading = true;
   try {
-    const data = await api.get(`/api/channels/preview?url=${encodeURIComponent(url)}`);
-    _renderChannelPreview(data);
+    const data = await api.get(`/api/channel?url=${encodeURIComponent(cv.url)}&tab=${encodeURIComponent(cv.tab)}&page=${page}`);
+    if (loadId !== _channelLoadId) return;
+    cv.meta = data;
+    cv.name = data.name || cv.name;
+    // URL canonica por channel id: cache keys estables entre @handle y UC id
+    if (data.url) cv.url = data.url;
+    cv.page = page;
+    cv.hasMore = !!data.hasMore;
+    cv.error = data.tabError || "";
+    cv.loading = false;
+    if (page === 1) {
+      cv.items = data.items || [];
+      // Canales "Topic" de música: /videos vacio, contenido en /releases;
+      // si tampoco hay releases, probar la pagina de artista de YT Music.
+      if (!cv.items.length && cv.tab === "videos" && !cv._triedReleases) {
+        cv._triedReleases = true;
+        openChannelView(cv.url, cv.name, "releases");
+        return;
+      }
+      if (!cv.items.length && cv.tab === "releases" && cv._triedReleases) {
+        const uc = (cv.url.match(/channel\/(UC[\w-]{22})/) || [])[1];
+        if (uc) {
+          openArtistView(uc, cv.name);
+          return;
+        }
+      }
+      renderChannelView();
+    } else {
+      cv.items = [...cv.items, ...(data.items || [])];
+      _appendChannelItems(data.items || []);
+    }
   } catch (err) {
-    $("#view-channels").innerHTML = `
-      <div class="section-hdr">
-        <span class="section-title">${escapeHtml(name || "Canal")}</span>
-        <button class="btn btn-ghost" type="button" id="backToChannels">← Canales</button>
-      </div>
-      ${empty("Error", err.message)}`;
-    const b = $("#backToChannels");
-    if (b) b.onclick = () => renderChannels();
+    if (loadId !== _channelLoadId) return;
+    cv.loading = false;
+    cv.error = err.message;
+    if (page === 1) renderChannelView();
+    else _updateChannelSentinel();
   }
+}
+
+function renderChannelView() {
+  const cv = state.channelView;
+  const root = $("#view-channel");
+  if (!root) return;
+  const meta = cv.meta;
+  const avatar = meta?.avatar ? `<img class="channel-avatar" ${thumbAttrs(meta.avatar)}>` : `<div class="channel-avatar channel-avatar--empty"></div>`;
+  const subs = meta?.subscriberCount ? `${Number(meta.subscriberCount).toLocaleString()} suscriptores` : "";
+  const followBtn = meta ? (meta.alreadyFollowed
+    ? `<button class="btn btn-ghost" type="button" data-unfollow-channel="${escapeHtml(meta.followedChannelId || "")}">Siguiendo ✓</button>`
+    : `<button class="btn btn-primary" type="button" data-add-channel="${escapeHtml(meta.url || cv.url)}" data-add-channel-name="${escapeHtml(cv.name)}">＋ Seguir canal</button>`) : "";
+  root.innerHTML = `
+    <div class="channel-header">
+      ${avatar}
+      <div class="channel-header-info">
+        <h2 class="channel-name">${escapeHtml(cv.name || "Canal")}</h2>
+        <div class="meta">${escapeHtml(meta?.handle || "")}${meta?.handle && subs ? " · " : ""}${escapeHtml(subs)}</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-left:auto">
+        ${followBtn}
+        <button class="btn btn-ghost" type="button" id="backToChannels">← Volver</button>
+      </div>
+    </div>
+    <div class="channel-tabs">
+      ${CHANNEL_TABS.map(([key, label]) => `<button class="channel-tab ${key === cv.tab ? "active" : ""}" type="button" data-channel-tab="${key}">${label}</button>`).join("")}
+    </div>
+    <div id="channelGrid" class="grid">
+      ${cv.items.length ? cv.items.map(videoCard).join("") : (cv.loading ? _skeletonCards(8) : "")}
+    </div>
+    ${(!cv.loading && !cv.items.length) ? empty(cv.error ? "Sin contenido" : "Sin videos", cv.error || "Este canal no tiene contenido en esta pestaña.") : ""}
+    <div id="channelSentinel" class="channel-sentinel">${cv.loading && cv.items.length ? `<span class="spinner"></span>` : ""}</div>
+  `;
+  const back = $("#backToChannels");
+  if (back) back.onclick = () => setView("channels");
+  root.querySelectorAll("[data-channel-tab]").forEach((btn) => {
+    btn.onclick = () => {
+      if (btn.dataset.channelTab === cv.tab) return;
+      openChannelView(cv.url, cv.name, btn.dataset.channelTab);
+    };
+  });
+  _setupChannelObserver();
+}
+
+function _skeletonCards(n) {
+  return Array.from({ length: n }, () => `
+    <article class="card card--skeleton">
+      <div class="thumb skeleton-box"></div>
+      <div class="card-body">
+        <div class="skeleton-line" style="width:90%"></div>
+        <div class="skeleton-line" style="width:55%"></div>
+      </div>
+    </article>`).join("");
+}
+
+function _appendChannelItems(items) {
+  const grid = $("#channelGrid");
+  if (grid && items.length) grid.insertAdjacentHTML("beforeend", items.map(videoCard).join(""));
+  _updateChannelSentinel();
+}
+
+function _updateChannelSentinel() {
+  const sentinel = $("#channelSentinel");
+  if (sentinel) sentinel.innerHTML = state.channelView.loading ? `<span class="spinner"></span>` : "";
+}
+
+function _setupChannelObserver() {
+  if (_channelObserver) _channelObserver.disconnect();
+  const sentinel = $("#channelSentinel");
+  if (!sentinel) return;
+  _channelObserver = new IntersectionObserver((entries) => {
+    const cv = state.channelView;
+    if (entries.some((e) => e.isIntersecting) && cv.hasMore && !cv.loading && state.view === "channel") {
+      _updateChannelSentinel();
+      _fetchChannelPage(cv.page + 1).then(_updateChannelSentinel);
+    }
+  }, { rootMargin: "600px" });
+  _channelObserver.observe(sentinel);
+}
+
+// ── Artist view (YT Music) ────────────────────────────────────────────────────
+
+async function openArtistView(channelId, name) {
+  if (!channelId) return;
+  const av = state.artistView;
+  av.channelId = channelId;
+  av.name = name || "";
+  av.data = null;
+  av.loading = true;
+  av.error = "";
+  setView("artist");
+  renderArtistView();
+  try {
+    const data = await api.get(`/api/music/artist?channel_id=${encodeURIComponent(channelId)}`);
+    if (state.artistView.channelId !== channelId) return;
+    av.data = data;
+    av.name = data.name || av.name;
+    av.loading = false;
+  } catch (err) {
+    if (state.artistView.channelId !== channelId) return;
+    av.loading = false;
+    av.error = err.message;
+  }
+  renderArtistView();
+}
+
+function renderArtistView() {
+  const av = state.artistView;
+  const root = $("#view-artist");
+  if (!root) return;
+  const d = av.data;
+  if (av.loading) {
+    root.innerHTML = `
+      <div class="channel-header">
+        <div class="channel-avatar channel-avatar--empty skeleton-box"></div>
+        <div class="channel-header-info"><h2 class="channel-name">${escapeHtml(av.name || "Artista")}</h2></div>
+      </div>
+      <div class="grid">${_skeletonCards(8)}</div>`;
+    return;
+  }
+  if (!d) {
+    root.innerHTML = `
+      <div class="section-hdr">
+        <span class="section-title">${escapeHtml(av.name || "Artista")}</span>
+        <button class="btn btn-ghost" type="button" id="backFromArtist">← Volver</button>
+      </div>
+      ${empty("Error", av.error || "No se pudo cargar el artista.")}`;
+    const b = $("#backFromArtist");
+    if (b) b.onclick = () => setView("music");
+    return;
+  }
+  const songRows = (d.songs || []).map((song, i) => `
+    <div class="queue-item" data-artist-play="${i}">
+      <span class="queue-idx">${i + 1}</span>
+      ${song.thumbnail ? `<img class="queue-thumb" ${thumbAttrs(song.thumbnail)}>` : `<div class="queue-thumb"></div>`}
+      <div class="queue-info">
+        <div class="queue-title">${escapeHtml(song.title)}</div>
+        <div class="queue-meta">${escapeHtml(song.channel || "")} · ${escapeHtml(song.durationText || "")}</div>
+      </div>
+    </div>`).join("");
+  const releaseCard = (rel) => `
+    <article class="card">
+      <div class="thumb">${rel.thumbnail ? `<img ${thumbAttrs(rel.thumbnail)}>` : ""}<span class="duration">${escapeHtml(rel.durationText || "")}</span></div>
+      <div class="card-body">
+        <div class="card-title">${escapeHtml(rel.title)}</div>
+        <div class="meta">${escapeHtml(rel.channel || "")}</div>
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-primary" type="button" data-album-play="${escapeHtml(rel.url)}">▶ Reproducir</button>
+      </div>
+    </article>`;
+  const relatedCard = (a) => `
+    <article class="card">
+      <div class="thumb">${a.thumbnail ? `<img ${thumbAttrs(a.thumbnail)}>` : ""}</div>
+      <div class="card-body">
+        <div class="card-title">${escapeHtml(a.title)}</div>
+        <div class="meta">${escapeHtml(a.channel || "")}</div>
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-ghost" type="button" data-open-artist="${escapeHtml(a.id)}" data-open-artist-name="${escapeHtml(a.title)}">Ver artista</button>
+      </div>
+    </article>`;
+  root.innerHTML = `
+    <div class="channel-header">
+      ${d.thumbnail ? `<img class="channel-avatar" ${thumbAttrs(d.thumbnail)}>` : `<div class="channel-avatar channel-avatar--empty"></div>`}
+      <div class="channel-header-info">
+        <h2 class="channel-name">${escapeHtml(d.name)}</h2>
+        <div class="meta">${escapeHtml(d.subscriberCount ? `${d.subscriberCount} suscriptores` : "Artista · YT Music")}</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-left:auto">
+        ${d.songs?.length ? `<button class="btn btn-primary" type="button" data-artist-play="0">▶ Reproducir top</button>` : ""}
+        <button class="btn btn-ghost" type="button" id="backFromArtist">← Volver</button>
+      </div>
+    </div>
+    ${d.songs?.length ? `<section class="artist-section"><div class="section-hdr"><span class="section-title">Canciones top</span></div><div class="list-stack">${songRows}</div></section>` : ""}
+    ${d.albums?.length ? `<section class="artist-section"><div class="section-hdr"><span class="section-title">Álbumes</span></div><div class="grid">${d.albums.map(releaseCard).join("")}</div></section>` : ""}
+    ${d.singles?.length ? `<section class="artist-section"><div class="section-hdr"><span class="section-title">Singles</span></div><div class="grid">${d.singles.map(releaseCard).join("")}</div></section>` : ""}
+    ${d.related?.length ? `<section class="artist-section"><div class="section-hdr"><span class="section-title">Artistas similares</span></div><div class="grid">${d.related.map(relatedCard).join("")}</div></section>` : ""}
+  `;
+  const back = $("#backFromArtist");
+  if (back) back.onclick = () => setView("music");
 }
 
 function _refreshAfterFollowChange() {
   if (state.view === "watch") {
     _updateWatchMeta();
-  } else if (state.view === "channels" && state._lastChannelPreview) {
-    openChannelPreview(state._lastChannelPreview.url, state._lastChannelPreview.name);
+  } else if (state.view === "channel" && state.channelView.meta) {
+    // Recalcular seguimiento contra state.channels (meta del backend quedo stale)
+    const meta = state.channelView.meta;
+    const followed = findFollowedChannel(meta.url || state.channelView.url);
+    meta.alreadyFollowed = !!followed;
+    meta.followedChannelId = followed?.id || null;
+    renderChannelView();
   }
-}
-
-function _renderChannelPreview(data) {
-  const followBtn = data.alreadyFollowed
-    ? `<button class="btn btn-ghost" type="button" data-unfollow-channel="${escapeHtml(data.channelId)}">Siguiendo ✓</button>`
-    : `<button class="btn btn-primary" type="button" data-add-channel="${escapeHtml(data.url)}" data-add-channel-name="${escapeHtml(data.name || "")}">＋ Seguir canal</button>`;
-  $("#view-channels").innerHTML = `
-    <div class="section-hdr">
-      <span class="section-title">${escapeHtml(data.name || "Canal")}</span>
-      <div style="display:flex;gap:8px">
-        ${followBtn}
-        <button class="btn btn-ghost" type="button" id="backToChannels">← Canales</button>
-      </div>
-    </div>
-    ${data.items.length
-      ? `<div class="grid">${data.items.map(videoCard).join("")}</div>`
-      : empty("Sin videos", "Este canal no tiene videos recientes.")}`;
-  const b = $("#backToChannels");
-  if (b) b.onclick = () => renderChannels();
 }
 
 function renderLibrary() {
@@ -897,7 +1226,7 @@ function historyCard(item) {
         </div>
       </div>
       <div class="hist-actions">
-        ${canPlay ? `<button class="btn btn-primary" type="button" data-history-play="${escapeHtml(url)}" data-history-title="${escapeHtml(item.title || "")}">Reproducir</button>` : ""}
+        ${canPlay ? `<button class="btn btn-primary" type="button" data-history-play="${escapeHtml(url)}" data-history-title="${escapeHtml(item.title || "")}">▶ Reproducir</button>` : ""}
         ${isRemoteUrl ? `<button class="btn btn-ghost" type="button" data-download-history="audio" data-history-id="${escapeHtml(item.id)}">Audio</button>` : ""}
         ${isRemoteUrl ? `<button class="btn btn-ghost" type="button" data-add-history-playlist="${escapeHtml(item.id)}">+ Lista</button>` : ""}
         ${isRemoteUrl ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank">Abrir</a>` : ""}
@@ -994,6 +1323,7 @@ function renderConfig() {
 
 function _videoLayoutHtml() {
   return `
+    <div id="watch-party-bar"></div>
     <div class="watch-layout watch-layout--video">
       <div class="watch-main">
         <div class="watch-video-wrap">
@@ -1020,6 +1350,7 @@ function _videoLayoutHtml() {
 
 function _musicLayoutHtml() {
   return `
+    <div id="watch-party-bar"></div>
     <div class="watch-layout watch-layout--music">
       <div class="watch-main watch-main--music">
         <div class="music-player-card">
@@ -1094,6 +1425,10 @@ function renderWatch() {
       state.player.vjs.dispose();
       state.player.vjs = null;
     }
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      state.player.audioVjs.dispose();
+      state.player.audioVjs = null;
+    }
     root.innerHTML = useMusicLayout ? _musicLayoutHtml() : _videoLayoutHtml();
     if (useMusicLayout) {
       const ac = new AbortController();
@@ -1110,6 +1445,7 @@ function renderWatch() {
   _updateWatchMeta();
   _updateWatchQueue();
   _updateWatchRelated();
+  _updateWatchPartyBar();
 }
 
 function _updateWatchMeta(error = "") {
@@ -1147,23 +1483,86 @@ function _updateVideoMeta(error = "") {
     : escapeHtml(channel);
   const hasPrev = state.player.index > 0;
   const hasNext = state.player.index < state.player.queue.length - 1;
+  const membersOnlyErr = _isMembersOnlyError(error);
+  const isMembers = Boolean(item?.membersOnly || membersOnlyErr);
+  const errorBannerHtml = !error
+    ? ""
+    : membersOnlyErr
+      ? `<div class="player-info-card player-info-card--members">
+          <div class="player-info-card-body">
+            <span class="tag tag-members">★ Solo miembros</span>
+            <span>Este video es exclusivo para miembros del canal. Necesitas una membresía activa en tu cuenta de YouTube para reproducirlo.</span>
+          </div>
+          <div class="player-info-card-actions">
+            ${item?.url ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Abrir en YouTube</a>` : ""}
+            <button class="btn btn-ghost" type="button" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>
+          </div>
+        </div>`
+      : `<div class="player-error-card"><span>⚠ ${escapeHtml(error)}</span><button class="btn btn-ghost" type="button" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button></div>`;
   el.innerHTML = `
     <div class="watch-title">${escapeHtml(title)}</div>
-    <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}</div>
+    <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}${isMembers ? ` <span class="tag tag-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}</div>
     <div class="watch-actions">
       <button class="btn btn-ghost" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>⏮ Anterior</button>
       <button class="btn btn-ghost" type="button" id="watchNext" ${hasNext ? "" : "disabled"}>Siguiente ⏭</button>
       ${_followButtonHtml(channelUrl, channel)}
       ${_playerCtrlsHtml()}
-      <button class="btn btn-primary" type="button" data-watch-download="video">Descargar</button>
+      <button class="btn btn-ghost" type="button" data-watch-download="video">Descargar</button>
       <button class="btn btn-ghost" type="button" data-watch-download="audio">Audio</button>
       <button class="btn btn-ghost" type="button" id="toggleAudioOnly">Solo audio</button>
       <button class="btn btn-ghost" type="button" id="playerExternal">Abrir externo</button>
       <button class="btn btn-ghost" type="button" id="watchBack">← Volver</button>
     </div>
+    ${_nativePlayerBarHtml()}
     ${state.player.loading ? `<div class="player-status">Cargando...</div>` : ""}
-    ${error ? `<div class="player-error-card"><span>⚠ ${escapeHtml(error)}</span><button class="btn btn-ghost" type="button" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button></div>` : ""}
+    ${errorBannerHtml}
   `;
+}
+
+function _nativePlayerBarHtml() {
+  if (!IS_TAURI || !state.player.native?.active) return "";
+  const st = state.player.native;
+  const isMpv = (st.backend || "mpv") === "mpv";
+  const pauseLabel = st.paused ? "▶ Reanudar" : "⏸ Pausar";
+  const muteLabel = st.muted ? "🔇 Con sonido" : "🔊 Silenciar";
+  const ipcBtns = isMpv
+    ? `
+      <button class="btn btn-ghost" type="button" data-native-ctrl="toggle">${pauseLabel}</button>
+      <button class="btn btn-ghost" type="button" data-native-ctrl="seek-back">-10s</button>
+      <button class="btn btn-ghost" type="button" data-native-ctrl="seek-fwd">+10s</button>
+      <button class="btn btn-ghost" type="button" data-native-ctrl="mute">${muteLabel}</button>
+    `
+    : "";
+  return `
+    <div class="watch-actions" style="margin-top:8px;padding:8px 10px;border-radius:10px;background:var(--surface-2,rgba(255,255,255,0.04))">
+      <span class="badge">${escapeHtml(st.backend || "mpv")} · ${escapeHtml(st.hwdec || "auto-safe")}</span>
+      ${ipcBtns}
+      <button class="btn btn-ghost" type="button" data-native-ctrl="stop">⏹ Detener</button>
+    </div>
+  `;
+}
+
+async function refreshNativePlayerStatus() {
+  if (!IS_TAURI) return null;
+  try {
+    const status = await window.__TAURI__.core.invoke("player_status");
+    state.player.native = status?.state || null;
+    state.player.capabilities = status?.capabilities || null;
+    return status;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function sendNativePlayerControl(command) {
+  if (!IS_TAURI) return;
+  try {
+    const updated = await window.__TAURI__.core.invoke("player_control", { command });
+    state.player.native = updated;
+    if (state.view === "watch") _updateWatchMeta();
+  } catch (err) {
+    toast(String(err?.message || err));
+  }
 }
 
 function _updateMusicMeta(error = "") {
@@ -1212,9 +1611,15 @@ function _updateMusicMeta(error = "") {
       statusEl.style.display = "";
       statusEl.className = "player-status";
     } else if (error) {
-      statusEl.innerHTML = `⚠ ${escapeHtml(error)} <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>`;
-      statusEl.style.display = "";
-      statusEl.className = "player-status error-text";
+      if (_isMembersOnlyError(error)) {
+        statusEl.innerHTML = `<span class="tag tag-members">★ Solo miembros</span> Este contenido es exclusivo para miembros del canal. <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>`;
+        statusEl.style.display = "";
+        statusEl.className = "player-status";
+      } else {
+        statusEl.innerHTML = `⚠ ${escapeHtml(error)} <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>`;
+        statusEl.style.display = "";
+        statusEl.className = "player-status error-text";
+      }
     } else {
       statusEl.style.display = "none";
     }
@@ -1256,12 +1661,18 @@ function _setupMusicListeners(sig) {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "⏸";
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
+    _onLocalMediaEvent();
   }, sig);
 
   audio.addEventListener("pause", () => {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "▶";
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
+    _onLocalMediaEvent();
+  }, sig);
+
+  audio.addEventListener("seeked", () => {
+    _onLocalMediaEvent();
   }, sig);
 
   const wrap = $("#musicProgressWrap");
@@ -1315,17 +1726,34 @@ function _updateWatchQueue() {
   if (!el) return;
   const q = state.player.queue;
   const idx = state.player.index;
-  if (hdr) hdr.textContent = `Cola · ${idx + 1} / ${q.length}`;
-  el.innerHTML = q.map((item, i) => `
-    <div class="queue-item ${i === idx ? "active" : ""}" data-queue-idx="${i}">
-      <span class="queue-idx">${i === idx ? "▶" : i + 1}</span>
-      ${item.thumbnail ? `<img class="queue-thumb" ${thumbAttrs(item.thumbnail)}>` : `<div class="queue-thumb"></div>`}
-      <div class="queue-info">
-        <div class="queue-title">${escapeHtml(item.title || item.url)}</div>
-        <div class="queue-meta">${escapeHtml(item.channel || "")}${item.durationText ? ` · ${escapeHtml(item.durationText)}` : ""}</div>
+  const isParty = Boolean(state.party?.active);
+  const isPartyHost = isParty && state.party.role === "host";
+  if (hdr) {
+    hdr.textContent = isParty
+      ? `Cola compartida · ${q.length ? `${idx + 1} / ${q.length}` : "0"}`
+      : `Cola · ${idx + 1} / ${q.length}`;
+  }
+  el.innerHTML = q.map((item, i) => {
+    const addedBy = item.addedBy;
+    const addedLabel = addedBy?.displayName
+      ? `<div class="queue-added-by" title="${escapeHtml(addedBy.googleAccountName ? `${addedBy.displayName} (Google: ${addedBy.googleAccountName} · ${addedBy.userId})` : `${addedBy.displayName} (${addedBy.userId || ""})`)}">Agregado por ${escapeHtml(addedBy.displayName)}</div>`
+      : "";
+    const removeBtn = isPartyHost
+      ? `<button class="queue-remove-btn" type="button" data-party-remove-idx="${i}" title="Quitar de la cola">×</button>`
+      : "";
+    return `
+      <div class="queue-item ${i === idx ? "active" : ""}" data-queue-idx="${i}">
+        <span class="queue-idx">${i === idx ? "▶" : i + 1}</span>
+        ${item.thumbnail ? `<img class="queue-thumb" ${thumbAttrs(item.thumbnail)}>` : `<div class="queue-thumb"></div>`}
+        <div class="queue-info">
+          <div class="queue-title">${escapeHtml(item.title || item.url)}</div>
+          <div class="queue-meta">${escapeHtml(item.channel || "")}${item.durationText ? ` · ${escapeHtml(item.durationText)}` : ""}</div>
+          ${addedLabel}
+        </div>
+        ${removeBtn}
       </div>
-    </div>
-  `).join("");
+    `;
+  }).join("");
   const activeEl = el.querySelector(".queue-item.active");
   if (activeEl) activeEl.scrollIntoView({ block: "nearest" });
 }
@@ -1439,8 +1867,26 @@ async function _onTrackEnded() {
   }
 }
 
-function addToQueue(item) {
+async function addToQueue(item) {
   const entry = _itemToQueueEntry(item);
+  if (state.party?.active) {
+    if (state.party.role !== "host" && !state.party.canSelfQueue) {
+      toast("El host no ha habilitado permisos de cola para tu usuario");
+      return;
+    }
+    try {
+      const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
+      const snap = await api.post("/api/party/queue/add", {
+        item: { ...entry, sourceContext: ctx || "search" },
+        playNext: false,
+      });
+      _onPartyStateUpdate(snap);
+      toast("Añadido a la cola compartida");
+    } catch (err) {
+      toast(err.message);
+    }
+    return;
+  }
   if (!state.player.current) {
     const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
     openWatchQueue([entry], 0, ctx);
@@ -1452,8 +1898,26 @@ function addToQueue(item) {
   toast("Añadido a la cola");
 }
 
-function playNext(item) {
+async function playNext(item) {
   const entry = _itemToQueueEntry(item);
+  if (state.party?.active) {
+    if (state.party.role !== "host" && !state.party.canSelfQueue) {
+      toast("El host no ha habilitado permisos de cola para tu usuario");
+      return;
+    }
+    try {
+      const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
+      const snap = await api.post("/api/party/queue/add", {
+        item: { ...entry, sourceContext: ctx || "search" },
+        playNext: true,
+      });
+      _onPartyStateUpdate(snap);
+      toast("Se reproducirá a continuación en la sesión");
+    } catch (err) {
+      toast(err.message);
+    }
+    return;
+  }
   if (!state.player.current) {
     const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
     openWatchQueue([entry], 0, ctx);
@@ -1477,7 +1941,7 @@ function _updateMediaSession() {
       : [],
   });
   const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
-  const audioEl = isAudio ? $("#webPlayerAudio") : null;
+  const audioEl = isAudio ? _getAudioEl() : null;
   const vjs = !isAudio ? state.player.vjs : null;
   navigator.mediaSession.setActionHandler("play", () => {
     if (audioEl) audioEl.play().catch(() => {});
@@ -1510,6 +1974,36 @@ function _updateMediaSession() {
 }
 
 async function openWatchQueue(queue, index = 0, sourceContext = "search") {
+  if (state.party?.active) {
+    const chosen = queue[index] || queue[0];
+    if (!chosen) return;
+    if (state.party.role === "guest") {
+      if (state.party.canSelfQueue) {
+        await addToQueue(chosen);
+        setView("watch");
+      } else {
+        toast("Solo el host controla la reproducción y la cola en esta sesión");
+      }
+      return;
+    }
+    // Host: enqueue and immediately play it synchronized for everyone
+    try {
+      const snap = await api.post("/api/party/queue/add", {
+        item: { ..._itemToQueueEntry(chosen), sourceContext: sourceContext || "search" },
+        playNext: false,
+      });
+      const newIdx = Math.max(0, (snap.queue?.length || 1) - 1);
+      state.player.sourceContext = sourceContext;
+      state.player.audioOnly = false;
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      setView("watch");
+      await loadWebPlayerItem(newIdx);
+      await _pushHostPlaybackSync({ currentIndex: newIdx, positionSecs: 0, isPlaying: true });
+    } catch (err) {
+      toast(err.message);
+    }
+    return;
+  }
   state.player.audioOnly = false;
   state.player.sourceContext = sourceContext;
   state.player.shuffle = false;
@@ -1518,11 +2012,11 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
     toast("Cargando cola...");
     try {
       const data = await api.post("/api/player/playlist", { url: queue[0].url, quality: state.config?.playbackQuality || "best" });
-      if (data.requiresLogin || (data.items?.length === 0 && data.error)) {
+      if (data.requiresLogin || !data.items?.length) {
         toast(data.error || "No se pudo cargar la playlist");
         return;
       }
-      if (data.items?.length) queue = data.items;
+      queue = data.items;
     } catch (err) {
       toast(err.message);
       return;
@@ -1536,13 +2030,16 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   await loadWebPlayerItem(index);
 }
 
-async function loadWebPlayerItem(index) {
+async function loadWebPlayerItem(index, opts = {}) {
   const item = state.player.queue[index];
   if (!item) return;
   const loadId = ++state.player._loadingId;
   state.player.index = index;
   state.player.current = item;
   state.player.loading = true;
+  if (item.sourceContext && state.party?.active) {
+    state.player.sourceContext = item.sourceContext;
+  }
   renderWatch();
   _updateWatchMeta();
   _updateWatchQueue();
@@ -1554,23 +2051,103 @@ async function loadWebPlayerItem(index) {
     } else {
       await _loadVideoItem(item, loadId);
     }
+    if (state.player._loadingId !== loadId) return;
+    if (opts?.fromPartySync) {
+      setTimeout(() => {
+        _applyMediaSync(Boolean(opts.targetPlaying), Number(opts.targetPos || 0), Number(opts.targetRate || 1));
+      }, 350);
+    } else if (state.party?.active && state.party.role === "host") {
+      _pushHostPlaybackSync({ currentIndex: index, positionSecs: 0, isPlaying: true });
+    }
   } catch (err) {
     if (state.player._loadingId !== loadId) return;
     state.player.loading = false;
-    _updateWatchMeta(err.message);
+    const msg = err?.message || String(err || "Error inesperado");
+    if (_isMembersOnlyError(msg)) {
+      _markMembersOnlyByUrl(item.url);
+    }
+    _updateWatchMeta(msg);
   }
+}
+
+function _resolveDesktopPlayer() {
+  const preferred = (state.config?.defaultPlayer || "mpv").toLowerCase();
+  const caps = state.player.capabilities || {};
+  if (preferred === "vlc") {
+    return {
+      preferred: "vlc",
+      available: !!caps.vlcAvailable,
+      path: caps.vlcPath || state.config?.players?.vlc || "vlc",
+    };
+  }
+  return {
+    preferred: "mpv",
+    available: !!caps.mpvAvailable,
+    path: caps.mpvPath || state.config?.players?.mpv || "mpv",
+  };
+}
+
+function _getAudioEl() {
+  return document.getElementById("webPlayerAudio_html5_api") || $("#webPlayerAudio");
 }
 
 async function _loadMusicItem(item, loadId) {
   const info = await api.get(`/api/player/audio?url=${encodeURIComponent(item.url)}`);
   if (state.player._loadingId !== loadId) return;
-  const audio = $("#webPlayerAudio");
+  const audio = _getAudioEl();
   if (!audio) return;
   state.player.current = { ...item, ...(info.item || {}) };
   state.player.loading = false;
-  audio.src = info.proxyUrl;
-  audio.load();
-  audio.play().catch(() => {});
+  const rawSrc = info.streamUrl || info.proxyUrl || "";
+  const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist");
+  const proxiedSrc = streamProxyUrl(rawSrc);
+  if (IS_TAURI && isHls && window.videojs) {
+    if (!state.player.audioVjs || state.player.audioVjs.isDisposed()) {
+      state.player.audioVjs = videojs("webPlayerAudio", {
+        controls: false,
+        autoplay: true,
+        preload: "auto",
+        html5: { vhs: { overrideNative: true } },
+      });
+      state.player.audioVjs.on("error", () => {
+        const err = state.player.audioVjs?.error();
+        _updateWatchMeta(err?.message || "Error al reproducir el audio.");
+      });
+    }
+    state.player.audioVjs.src({ src: proxiedSrc, type: "application/x-mpegURL" });
+    state.player.audioVjs.play().catch(() => {});
+  } else {
+    let targetAudio = audio;
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      try { state.player.audioVjs.dispose(); } catch (_) {}
+      state.player.audioVjs = null;
+      // videojs.dispose() removes the <audio> element from the DOM; recreate it for native playback.
+      const card = document.querySelector(".music-player-card");
+      if (card && !document.getElementById("webPlayerAudio")) {
+        const fresh = document.createElement("audio");
+        fresh.id = "webPlayerAudio";
+        fresh.autoplay = true;
+        card.appendChild(fresh);
+        if (state.player._listenerAbort) {
+          state.player._listenerAbort.abort();
+        }
+        const ac = new AbortController();
+        state.player._listenerAbort = ac;
+        const sig = { signal: ac.signal };
+        fresh.addEventListener("ended", () => { _onTrackEnded(); }, sig);
+        _setupMusicListeners(sig);
+        targetAudio = fresh;
+      }
+    }
+    if (!targetAudio) return;
+    targetAudio.onerror = () => {
+      const code = targetAudio.error?.code;
+      _updateWatchMeta(`Error de audio (código ${code || "?"}). Prueba con 'Abrir externo'.`);
+    };
+    targetAudio.src = proxiedSrc;
+    targetAudio.load();
+    targetAudio.play().catch(() => {});
+  }
   _updateWatchMeta();
   _updateWatchQueue();
   _updateWatchRelated();
@@ -1581,6 +2158,7 @@ async function _loadMusicItem(item, loadId) {
 // Warm the backend cache for the next queue item so advancing has no gap.
 const _prefetchedUrls = new Set();
 function _prefetchNextItem() {
+  if (IS_TAURI) return;
   const next = state.player.queue[state.player.index + 1];
   if (!next || !next.url || _prefetchedUrls.has(next.url)) return;
   _prefetchedUrls.add(next.url);
@@ -1595,13 +2173,60 @@ function _prefetchNextItem() {
 }
 
 async function _loadVideoItem(item, loadId) {
+  state.player.audioTracks = null;
+  state.player.audioLang = null;
+  const rawQuality = state.config?.playbackQuality || "best";
+  const quality = encodeURIComponent(rawQuality);
+
+  // Desktop integrated mode: play inside Playzi via Video.js + local playzi-stream:// HLS proxy.
+  // External players (VLC / mpv) remain available via the "Abrir externo" button and local files.
+  if (IS_TAURI) {
+    const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
+    if (state.player._loadingId !== loadId) return;
+    state.player.current = { ...item, ...(info.item || {}) };
+    state.player.loading = false;
+    const rawSrc = info.streamUrl || info.video?.url || "";
+    if (rawSrc) {
+      await ensureVideoPlayer();
+      if (state.player._loadingId !== loadId) return;
+      const player = state.player.vjs;
+      const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
+      const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
+      const hlsAudioUrl = info.hlsAudio?.url || "";
+      const proxiedSrc = (isHls && !videoHasAudio && hlsAudioUrl)
+        ? streamMasterProxyUrl(rawSrc, hlsAudioUrl)
+        : streamProxyUrl(rawSrc);
+      const mimeType = isHls
+        ? "application/x-mpegURL"
+        : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+      player.src({ src: proxiedSrc, type: mimeType });
+      player.play().catch(() => {});
+    } else {
+      _updateWatchMeta("No se pudo resolver un stream reproducible. Puedes intentar con 'Abrir externo'.");
+      return;
+    }
+    _updateWatchMeta();
+    _updateWatchQueue();
+    _updateWatchRelated();
+    _updateMediaSession();
+    return;
+  }
+
+  // Warm the manifest in parallel with /info: both share the same yt-dlp
+  // extraction via the backend single-flight, so the player's manifest
+  // request later is a cache hit instead of a second round-trip.
+  if (!item.manifestUrl) {
+    fetch(`/api/player/manifest.mpd?url=${encodeURIComponent(item.url)}&quality=${quality}`).catch(() => {});
+  }
   const info = item.manifestUrl
     ? { manifestUrl: item.manifestUrl, item }
-    : await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${encodeURIComponent(state.config?.playbackQuality || "best")}`);
+    : await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
   if (state.player._loadingId !== loadId) return;
   await ensureVideoPlayer();
   if (state.player._loadingId !== loadId) return;
   const player = state.player.vjs;
+  const audioBtn = player.controlBar?.getChild("AudioLangButton");
+  if (audioBtn) { audioBtn.show(); audioBtn.update(); }
   player.src({ type: "application/dash+xml", src: info.manifestUrl });
   player.play().catch(() => {});
   state.player.current = { ...item, ...(info.item || {}) };
@@ -1631,14 +2256,22 @@ async function ensureVideoPlayer() {
   state.player.vjs = player;
   player.on("error", () => {
     const err = player.error();
-    const code = err?.code;
-    const msg = code === 4
-      ? "Formato no compatible con el reproductor web. Prueba con un reproductor externo (MPV/VLC) o baja la calidad."
-      : (err?.message || "Error de reproducción");
+    const messages = {
+      1: "Reproducción cancelada.",
+      2: "Error de red al cargar el video. Revisa tu conexión o reintenta.",
+      3: "Error al decodificar el video. Prueba con otra calidad.",
+      4: "Formato no compatible con el reproductor web. Prueba con un reproductor externo (MPV/VLC) o baja la calidad.",
+      5: "El video está cifrado y no se puede reproducir.",
+    };
+    const msg = messages[err?.code] || err?.message || "Error de reproducción";
     toast(msg);
     _updateWatchMeta(msg);
   });
   player.on("ended", () => { _onTrackEnded(); });
+  player.on("play", () => { _onLocalMediaEvent(); });
+  player.on("pause", () => { _onLocalMediaEvent(); });
+  player.on("seeked", () => { _onLocalMediaEvent(); });
+  player.on("ratechange", () => { _onLocalMediaEvent(); });
   // Restore / persist volume
   player.ready(() => {
     const savedVol = localStorage.getItem("playzi-volume");
@@ -1648,7 +2281,72 @@ async function ensureVideoPlayer() {
     localStorage.setItem("playzi-volume", player.volume());
   });
   _registerQualityMenu(player);
+  _registerAudioMenu(player);
   _registerTheaterBtn(player);
+}
+
+function _registerAudioMenu(player) {
+  const MenuButton = videojs.getComponent("MenuButton");
+  const MenuItem = videojs.getComponent("MenuItem");
+
+  class AudioTrackMenuItem extends MenuItem {
+    constructor(p, opts) {
+      super(p, { ...opts, selectable: !!opts.track, multiSelectable: false });
+      if (opts.track) {
+        const active = state.player.audioLang
+          ? state.player.audioLang === opts.track.lang
+          : opts.track.default;
+        this.selected(active);
+      }
+    }
+    handleClick() {
+      const track = this.options_.track;
+      if (!track) return;
+      state.player.audioLang = track.lang;
+      const curTime = player.currentTime();
+      let src = player.currentSrc().replace(/&audio_lang=[^&]*/, "");
+      if (!track.default) src += `&audio_lang=${encodeURIComponent(track.lang)}`;
+      toast(`Cambiando audio a ${track.name}...`);
+      player.src({ type: "application/dash+xml", src });
+      player.one("canplay", () => {
+        player.currentTime(curTime);
+        player.play().catch(() => {});
+      });
+      const btn = player.controlBar.getChild("AudioLangButton");
+      if (btn) btn.items.forEach((it) => it.options_.track && it.selected(it.options_.track.lang === track.lang));
+    }
+  }
+
+  class AudioLangButton extends MenuButton {
+    buildCSSClass() { return `vjs-audio-lang-button ${super.buildCSSClass()}`; }
+    createItems() {
+      const tracks = state.player.audioTracks;
+      if (tracks === null) return [new AudioTrackMenuItem(player, { label: "Cargando idiomas..." })];
+      return tracks.map((t) => new AudioTrackMenuItem(player, { label: t.name, track: t }));
+    }
+    handleClick() {
+      super.handleClick?.();
+      if (state.player.audioTracks !== null || this._fetching) return;
+      this._fetching = true;
+      const url = state.player.current?.url;
+      if (!url) { this._fetching = false; return; }
+      api.get(`/api/player/audio-tracks?url=${encodeURIComponent(url)}`)
+        .then((data) => {
+          state.player.audioTracks = data.tracks || [];
+          this.update();
+          if (state.player.audioTracks.length <= 1) {
+            toast("Este video no tiene otras pistas de audio");
+            this.hide();
+          }
+        })
+        .catch((err) => { toast(err.message); })
+        .finally(() => { this._fetching = false; });
+    }
+  }
+
+  if (!videojs.getComponent("AudioLangButton")) videojs.registerComponent("AudioLangButton", AudioLangButton);
+  if (!videojs.getComponent("AudioTrackMenuItem")) videojs.registerComponent("AudioTrackMenuItem", AudioTrackMenuItem);
+  player.controlBar.addChild("AudioLangButton", {}, player.controlBar.children().length - 1);
 }
 
 function _registerQualityMenu(player) {
@@ -1733,7 +2431,11 @@ function _miniPlayerHtml() {
 
 function _updateMiniPlayer() {
   const item = state.player.current;
-  if (!item) return;
+  if (!item) {
+    // Reproductor destruido mientras el mini seguia visible: cortar el interval
+    _hideMiniPlayer();
+    return;
+  }
 
   const titleEl = document.getElementById("miniTitle");
   if (titleEl) titleEl.textContent = item.title || "";
@@ -1928,18 +2630,20 @@ function videoCard(item) {
     <article class="card">
       <div class="thumb">
         ${item.thumbnail ? `<img ${thumbAttrs(item.thumbnail)}>` : ""}
+        ${item.membersOnly ? `<span class="badge-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}
         <span class="duration">${escapeHtml(item.durationText || "--:--")}</span>
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(item.title)}</div>
-        <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
+        <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${item.membersOnly ? `<span class="tag tag-members" title="Requiere membresía activa del canal en YouTube">Solo miembros</span> ` : ""}${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
       </div>
       <div class="card-actions">
-        ${isArtist ? `<button class="btn btn-primary" type="button" data-artist-songs="${escapeHtml(item.title || "")}">Ver canciones</button>` : ""}
-        ${isPlaylist ? `<button class="btn btn-primary" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : ""}
-        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-primary" type="button" data-download="video" data-id="${id}">Descargar</button>` : ""}
+        ${(!isArtist && !isAlbum) ? `<button class="btn btn-primary" type="button" data-play-default data-id="${id}">▶ Reproducir</button>` : ""}
+        ${(isAlbum && item.url) ? `<button class="btn btn-primary" type="button" data-album-play="${escapeHtml(item.url)}">▶ Reproducir</button>` : ""}
+        ${isArtist ? `<button class="btn btn-ghost" type="button" data-open-artist="${escapeHtml(item.id || "")}" data-open-artist-name="${escapeHtml(item.title || "")}">Ver artista</button>` : ""}
+        ${isPlaylist ? `<button class="btn btn-ghost" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : ""}
+        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-download="video" data-id="${id}">Descargar</button>` : ""}
         ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-download="audio" data-id="${id}">Audio</button>` : ""}
-        ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-play-default data-id="${id}">▶ Play</button>` : ""}
         ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
         ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button"
           data-add-to-playlist="${escapeHtml(item.url || item.feedId || '')}"
@@ -1978,7 +2682,7 @@ function libraryCard(item) {
         <div class="meta"><span class="tag">${escapeHtml(item.format || item.kind)}</span> ${escapeHtml(item.size || "")} ${item.collection ? ` · ${escapeHtml(item.collection)}` : ""}</div>
       </div>
       <div class="card-actions">
-        <button class="btn btn-primary" type="button" data-local-play-default data-path="${escapeHtml(item.path)}">Reproducir</button>
+        <button class="btn btn-primary" type="button" data-local-play-default data-path="${escapeHtml(item.path)}">▶ Reproducir</button>
         ${item.mediaUrl ? `<a class="btn btn-ghost" href="${escapeHtml(item.mediaUrl)}" target="_blank">Navegador</a>` : ""}
       </div>
     </article>
@@ -1991,6 +2695,7 @@ function downloadItem(item) {
   const cancelled = item.status === "cancelled";
   const active = ["queued", "starting", "downloading", "processing"].includes(item.status);
   const statusLabel = done ? "Listo" : failed ? "Error" : cancelled ? "Cancelado" : escapeHtml(item.status || "queued");
+  const membersErr = failed && _isMembersOnlyError(item.error);
   return `
     <div class="dl-item">
       <div class="dl-header">
@@ -2003,7 +2708,7 @@ function downloadItem(item) {
       </div>
       <div class="track"><div class="fill" style="width:${Number(item.progress || 0)}%"></div></div>
       <div class="prog-labels"><span>${Math.round(item.progress || 0)}%</span><span>${escapeHtml(item.speed || "")} ${escapeHtml(item.eta || "")}</span></div>
-      ${failed ? `<div class="error-text">${escapeHtml(item.error)}</div>` : ""}
+      ${failed ? (membersErr ? `<div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px"><span class="tag tag-members">★ Solo miembros</span><span>Este video es exclusivo para miembros del canal.</span></div>` : `<div class="error-text">${escapeHtml(item.error)}</div>`) : ""}
       <div style="display:flex;gap:7px;margin-top:8px">
         ${active ? `<button class="btn btn-ghost" type="button" data-cancel-download="${escapeHtml(item.id)}">Cancelar</button>` : ""}
         ${(done || failed || cancelled) ? `<button class="btn btn-danger" type="button" data-delete-download="${escapeHtml(item.id)}">Eliminar</button>` : ""}
@@ -2023,7 +2728,10 @@ function allVideoItems() {
     ...(state.musicLibrary?.liked || []),
     ...(state.musicLibrary?.history || []),
   ];
-  return [...state.results, ...state.feed, ...state.recommendations, ...state.musicRecommendations, ...musicLibraryItems, ...state.library, ...playlistItems, ...state.history];
+  const artistItems = state.artistView?.data
+    ? [...(state.artistView.data.songs || []), ...(state.artistView.data.albums || []), ...(state.artistView.data.singles || [])]
+    : [];
+  return [...state.results, ...(state.channelView?.items || []), ...artistItems, ...state.feed, ...state.recommendations, ...state.musicRecommendations, ...musicLibraryItems, ...state.library, ...playlistItems, ...state.history];
 }
 
 function findVideo(id) {
@@ -2031,34 +2739,95 @@ function findVideo(id) {
 }
 
 // Warm the backend cache when the user hovers a result, so the click feels
-// instant. Debounced; one prefetch in flight; never re-warms the same URL.
+// instant. Debounced; capped concurrency; never re-warms the same URL.
+let _prefetchInFlight = 0;
+const _PREFETCH_MAX_INFLIGHT = 3;
+
+const _PREFETCH_TTL_MS = 4 * 60 * 60 * 1000;
+const _PREFETCH_MAX_ENTRIES = 120;
+const _prefetchTimestamps = new Map();
+
+function _isPrefetchedFresh(url) {
+  const ts = _prefetchTimestamps.get(url);
+  if (!ts) return false;
+  if (Date.now() - ts > _PREFETCH_TTL_MS) {
+    _prefetchTimestamps.delete(url);
+    _prefetchedUrls.delete(url);
+    return false;
+  }
+  return true;
+}
+
+function _markPrefetched(url) {
+  if (_prefetchTimestamps.size >= _PREFETCH_MAX_ENTRIES) {
+    const oldest = _prefetchTimestamps.keys().next().value;
+    if (oldest) {
+      _prefetchTimestamps.delete(oldest);
+      _prefetchedUrls.delete(oldest);
+    }
+  }
+  _prefetchTimestamps.set(url, Date.now());
+  _prefetchedUrls.add(url);
+}
+
+function prefetchPlayback(url, forceAudio = false) {
+  if (!url || _isPrefetchedFresh(url) || _prefetchInFlight >= _PREFETCH_MAX_INFLIGHT) return;
+  // Playlists/mixes resolve to many videos — nothing single to warm.
+  if (String(url).includes("list=") && !String(url).includes("watch?v=")) return;
+  _markPrefetched(url);
+  _prefetchInFlight += 1;
+  const isAudio = forceAudio || String(url).includes("music.youtube.com");
+  const quality = encodeURIComponent(state.config?.playbackQuality || "best");
+  const endpoint = isAudio
+    ? `/api/player/audio?url=${encodeURIComponent(url)}`
+    : `/api/player/manifest.mpd?url=${encodeURIComponent(url)}&quality=${quality}`;
+  fetch(endpoint)
+    .then((res) => {
+      if (!res.ok) {
+        _prefetchedUrls.delete(url);
+        _prefetchTimestamps.delete(url);
+      }
+    })
+    .catch(() => {
+      _prefetchedUrls.delete(url);
+      _prefetchTimestamps.delete(url);
+    })
+    .finally(() => { _prefetchInFlight -= 1; });
+}
+
+function _hoverPrefetchTarget(ev) {
+  // Anywhere on a result card (thumbnail/title), not just the Play button.
+  const card = ev.target.closest(".card");
+  const playBtn = card?.querySelector("[data-play-default]");
+  if (playBtn) {
+    const item = findVideo(playBtn.dataset.id);
+    if (item?.url) return { url: item.url, forceAudio: false };
+  }
+  // Artist view song rows play via the music/audio pipeline.
+  const artistRow = ev.target.closest("[data-artist-play]");
+  if (artistRow) {
+    const song = state.artistView?.data?.songs?.[Number(artistRow.dataset.artistPlay) || 0];
+    if (song?.url) return { url: song.url, forceAudio: true };
+  }
+  return null;
+}
+
 function _setupHoverPrefetch() {
   let hoverTimer = null;
-  let inFlight = null;
   document.body.addEventListener("mouseover", (ev) => {
-    // Trigger anywhere on the card (thumbnail/title), not just the Play button.
-    const card = ev.target.closest(".card");
-    const playBtn = card?.querySelector("[data-play-default]");
-    if (!playBtn) return;
-    const item = findVideo(playBtn.dataset.id);
-    if (!item || !item.url || _prefetchedUrls.has(item.url)) return;
+    const target = _hoverPrefetchTarget(ev);
+    if (!target || _prefetchedUrls.has(target.url)) return;
     clearTimeout(hoverTimer);
-    hoverTimer = setTimeout(() => {
-      if (_prefetchedUrls.has(item.url)) return;
-      _prefetchedUrls.add(item.url);
-      if (inFlight) inFlight.abort();
-      inFlight = new AbortController();
-      const isAudio = String(item.url).includes("music.youtube.com");
-      const quality = encodeURIComponent(state.config?.playbackQuality || "best");
-      const endpoint = isAudio
-        ? `/api/player/audio?url=${encodeURIComponent(item.url)}`
-        : `/api/player/manifest.mpd?url=${encodeURIComponent(item.url)}&quality=${quality}`;
-      fetch(endpoint, { signal: inFlight.signal }).catch(() => {});
-    }, 200);
+    hoverTimer = setTimeout(() => prefetchPlayback(target.url, target.forceAudio), 200);
   });
   document.body.addEventListener("mouseout", (ev) => {
-    if (ev.target.closest(".card")) clearTimeout(hoverTimer);
+    if (ev.target.closest(".card") || ev.target.closest("[data-artist-play]")) clearTimeout(hoverTimer);
   });
+  // No hover on touch devices: warm on touchstart, before the tap resolves to a click.
+  document.body.addEventListener("touchstart", (ev) => {
+    const target = _hoverPrefetchTarget(ev);
+    if (target) prefetchPlayback(target.url, target.forceAudio);
+  }, { passive: true });
 }
 
 function openDownloadModal(item, kind, presetCollection = "") {
@@ -2486,6 +3255,9 @@ function bindEvents() {
       try {
         const savedConfig = await api.post("/api/config", submittedConfig);
         state.config = { ...submittedConfig, ...savedConfig, playbackQuality: savedConfig.playbackQuality || submittedConfig.playbackQuality };
+        if (IS_TAURI) {
+          await refreshNativePlayerStatus();
+        }
         toast("Configuración guardada");
         renderConfig();
       } catch (err) {
@@ -2517,13 +3289,31 @@ function bindEvents() {
       await doSearch();
       return;
     }
-    const artistSongs = ev.target.closest("[data-artist-songs]");
-    if (artistSongs) {
-      state.query = artistSongs.dataset.artistSongs || "";
-      state.searchScope = "music";
-      state.musicSearchFilter = "songs";
-      $("#searchInput").value = state.query;
-      await doSearch();
+    const openArtist = ev.target.closest("[data-open-artist]");
+    if (openArtist) {
+      await openArtistView(openArtist.dataset.openArtist, openArtist.dataset.openArtistName);
+      return;
+    }
+    const artistPlay = ev.target.closest("[data-artist-play]");
+    if (artistPlay) {
+      const songs = state.artistView?.data?.songs || [];
+      const idx = Number(artistPlay.dataset.artistPlay) || 0;
+      if (songs.length) await openWatchQueue(songs.map(_itemToQueueEntry), idx, "music");
+      return;
+    }
+    const albumPlay = ev.target.closest("[data-album-play]");
+    if (albumPlay) {
+      toast("Cargando álbum...");
+      try {
+        const data = await api.post("/api/music/playlist-songs", { url: albumPlay.dataset.albumPlay });
+        if (!data.items?.length) {
+          toast("No se encontraron canciones en este álbum");
+          return;
+        }
+        await openWatchQueue(data.items.map(_itemToQueueEntry), 0, "music");
+      } catch (err) {
+        toast(err.message);
+      }
       return;
     }
     if (ev.target.closest("[data-open-import-playlist]")) {
@@ -2558,6 +3348,11 @@ function bindEvents() {
     }
     const local = ev.target.closest("[data-local-play-default]");
     if (local) await playTarget(local.dataset.path, null, local.dataset.path);
+
+    const urlPlay = ev.target.closest("[data-url-play]");
+    if (urlPlay && state.query.trim()) {
+      await directPlay();
+    }
 
     const urlDownload = ev.target.closest("[data-url-download]");
     if (urlDownload && state.query.trim()) {
@@ -2663,28 +3458,14 @@ function bindEvents() {
     }
     const watchChannel = ev.target.closest("[data-watch-channel]");
     if (watchChannel) {
-      openChannelPreview(watchChannel.dataset.watchChannel, watchChannel.dataset.watchChannelName);
+      openChannelView(watchChannel.dataset.watchChannel, watchChannel.dataset.watchChannelName);
       return;
     }
     const viewChannel = ev.target.closest("[data-view-channel]");
     if (viewChannel) {
-      const channelId = viewChannel.dataset.viewChannel;
-      setView("channels");
-      const channel = state.channels.find((c) => c.id === channelId);
-      const videos = state.feed.filter((f) => f.sourceChannelId === channelId);
-      $("#view-channels").innerHTML = `
-        <div class="section-hdr">
-          <span class="section-title">${escapeHtml(channel?.name || "Canal")}</span>
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-ghost" type="button" data-refresh-channel="${escapeHtml(channelId)}">Actualizar</button>
-            <button class="btn btn-ghost" type="button" id="backToChannels">← Canales</button>
-          </div>
-        </div>
-        ${videos.length
-          ? `<div class="grid">${videos.map(videoCard).join("")}</div>`
-          : empty("Sin videos recientes", "Pulsa Actualizar para cargar los videos recientes de este canal.")}
-      `;
-      $("#backToChannels").onclick = () => renderChannels();
+      const channel = state.channels.find((c) => c.id === viewChannel.dataset.viewChannel);
+      if (channel) openChannelView(channel.url, channel.name);
+      return;
     }
     const cancelDownload = ev.target.closest("[data-cancel-download]");
     if (cancelDownload) {
@@ -2814,8 +3595,22 @@ function bindEvents() {
     }
 
     // Watch view controls
+    const partyRemoveBtn = ev.target.closest("[data-party-remove-idx]");
+    if (partyRemoveBtn) {
+      ev.stopPropagation();
+      const idx = Number(partyRemoveBtn.dataset.partyRemoveIdx);
+      try {
+        const snap = await api.post("/api/party/queue/remove", { index: idx });
+        _onPartyStateUpdate(snap);
+      } catch (err) { toast(err.message); }
+      return;
+    }
     const queueItem = ev.target.closest("[data-queue-idx]");
     if (queueItem) {
+      if (state.party?.active && state.party.role === "guest") {
+        toast("Solo el host puede cambiar la pista actual");
+        return;
+      }
       const idx = Number(queueItem.dataset.queueIdx);
       await loadWebPlayerItem(idx);
     }
@@ -2859,7 +3654,19 @@ function bindEvents() {
     if (ev.target.closest("#ctrlAutoplay")) { toggleAutoplay(); }
     if (ev.target.closest("#playerExternal") && state.player.current?.url) {
       const cur = state.player.current;
+      try { state.player.vjs?.pause(); } catch (_) {}
+      try { state.player.audioVjs?.pause(); } catch (_) {}
+      try { _getAudioEl()?.pause(); } catch (_) {}
       await playTarget(cur.url, state.config?.defaultPlayer || "mpv", cur.title, cur.thumbnail, cur.channel);
+    }
+    const nativeCtrlBtn = ev.target.closest("[data-native-ctrl]");
+    if (nativeCtrlBtn) {
+      const action = nativeCtrlBtn.dataset.nativeCtrl;
+      if (action === "toggle") await sendNativePlayerControl({ action: "togglePause" });
+      else if (action === "seek-back") await sendNativePlayerControl({ action: "seek", seconds: -10, relative: true });
+      else if (action === "seek-fwd") await sendNativePlayerControl({ action: "seek", seconds: 10, relative: true });
+      else if (action === "mute") await sendNativePlayerControl({ action: "setMute", muted: !state.player.native?.muted });
+      else if (action === "stop") await sendNativePlayerControl({ action: "stop" });
     }
     if (ev.target.closest("#toggleAudioOnly")) {
       state.player.audioOnly = !state.player.audioOnly;
@@ -2897,7 +3704,7 @@ function bindEvents() {
   document.addEventListener("keydown", async (ev) => {
     if (state.view !== "watch") return;
     if (ev.target.matches("input, textarea, select")) return;
-    const audio = state.player.sourceContext === "music" || state.player.audioOnly ? $("#webPlayerAudio") : null;
+    const audio = state.player.sourceContext === "music" || state.player.audioOnly ? _getAudioEl() : null;
     const vjs = state.player.vjs;
     if (ev.code === "Space") {
       ev.preventDefault();
@@ -2929,10 +3736,13 @@ function bindEvents() {
 let _pollTimer = null;
 
 function scheduleNextPoll() {
+  if (IS_TAURI) return;
   clearTimeout(_pollTimer);
+  if (document.hidden) return;
   const hasActive = state.downloads.some((d) => !["done", "error", "cancelled"].includes(d.status));
   _hadActiveDownloads = _hadActiveDownloads || hasActive;
   _pollTimer = setTimeout(async () => {
+    if (document.hidden) return;
     try {
       await refreshSummary();
       const stillActive = state.downloads.some((d) => !["done", "error", "cancelled"].includes(d.status));
@@ -2949,9 +3759,776 @@ function scheduleNextPoll() {
   }, hasActive ? 2500 : 12000);
 }
 
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(_pollTimer);
+    _pollTimer = null;
+  } else {
+    refreshSummary().catch(() => {});
+    scheduleNextPoll();
+  }
+});
+
+async function bindTauriEvents() {
+  if (!IS_TAURI || !window.__TAURI__?.event?.listen) return;
+  const { listen } = window.__TAURI__.event;
+  await listen("download-progress", (event) => {
+    const ev = event.payload || {};
+    const job = state.downloads.find((d) => d.id === ev.jobId);
+    if (job) {
+      job.status = ev.status ?? job.status;
+      job.progress = ev.progress ?? job.progress;
+      job.speed = ev.speed ?? job.speed;
+      job.eta = ev.eta ?? job.eta;
+      job.error = ev.error ?? job.error;
+      if (ev.path) job.path = ev.path;
+      job.updatedAt = ev.updatedAt ?? job.updatedAt;
+    }
+    if (state.view === "downloads") renderDownloads();
+    $("#downloadBadge").textContent = state.downloads.filter((d) => !["done", "error", "cancelled"].includes(d.status)).length || "";
+    if (ev.status === "done") {
+      refreshLists().catch(() => {});
+    }
+  });
+  await listen("sync-status", (event) => {
+    const ev = event.payload || {};
+    state.syncStatus = { ...(state.syncStatus || {}), ...ev };
+    if (!ev.running && ev.lastSuccess && ev.lastSuccess !== _lastSeenSyncSuccess) {
+      _lastSeenSyncSuccess = ev.lastSuccess;
+      refreshLists().catch(() => {});
+    }
+  });
+  await listen("auth-status", (event) => {
+    const ev = event.payload || {};
+    const wasOk = state.musicAuthState === "ok";
+    if (ev.authState) state.musicAuthState = ev.authState;
+    if (ev.accountName !== undefined) state.musicAccountName = ev.accountName;
+    renderAuthStatus();
+    if (ev.authState === "ok" && !wasOk) {
+      toast(ev.accountName ? `Conectado como ${ev.accountName}` : "Sesión iniciada.");
+    }
+    refreshLists().catch(() => {});
+  });
+  await listen("player-state", (event) => {
+    const ev = event.payload || {};
+    if (ev.state) {
+      state.player.native = ev.state;
+      if (state.view === "watch") _updateWatchMeta();
+    }
+  });
+  await listen("party-state", (event) => {
+    if (event.payload) _onPartyStateUpdate(event.payload);
+  });
+  await listen("party-notice", (event) => {
+    const msg = event.payload?.message;
+    if (msg) toast(msg);
+  });
+}
+
+// ── Watch Party / Sesión Compartida ──────────────────────────────────────────
+
+let _applyingPartySync = false;
+let _partyHeartbeatTimer = null;
+let _partySyncDebounce = null;
+let _partyLastSyncedUrl = "";
+
+function _updatePartyBadge() {
+  const badge = $("#partyBadge");
+  if (!badge) return;
+  if (state.party?.active) {
+    badge.textContent = String(state.party.participants?.length || 1);
+  } else {
+    badge.textContent = "";
+  }
+}
+
+function _updateWatchPartyBar() {
+  const bar = $("#watch-party-bar");
+  if (!bar) return;
+  const p = state.party;
+  if (!p?.active) {
+    bar.innerHTML = "";
+    return;
+  }
+  const roleLabel = p.role === "host" ? "Host" : `Invitado · Host: ${p.hostName || "Host"}`;
+  const permLabel = p.role === "host" || p.canSelfQueue ? "Puedes agregar a la cola" : "Solo lectura";
+  bar.innerHTML = `
+    <div class="watch-party-bar">
+      <div class="party-row">
+        <span class="party-pill party-pill--live">En sesión · Sala ${escapeHtml(p.roomCode)}</span>
+        <span>${escapeHtml(roleLabel)} · ${p.participants?.length || 1} conectados · ${escapeHtml(permLabel)}</span>
+      </div>
+      <div class="party-row">
+        ${p.role === "guest" ? `<button class="btn btn-ghost" type="button" data-party-action="resync">Resincronizar</button>` : ""}
+        <button class="btn btn-ghost" type="button" data-party-action="open-view">Gestionar sesión</button>
+      </div>
+    </div>
+  `;
+}
+
+function _getCurrentMediaState() {
+  const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+  if (isAudio) {
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      return {
+        isPlaying: !state.player.audioVjs.paused(),
+        positionSecs: Number(state.player.audioVjs.currentTime() || 0),
+        playbackRate: Number(state.player.audioVjs.playbackRate() || 1),
+      };
+    }
+    const audio = _getAudioEl();
+    if (audio) {
+      return {
+        isPlaying: !audio.paused,
+        positionSecs: Number(audio.currentTime || 0),
+        playbackRate: Number(audio.playbackRate || 1),
+      };
+    }
+  } else if (state.player.vjs && !state.player.vjs.isDisposed()) {
+    return {
+      isPlaying: !state.player.vjs.paused(),
+      positionSecs: Number(state.player.vjs.currentTime() || 0),
+      playbackRate: Number(state.player.vjs.playbackRate() || 1),
+    };
+  }
+  return { isPlaying: false, positionSecs: 0, playbackRate: 1 };
+}
+
+function _applyMediaSync(targetPlaying, targetPosSecs, targetRate = 1) {
+  _applyingPartySync = true;
+  try {
+    const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+    if (isAudio) {
+      const vjs = state.player.audioVjs && !state.player.audioVjs.isDisposed() ? state.player.audioVjs : null;
+      const audio = !vjs ? _getAudioEl() : null;
+      if (vjs) {
+        const cur = Number(vjs.currentTime() || 0);
+        if (Math.abs(cur - targetPosSecs) > 1.8) vjs.currentTime(targetPosSecs);
+        if (targetPlaying && vjs.paused()) vjs.play().catch(() => {});
+        else if (!targetPlaying && !vjs.paused()) vjs.pause();
+      } else if (audio) {
+        const cur = Number(audio.currentTime || 0);
+        if (Math.abs(cur - targetPosSecs) > 1.8) audio.currentTime = targetPosSecs;
+        if (targetPlaying && audio.paused) audio.play().catch(() => {});
+        else if (!targetPlaying && !audio.paused) audio.pause();
+      }
+    } else if (state.player.vjs && !state.player.vjs.isDisposed()) {
+      const vjs = state.player.vjs;
+      const cur = Number(vjs.currentTime() || 0);
+      if (Math.abs(cur - targetPosSecs) > 1.8) vjs.currentTime(targetPosSecs);
+      if (targetRate && Math.abs((vjs.playbackRate() || 1) - targetRate) > 0.05) {
+        vjs.playbackRate(targetRate);
+      }
+      if (targetPlaying && vjs.paused()) vjs.play().catch(() => {});
+      else if (!targetPlaying && !vjs.paused()) vjs.pause();
+    }
+  } catch (_) {}
+  setTimeout(() => { _applyingPartySync = false; }, 250);
+}
+
+function _onLocalMediaEvent() {
+  if (_applyingPartySync) return;
+  if (!state.party?.active || state.party.role !== "host") return;
+  clearTimeout(_partySyncDebounce);
+  _partySyncDebounce = setTimeout(() => {
+    _pushHostPlaybackSync();
+  }, 150);
+}
+
+async function _pushHostPlaybackSync(override = {}) {
+  if (!state.party?.active || state.party.role !== "host") return;
+  const media = _getCurrentMediaState();
+  try {
+    await api.post("/api/party/playback", {
+      currentIndex: override.currentIndex !== undefined ? override.currentIndex : state.player.index,
+      isPlaying: override.isPlaying !== undefined ? override.isPlaying : media.isPlaying,
+      positionSecs: override.positionSecs !== undefined ? override.positionSecs : media.positionSecs,
+      playbackRate: override.playbackRate !== undefined ? override.playbackRate : media.playbackRate,
+      repeat: state.player.repeat || "none",
+      shuffle: Boolean(state.player.shuffle),
+    });
+  } catch (_) {}
+}
+
+function _ensurePartyHeartbeat() {
+  if (state.party?.active && state.party.role === "host") {
+    if (!_partyHeartbeatTimer) {
+      _partyHeartbeatTimer = setInterval(() => {
+        if (!state.party?.active || state.party.role !== "host") {
+          clearInterval(_partyHeartbeatTimer);
+          _partyHeartbeatTimer = null;
+          return;
+        }
+        const media = _getCurrentMediaState();
+        if (media.isPlaying && state.player.current) {
+          _pushHostPlaybackSync();
+        }
+      }, 4000);
+    }
+  } else if (_partyHeartbeatTimer) {
+    clearInterval(_partyHeartbeatTimer);
+    _partyHeartbeatTimer = null;
+  }
+}
+
+function _onPartyStateUpdate(snapshot, opts = {}) {
+  if (!snapshot) return;
+  const wasActive = Boolean(state.party?.active);
+  state.party = snapshot;
+  _updatePartyBadge();
+  _ensurePartyHeartbeat();
+  _updateWatchPartyBar();
+  if (state.view === "party") renderParty();
+
+  if (!snapshot.active) {
+    _partyLastSyncedUrl = "";
+    return;
+  }
+
+  // Sync shared queue into player state
+  const mappedQueue = (snapshot.queue || []).map((q) => ({
+    id: q.id,
+    url: q.url,
+    title: q.title,
+    thumbnail: q.thumbnail || "",
+    channel: q.channel || "",
+    durationText: q.durationText || "",
+    sourceContext: q.sourceContext || "search",
+    addedBy: q.addedBy || null,
+  }));
+  state.player.queue = mappedQueue;
+  _updateWatchQueue();
+
+  if (opts.skipAutoLoad) return;
+
+  const pb = snapshot.playback || {};
+  const expectedIdx = pb.currentIndex;
+  if (expectedIdx === null || expectedIdx === undefined || !mappedQueue[expectedIdx]) return;
+  const targetItem = mappedQueue[expectedIdx];
+  const elapsedSecs = pb.isPlaying && pb.updatedAtMs
+    ? Math.max(0, (Date.now() - Number(pb.updatedAtMs)) / 1000) * Number(pb.playbackRate || 1)
+    : 0;
+  const targetPos = Math.max(0, Number(pb.positionSecs || 0) + elapsedSecs);
+
+  const isGuest = snapshot.role === "guest";
+  const hostNeedsFirstLoad = snapshot.role === "host" && !state.player.current;
+
+  if (isGuest || hostNeedsFirstLoad) {
+    const currentUrl = state.player.current?.url || "";
+    if (currentUrl !== targetItem.url || state.player.index !== expectedIdx || _partyLastSyncedUrl !== targetItem.url) {
+      _partyLastSyncedUrl = targetItem.url;
+      state.player.sourceContext = targetItem.sourceContext || "search";
+      if (isGuest && !wasActive) setView("watch");
+      loadWebPlayerItem(expectedIdx, {
+        fromPartySync: true,
+        targetPos,
+        targetPlaying: Boolean(pb.isPlaying),
+        targetRate: Number(pb.playbackRate || 1),
+      });
+    } else if (isGuest) {
+      _applyMediaSync(Boolean(pb.isPlaying), targetPos, Number(pb.playbackRate || 1));
+    }
+  }
+}
+
+async function _refreshPartyStatus() {
+  if (!IS_TAURI) return;
+  try {
+    const snap = await api.get("/api/party/status");
+    _onPartyStateUpdate(snap, { skipAutoLoad: true });
+  } catch (_) {}
+}
+
+function renderParty() {
+  const root = $("#view-party");
+  if (!root) return;
+  const prof = state.userProfile || {};
+  const friends = state.friends || [];
+  const p = state.party || {};
+  const isHost = p.active && p.role === "host";
+  const isGuest = p.active && p.role === "guest";
+  const friendIds = new Set(friends.map((f) => String(f.userId || "").toUpperCase()));
+  const allowedSet = new Set(p.allowedQueueUserIds || []);
+
+  const policyLabels = {
+    host_only: "Solo el host",
+    all: "Todos",
+    selected: "Solo seleccionados",
+  };
+
+  let sessionCardHtml = "";
+  if (!p.active) {
+    sessionCardHtml = `
+      <div class="party-grid">
+        <div class="party-card">
+          <div class="party-card-hdr">
+            <div class="party-card-title">Hostear una sesión</div>
+            <span class="party-pill">Local + Internet</span>
+          </div>
+          <p class="muted" style="font-size:.84rem">Abre una sala sincronizada desde tu PC. Tus amigos se conectan desde su Playzi por LAN, IP pública/Tailscale o túnel de internet.</p>
+          <div class="party-form-grid">
+            <label class="party-field">Puerto local
+              <input class="form-input" id="partyHostPort" type="number" min="1024" max="65535" value="8766">
+            </label>
+            <label class="party-field">Permisos de cola
+              <select class="form-input" id="partyHostPolicy">
+                <option value="all" selected>Todos pueden agregar</option>
+                <option value="host_only">Solo el host</option>
+                <option value="selected">Solo usuarios seleccionados</option>
+              </select>
+            </label>
+          </div>
+          <label class="party-field">Dirección pública opcional (IP pública, dominio o Tailscale)
+            <input class="form-input" id="partyPublicHost" placeholder="ej. mi-casa.duckdns.org:8766 o 100.x.x.x:8766">
+          </label>
+          <label class="party-check">
+            <input type="checkbox" id="partyStartTunnel">
+            Exponer automáticamente a internet con Cloudflare Tunnel (requiere cloudflared)
+          </label>
+          <div class="party-row">
+            <button class="btn btn-primary" type="button" data-party-action="start-host">Iniciar sesión (Host)</button>
+          </div>
+        </div>
+
+        <div class="party-card">
+          <div class="party-card-hdr">
+            <div class="party-card-title">Unirse a una sesión</div>
+            <span class="party-pill">Invitado</span>
+          </div>
+          <p class="muted" style="font-size:.84rem">Pega el enlace de invitación que te compartió el host (ws://, wss:// o IP:puerto).</p>
+          <label class="party-field">Enlace de invitación o IP:puerto
+            <input class="form-input" id="partyJoinInvite" placeholder="ws://... o wss://...trycloudflare.com/ws?room=ABC123">
+          </label>
+          <label class="party-field">Código de sala (opcional si ya viene en el enlace)
+            <input class="form-input" id="partyJoinRoom" placeholder="ABC123" style="text-transform:uppercase">
+          </label>
+          <div class="party-row">
+            <button class="btn btn-primary" type="button" data-party-action="join-session">Unirse a la sesión</button>
+          </div>
+        </div>
+      </div>
+    `;
+  } else if (isHost) {
+    // Combine connected guests and saved friends for the "selected" permission picker
+    const selectableMap = new Map();
+    for (const part of (p.participants || [])) {
+      if (!part.isHost) {
+        selectableMap.set(part.userId, {
+          userId: part.userId,
+          displayName: part.displayName,
+          googleAccountName: part.googleAccountName,
+          online: true,
+        });
+      }
+    }
+    for (const f of friends) {
+      if (!selectableMap.has(f.userId)) {
+        selectableMap.set(f.userId, {
+          userId: f.userId,
+          displayName: f.displayName,
+          googleAccountName: f.googleAccountName,
+          online: false,
+        });
+      }
+    }
+    const selectableUsers = Array.from(selectableMap.values());
+
+    sessionCardHtml = `
+      <div class="party-card party-card--wide">
+        <div class="party-card-hdr">
+          <div class="party-row">
+            <div class="party-card-title">Sesión activa (Host)</div>
+            <span class="party-pill party-pill--live">Sala ${escapeHtml(p.roomCode)}</span>
+            <span class="party-pill party-pill--ok">${p.participants?.length || 1} conectados</span>
+          </div>
+          <div class="party-row">
+            <button class="btn btn-ghost" type="button" data-party-action="go-watch">Ir al reproductor</button>
+            <button class="btn btn-danger" type="button" data-party-action="leave">Cerrar sesión</button>
+          </div>
+        </div>
+
+        <div class="party-field">Invitación lista para compartir con tus amigos
+          <div class="party-code-box">
+            <code id="partyInviteText">${escapeHtml(p.inviteUrl || p.localWsUrl)}</code>
+            <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.inviteUrl || p.localWsUrl)}">Copiar</button>
+          </div>
+        </div>
+
+        ${p.publicWsUrl && p.localWsUrl && p.publicWsUrl !== p.localWsUrl ? `
+          <div class="party-field">Enlace LAN local
+            <div class="party-code-box">
+              <code>${escapeHtml(p.localWsUrl)}</code>
+              <button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(p.localWsUrl)}">Copiar</button>
+            </div>
+          </div>
+        ` : ""}
+
+        <div class="party-row">
+          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública (IP/dominio/Tailscale) para internet" value="${escapeHtml(p.publicWsUrl || "")}">
+          <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
+          <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Abrir túnel internet (Cloudflare)"}</button>
+        </div>
+        ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
+
+        <div style="border-top:1px solid var(--br);padding-top:12px">
+          <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede agregar videos/canciones a la cola?</div>
+          <div class="party-policy-tabs">
+            <button type="button" class="party-policy-btn ${p.queuePolicy === "host_only" ? "active" : ""}" data-party-policy="host_only">Solo el host</button>
+            <button type="button" class="party-policy-btn ${p.queuePolicy === "all" ? "active" : ""}" data-party-policy="all">Todos en la sala</button>
+            <button type="button" class="party-policy-btn ${p.queuePolicy === "selected" ? "active" : ""}" data-party-policy="selected">Solo usuarios seleccionados</button>
+          </div>
+          ${p.queuePolicy === "selected" ? `
+            <div class="party-list" style="margin-top:10px">
+              ${selectableUsers.length ? selectableUsers.map((u) => `
+                <label class="party-person" style="cursor:pointer">
+                  <div class="party-person-info">
+                    <div class="party-person-name">
+                      <input type="checkbox" data-party-allow-uid="${escapeHtml(u.userId)}" ${allowedSet.has(u.userId) ? "checked" : ""}>
+                      <span>${escapeHtml(u.displayName)}</span>
+                      ${u.online ? `<span class="party-pill party-pill--ok">En sala</span>` : `<span class="party-pill">Amigo</span>`}
+                      ${u.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(u.googleAccountName)}</span>` : ""}
+                    </div>
+                    <div class="party-person-meta">${escapeHtml(u.userId)}</div>
+                  </div>
+                </label>
+              `).join("") : `<div class="muted" style="font-size:.83rem">Aún no hay invitados conectados ni amigos guardados para seleccionar.</div>`}
+            </div>
+          ` : ""}
+        </div>
+      </div>
+    `;
+  } else if (isGuest) {
+    sessionCardHtml = `
+      <div class="party-card party-card--wide">
+        <div class="party-card-hdr">
+          <div class="party-row">
+            <div class="party-card-title">Conectado a la sesión de ${escapeHtml(p.hostName || "Host")}</div>
+            <span class="party-pill party-pill--live">Sala ${escapeHtml(p.roomCode)}</span>
+            <span class="party-pill ${p.connected ? "party-pill--ok" : "party-pill--warn"}">${p.connected ? "Sincronizado" : "Desconectado"}</span>
+            <span class="party-pill ${p.canSelfQueue ? "party-pill--ok" : ""}">${p.canSelfQueue ? "Puedes agregar a la cola" : "Cola restringida por el host"}</span>
+          </div>
+          <div class="party-row">
+            <button class="btn btn-ghost" type="button" data-party-action="go-watch">Ir al reproductor</button>
+            <button class="btn btn-danger" type="button" data-party-action="leave">Salir de la sesión</button>
+          </div>
+        </div>
+        <div class="muted" style="font-size:.84rem">Política de cola actual: <strong>${escapeHtml(policyLabels[p.queuePolicy] || p.queuePolicy)}</strong> · En la cola: <strong>${p.queue?.length || 0}</strong> elementos.</div>
+        ${p.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.lastError)}</div>` : ""}
+      </div>
+    `;
+  }
+
+  const participantsHtml = p.active ? `
+    <div class="party-card">
+      <div class="party-card-hdr">
+        <div class="party-card-title">Participantes (${p.participants?.length || 0})</div>
+      </div>
+      <div class="party-list">
+        ${(p.participants || []).map((part) => {
+          const isSelf = part.userId === prof.userId || part.userId === p.selfUserId;
+          const isFriend = friendIds.has(String(part.userId || "").toUpperCase());
+          return `
+            <div class="party-person">
+              <div class="party-person-info">
+                <div class="party-person-name">
+                  <span>${escapeHtml(part.displayName)}</span>
+                  ${part.isHost ? `<span class="party-pill party-pill--live">Host</span>` : ""}
+                  ${isSelf ? `<span class="party-pill">Tú</span>` : ""}
+                  ${part.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(part.googleAccountName)}</span>` : ""}
+                  <span class="party-pill ${part.canQueue ? "party-pill--ok" : ""}">${part.canQueue ? "Cola OK" : "Solo ver"}</span>
+                </div>
+                <div class="party-person-meta">${escapeHtml(part.userId)}</div>
+              </div>
+              <div class="party-row">
+                ${!isSelf && !isFriend ? `<button class="btn btn-ghost" type="button" data-party-save-friend="${escapeHtml(part.userId)}" data-party-save-name="${escapeHtml(part.displayName)}" data-party-save-google="${escapeHtml(part.googleAccountName || "")}">+ Amigo</button>` : ""}
+                ${isHost && !part.isHost ? `<button class="btn btn-ghost" type="button" data-party-kick="${escapeHtml(part.userId)}">Expulsar</button>` : ""}
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </div>
+  ` : "";
+
+  root.innerHTML = `
+    <div class="section-head">
+      <div>
+        <h2>Sesión compartida (Watch Party)</h2>
+        <p class="muted">Reproduce videos y canciones sincronizados con amigos y controla quién puede agregar a la cola.</p>
+      </div>
+    </div>
+
+    <div class="party-card party-card--wide" style="margin-bottom:16px">
+      <div class="party-card-hdr">
+        <div class="party-card-title">Tu identidad en Playzi</div>
+        ${prof.googleAccountName ? `<span class="party-pill party-pill--ok">Google: ${escapeHtml(prof.googleAccountName)}</span>` : `<span class="party-pill">Sin cuenta Google vinculada</span>`}
+      </div>
+      <div class="party-form-grid">
+        <div class="party-field">Tu ID único de Playzi
+          <div class="party-code-box">
+            <code>${escapeHtml(prof.userId || "Generando...")}</code>
+            <button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(prof.userId || "")}">Copiar ID</button>
+          </div>
+        </div>
+        <div class="party-field">Nombre visible en sesiones
+          <div class="party-row">
+            <input class="form-input" id="partyDisplayName" style="flex:1" value="${escapeHtml(prof.displayName || "")}" placeholder="Tu nombre">
+            <button class="btn btn-primary" type="button" data-party-action="save-profile">Guardar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    ${sessionCardHtml}
+
+    <div class="party-grid">
+      ${participantsHtml}
+      <div class="party-card">
+        <div class="party-card-hdr">
+          <div class="party-card-title">Amigos guardados (${friends.length})</div>
+        </div>
+        <div class="party-form-grid">
+          <input class="form-input" id="friendIdInput" placeholder="ID de Playzi (ej. PZ-AB12-CD34)">
+          <input class="form-input" id="friendNameInput" placeholder="Nombre del amigo">
+        </div>
+        <div class="party-row" style="justify-content:space-between">
+          <label class="party-check">
+            <input type="checkbox" id="friendDefaultQueue" checked>
+            Permitir cola por defecto
+          </label>
+          <button class="btn btn-primary" type="button" data-party-action="add-friend">Agregar amigo</button>
+        </div>
+        <div class="party-list">
+          ${friends.length ? friends.map((f) => `
+            <div class="party-person">
+              <div class="party-person-info">
+                <div class="party-person-name">
+                  <span>${escapeHtml(f.displayName)}</span>
+                  ${f.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(f.googleAccountName)}</span>` : ""}
+                  <span class="party-pill ${f.defaultAllowQueue ? "party-pill--ok" : ""}">${f.defaultAllowQueue ? "Cola por defecto" : "Sin cola por defecto"}</span>
+                </div>
+                <div class="party-person-meta">${escapeHtml(f.userId)}</div>
+              </div>
+              <div class="party-row">
+                <button class="btn btn-ghost" type="button" data-friend-toggle="${escapeHtml(f.userId)}">${f.defaultAllowQueue ? "Quitar permiso" : "Permitir cola"}</button>
+                <button class="btn btn-ghost" type="button" data-friend-remove="${escapeHtml(f.userId)}">Eliminar</button>
+              </div>
+            </div>
+          `).join("") : `<div class="muted" style="font-size:.84rem">Aún no tienes amigos guardados. Puedes agregarlos por su ID o desde una sesión activa.</div>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+document.addEventListener("click", async (ev) => {
+  const copyBtn = ev.target.closest("[data-party-copy]");
+  if (copyBtn) {
+    const text = copyBtn.dataset.partyCopy || "";
+    if (text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("Copiado al portapapeles");
+      } catch (_) {
+        toast("No se pudo copiar automáticamente");
+      }
+    }
+    return;
+  }
+
+  const policyBtn = ev.target.closest("[data-party-policy]");
+  if (policyBtn) {
+    const policy = policyBtn.dataset.partyPolicy;
+    try {
+      const snap = await api.post("/api/party/policy", {
+        queuePolicy: policy,
+        allowedQueueUserIds: state.party.allowedQueueUserIds || [],
+      });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast("Permisos de cola actualizados");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const saveFriendBtn = ev.target.closest("[data-party-save-friend]");
+  if (saveFriendBtn) {
+    try {
+      const resp = await api.post("/api/friends", {
+        userId: saveFriendBtn.dataset.partySaveFriend,
+        displayName: saveFriendBtn.dataset.partySaveName || "",
+        googleAccountName: saveFriendBtn.dataset.partySaveGoogle || "",
+        defaultAllowQueue: true,
+      });
+      state.friends = resp.items || [];
+      renderParty();
+      toast("Amigo guardado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const kickBtn = ev.target.closest("[data-party-kick]");
+  if (kickBtn) {
+    try {
+      const snap = await api.post("/api/party/kick", { userId: kickBtn.dataset.partyKick });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast("Participante removido");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const friendToggle = ev.target.closest("[data-friend-toggle]");
+  if (friendToggle) {
+    const uid = friendToggle.dataset.friendToggle;
+    const f = (state.friends || []).find((x) => x.userId === uid);
+    if (!f) return;
+    try {
+      const resp = await api.post("/api/friends", {
+        userId: f.userId,
+        displayName: f.displayName,
+        googleAccountName: f.googleAccountName || "",
+        defaultAllowQueue: !f.defaultAllowQueue,
+      });
+      state.friends = resp.items || [];
+      renderParty();
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const friendRemove = ev.target.closest("[data-friend-remove]");
+  if (friendRemove) {
+    try {
+      const resp = await api.del(`/api/friends/${encodeURIComponent(friendRemove.dataset.friendRemove)}`);
+      state.friends = resp.items || [];
+      renderParty();
+      toast("Amigo eliminado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const actionBtn = ev.target.closest("[data-party-action]");
+  if (!actionBtn) return;
+  const action = actionBtn.dataset.partyAction;
+
+  if (action === "open-view") { setView("party"); return; }
+  if (action === "go-watch") { setView("watch"); return; }
+  if (action === "resync") {
+    _partyLastSyncedUrl = "";
+    _onPartyStateUpdate(state.party);
+    toast("Sincronizando con el host...");
+    return;
+  }
+  if (action === "save-profile") {
+    const name = ($("#partyDisplayName")?.value || "").trim();
+    try {
+      state.userProfile = await api.post("/api/profile", { displayName: name });
+      renderParty();
+      toast("Perfil actualizado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "add-friend") {
+    const userId = ($("#friendIdInput")?.value || "").trim();
+    const displayName = ($("#friendNameInput")?.value || "").trim();
+    const defaultAllowQueue = Boolean($("#friendDefaultQueue")?.checked);
+    try {
+      const resp = await api.post("/api/friends", { userId, displayName, defaultAllowQueue });
+      state.friends = resp.items || [];
+      renderParty();
+      toast("Amigo agregado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "start-host") {
+    const port = Number($("#partyHostPort")?.value || 8766);
+    const queuePolicy = $("#partyHostPolicy")?.value || "all";
+    const publicHost = ($("#partyPublicHost")?.value || "").trim();
+    const startTunnel = Boolean($("#partyStartTunnel")?.checked);
+    const media = _getCurrentMediaState();
+    const initialQueue = (state.player.queue || []).map((q) => ({
+      url: q.url,
+      title: q.title || q.url,
+      thumbnail: q.thumbnail || "",
+      channel: q.channel || "",
+      durationText: q.durationText || "",
+      sourceContext: state.player.sourceContext || "search",
+    }));
+    try {
+      const snap = await api.post("/api/party/host", {
+        port,
+        queuePolicy,
+        publicHost: publicHost || null,
+        startTunnel,
+        initialQueue,
+        initialIndex: state.player.index || 0,
+        initialPositionSecs: media.positionSecs || 0,
+        initialIsPlaying: media.isPlaying || false,
+      });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast(`Sesión iniciada · Sala ${snap.roomCode}`);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "set-public-host") {
+    const publicHost = ($("#partyUpdatePublicHost")?.value || "").trim();
+    try {
+      const snap = await api.post("/api/party/public-host", { publicHost });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast("Dirección pública actualizada");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "start-tunnel") {
+    try {
+      toast("Iniciando túnel de internet...");
+      const snap = await api.post("/api/party/tunnel", {});
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "join-session") {
+    const invite = ($("#partyJoinInvite")?.value || "").trim();
+    const roomCode = ($("#partyJoinRoom")?.value || "").trim();
+    try {
+      toast("Conectando a la sesión...");
+      const snap = await api.post("/api/party/join", { invite, roomCode: roomCode || null });
+      _onPartyStateUpdate(snap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "leave") {
+    try {
+      const snap = await api.post("/api/party/leave", {});
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast("Sesión finalizada");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+});
+
+document.addEventListener("change", async (ev) => {
+  const allowChk = ev.target.closest("[data-party-allow-uid]");
+  if (!allowChk || !state.party?.active || state.party.role !== "host") return;
+  const uid = allowChk.dataset.partyAllowUid;
+  const set = new Set(state.party.allowedQueueUserIds || []);
+  if (allowChk.checked) set.add(uid);
+  else set.delete(uid);
+  try {
+    const snap = await api.post("/api/party/policy", {
+      queuePolicy: "selected",
+      allowedQueueUserIds: Array.from(set),
+    });
+    _onPartyStateUpdate(snap, { skipAutoLoad: true });
+  } catch (err) { toast(err.message); }
+});
+
 async function main() {
   applySidebarState();
   bindEvents();
+  await bindTauriEvents();
+  if (IS_TAURI) {
+    refreshNativePlayerStatus().catch(() => {});
+    _refreshPartyStatus().catch(() => {});
+  }
   await loadAll();
   scheduleNextPoll();
 }

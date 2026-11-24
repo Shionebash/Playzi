@@ -6,7 +6,7 @@ from typing import Any
 
 import yt_dlp
 
-from .config import YTDLP_SEARCH_LIMIT
+from . import config
 from .ytdlp_opts import javascript_runtime_opts
 
 
@@ -118,7 +118,7 @@ def search(query: str, limit: int | None = None) -> list[dict[str, Any]]:
     query = query.strip()
     if not query:
         return []
-    effective_limit = limit or YTDLP_SEARCH_LIMIT
+    effective_limit = limit or config.YTDLP_SEARCH_LIMIT
     cache_key = f"{query}|{effective_limit}"
     cached = _cache_get(_SEARCH_CACHE, cache_key)
     if cached is not None:

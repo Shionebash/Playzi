@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from starlette.background import BackgroundTask
 
 from . import config
 from .autosync import get_sync_status, refresh_all, refresh_section, start_autosync
+from .channel_browse import browse_channel
 from .channels import add_channel, delete_channel, list_channels, list_feed, preview_channel, refresh_all_channels, refresh_channel
 from .collections import create_collection, delete_collection, list_collections
 from .history import delete_history_event
@@ -31,12 +33,12 @@ from .state import read_state_key
 from .player import _resolve_vlc_stream, playlist_entries, play, resolve_stream_info
 from .recommendations import list_recommendations
 from .tasks import get_task, list_tasks, start_task
-from .web_player import audio_info
+from .web_player import audio_info, audio_tracks
 from .web_player import manifest as player_manifest
 from .web_player import player_info, resolve_playlist
 from .ytmusic import (
-    fetch_playlist_songs, list_music_library, list_music_playlists, list_music_recommendations,
-    refresh_music_library, search_music,
+    fetch_playlist_songs, get_artist_info, list_music_library, list_music_playlists,
+    list_music_recommendations, refresh_music_library, search_music,
 )
 from .youtube import fetch_radio_items, search
 
@@ -66,11 +68,13 @@ _THUMBNAIL_HEADERS = {
     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 }
 _THUMB_CACHE: dict[str, tuple[float, bytes, str]] = {}
+_THUMB_CACHE_LOCK = threading.Lock()
 _THUMB_CACHE_TTL = 24 * 60 * 60
 _THUMB_CACHE_MAX = 250
 
 _HTTP_CLIENT = httpx.Client(
-    timeout=None,
+    # read=30 aplica por chunk en streaming, no al total: no corta videos largos
+    timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
     follow_redirects=True,
     limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
 )
@@ -88,6 +92,8 @@ config.ensure_dirs()
 async def _lifespan(app):
     start_autosync()
     yield
+    _SEARCH_POOL.shutdown(wait=False, cancel_futures=True)
+    _HTTP_CLIENT.close()
 
 
 app = FastAPI(title="Playzi", version="0.1.0", lifespan=_lifespan)
@@ -298,6 +304,7 @@ def api_search(q: str, scope: str | None = None, search_filter: str | None = Non
         try:
             music_items = mus_fut.result(timeout=60)
         except Exception:
+            logger.warning("Busqueda de YT Music fallo para %r, devolviendo solo YouTube", q, exc_info=True)
             music_items = []
         return {"items": [*yt_items, *music_items]}
     except Exception as exc:
@@ -351,6 +358,17 @@ def api_history_delete(event_id: str):
 @app.get("/api/channels")
 def api_channels():
     return {"items": list_channels()}
+
+
+@app.get("/api/channel")
+def api_channel_browse(url: str, tab: str = "videos", page: int = 1, page_size: int = 30):
+    try:
+        return browse_channel(url, tab, page, page_size)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Error al explorar canal: %s", url)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/channels/preview")
@@ -502,7 +520,8 @@ def api_thumbnail(url: str):
         raise HTTPException(status_code=400, detail="URL de thumbnail invalida")
     if not _thumbnail_host_allowed(parsed.hostname):
         raise HTTPException(status_code=400, detail="Dominio de thumbnail no permitido")
-    cached = _THUMB_CACHE.get(url)
+    with _THUMB_CACHE_LOCK:
+        cached = _THUMB_CACHE.get(url)
     if cached and time.monotonic() - cached[0] < _THUMB_CACHE_TTL:
         return Response(
             content=cached[1],
@@ -510,16 +529,17 @@ def api_thumbnail(url: str):
             headers={"Cache-Control": "public, max-age=86400"},
         )
     try:
-        response = httpx.get(url, headers=_THUMBNAIL_HEADERS, timeout=12, follow_redirects=True)
+        response = _HTTP_CLIENT.get(url, headers=_THUMBNAIL_HEADERS, timeout=12)
         response.raise_for_status()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"No se pudo cargar thumbnail: {exc}") from exc
     content_type = response.headers.get("content-type", "image/jpeg")
     if not content_type.startswith("image/"):
         content_type = "image/jpeg"
-    if len(_THUMB_CACHE) >= _THUMB_CACHE_MAX:
-        _THUMB_CACHE.pop(next(iter(_THUMB_CACHE)))
-    _THUMB_CACHE[url] = (time.monotonic(), response.content, content_type)
+    with _THUMB_CACHE_LOCK:
+        if len(_THUMB_CACHE) >= _THUMB_CACHE_MAX:
+            _THUMB_CACHE.pop(next(iter(_THUMB_CACHE)))
+        _THUMB_CACHE[url] = (time.monotonic(), response.content, content_type)
     return Response(
         content=response.content,
         media_type=content_type,
@@ -592,7 +612,11 @@ def _ffmpeg_stream(url: str, quality: str | None = None):
     video_headers = video.get("http_headers") or {}
     audio_headers = audio.get("http_headers") or {}
     common_headers = {**audio_headers, **video_headers}
-    header_text = "".join(f"{key}: {value}\r\n" for key, value in common_headers.items())
+    header_text = "".join(
+        f"{str(key).replace(chr(13), '').replace(chr(10), '')}: "
+        f"{str(value).replace(chr(13), '').replace(chr(10), '')}\r\n"
+        for key, value in common_headers.items()
+    )
     ffmpeg = config.FFMPEG_PATH or "ffmpeg"
     args = [
         ffmpeg,
@@ -617,14 +641,49 @@ def _ffmpeg_stream(url: str, quality: str | None = None):
         "matroska",
         "pipe:1",
     ]
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    stderr_tail: list[bytes] = []
+
+    def _drain_stderr() -> None:
+        try:
+            for line in proc.stderr:
+                stderr_tail.append(line)
+                if len(stderr_tail) > 20:
+                    stderr_tail.pop(0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    def _iter_output():
+        try:
+            while True:
+                chunk = proc.stdout.read(1024 * 256)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            code = proc.wait()
+            if code not in (0, None) and stderr_tail:
+                logger.warning(
+                    "ffmpeg salio con codigo %s: %s",
+                    code,
+                    b"".join(stderr_tail).decode("utf-8", "replace").strip(),
+                )
 
     def close_proc() -> None:
         if proc.poll() is None:
-            proc.terminate()
+            proc.kill()
 
     return StreamingResponse(
-        proc.stdout,
+        _iter_output(),
         media_type="video/x-matroska",
         headers={"Cache-Control": "no-store"},
         background=BackgroundTask(close_proc),
@@ -767,11 +826,20 @@ def api_player_info(url: str, quality: str | None = None):
 
 
 @app.get("/api/player/manifest.mpd")
-def api_player_manifest(url: str, quality: str | None = None):
+def api_player_manifest(url: str, quality: str | None = None, audio_lang: str | None = None):
     try:
-        return Response(player_manifest(url, quality), media_type="application/dash+xml")
+        return Response(player_manifest(url, quality, audio_lang), media_type="application/dash+xml")
     except Exception as exc:
         logger.exception("Error al generar manifest: %s", url)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/player/audio-tracks")
+def api_player_audio_tracks(url: str):
+    try:
+        return audio_tracks(url)
+    except Exception as exc:
+        logger.exception("Error al obtener pistas de audio: %s", url)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -780,7 +848,8 @@ def api_player_proxy(src: str, request: Request):
     parsed = urlparse(src)
     if parsed.scheme not in {"http", "https"}:
         raise HTTPException(status_code=400, detail="URL invalida")
-    if not parsed.hostname or not parsed.hostname.endswith("googlevideo.com"):
+    host = (parsed.hostname or "").lower()
+    if not host or (host != "googlevideo.com" and not host.endswith(".googlevideo.com")):
         raise HTTPException(status_code=400, detail="Host de media no permitido")
 
     headers = {
@@ -827,6 +896,15 @@ def api_player_playlist(payload: PlayerPlaylistRequest):
         return resolve_playlist(payload.url, payload.quality)
     except Exception as exc:
         logger.exception("Error al resolver cola: %s", payload.url)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/music/artist")
+def api_music_artist(channel_id: str):
+    try:
+        return get_artist_info(channel_id)
+    except Exception as exc:
+        logger.exception("Error al obtener artista: %s", channel_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 

@@ -26,6 +26,7 @@ QUALITY_HEIGHT = {
 }
 
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
+_DOWNLOAD_SEMAPHORE = threading.Semaphore(3)
 
 
 class _DownloadCancelled(Exception):
@@ -159,17 +160,21 @@ def _run_download(job_id: str, cancel_event: threading.Event) -> None:
     if not job:
         _CANCEL_EVENTS.pop(job_id, None)
         return
-    _set_job(job_id, {"status": "starting"})
+    _set_job(job_id, {"status": "queued"})
     try:
-        meta = metadata_for_url(job["url"])
-        title = meta.get("title") or job["title"]
-        channel = meta.get("channel") or job["channel"]
-        out_dir = _safe_dir(config.MEDIA_ROOT / _safe_name(job.get("collection") or channel))
-        out_tmpl = str(out_dir / "%(title).180B [%(id)s].%(ext)s")
-        opts = _ydl_options(job, out_tmpl, cancel_event)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(job["url"], download=True)
-            final_path = Path(ydl.prepare_filename(info))
+        with _DOWNLOAD_SEMAPHORE:
+            if cancel_event.is_set():
+                raise _DownloadCancelled()
+            _set_job(job_id, {"status": "starting"})
+            meta = metadata_for_url(job["url"])
+            title = meta.get("title") or job["title"]
+            channel = meta.get("channel") or job["channel"]
+            out_dir = _safe_dir(config.MEDIA_ROOT / _safe_name(job.get("collection") or channel))
+            out_tmpl = str(out_dir / "%(title).180B [%(id)s].%(ext)s")
+            opts = _ydl_options(job, out_tmpl, cancel_event)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(job["url"], download=True)
+                final_path = Path(ydl.prepare_filename(info))
         final_path = _normalize_final_path(final_path, job)
         library_item = {
             "id": job_id,

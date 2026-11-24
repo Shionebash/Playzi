@@ -681,6 +681,71 @@ def search_music(query: str, limit: int = 20, search_filter: str | None = None) 
     return items
 
 
+_ARTIST_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ARTIST_CACHE_TTL = 1800
+_ARTIST_CACHE_MAX = 30
+
+
+def get_artist_info(channel_id: str) -> dict[str, Any]:
+    """Artist page via ytmusicapi: top songs, albums, singles, related."""
+    cached = _ARTIST_CACHE.get(channel_id)
+    if cached and time.monotonic() - cached[0] < _ARTIST_CACHE_TTL:
+        return cached[1]
+    client = _ytmusic_client(prefer_auth=True)
+    data = client.get_artist(channel_id)
+    thumbs = data.get("thumbnails") or []
+    songs_raw = (data.get("songs") or {}).get("results") or []
+    result = {
+        "channelId": channel_id,
+        "name": data.get("name") or "Artista",
+        "description": data.get("description") or "",
+        "subscriberCount": data.get("subscribers") or "",
+        "thumbnail": thumbs[-1].get("url") if thumbs else "",
+        "songsPlaylistId": (data.get("songs") or {}).get("browseId") or "",
+        "songs": [
+            {**_track_to_queue_item(t), "source": "music", "resultType": "track"}
+            for t in songs_raw if t.get("videoId")
+        ],
+        "albums": _artist_releases((data.get("albums") or {}).get("results") or [], "Álbum"),
+        "singles": _artist_releases((data.get("singles") or {}).get("results") or [], "Single"),
+        "related": [
+            {
+                "id": r.get("browseId") or "",
+                "title": r.get("title") or "",
+                "channel": r.get("subscribers") or "Artista",
+                "thumbnail": (r.get("thumbnails") or [{}])[-1].get("url", ""),
+                "source": "music",
+                "resultType": "artist",
+            }
+            for r in ((data.get("related") or {}).get("results") or []) if r.get("browseId")
+        ],
+    }
+    if len(_ARTIST_CACHE) >= _ARTIST_CACHE_MAX:
+        _ARTIST_CACHE.pop(min(_ARTIST_CACHE.items(), key=lambda kv: kv[1][0])[0], None)
+    _ARTIST_CACHE[channel_id] = (time.monotonic(), result)
+    return result
+
+
+def _artist_releases(results: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    items = []
+    for rel in results:
+        browse_id = rel.get("browseId") or ""
+        if not browse_id:
+            continue
+        thumbs = rel.get("thumbnails") or []
+        items.append({
+            "id": browse_id,
+            "url": f"https://music.youtube.com/browse/{browse_id}",
+            "title": rel.get("title") or kind,
+            "channel": str(rel.get("year") or kind),
+            "durationText": kind,
+            "thumbnail": thumbs[-1].get("url") if thumbs else "",
+            "source": "music",
+            "resultType": "album",
+        })
+    return items
+
+
 def fetch_playlist_songs(playlist_url: str) -> list[dict[str, Any]]:
     try:
         with yt_dlp.YoutubeDL(_opts({"playlistend": 150})) as ydl:
