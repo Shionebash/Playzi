@@ -188,7 +188,7 @@ impl YouTubeClient {
                     req = req.header(k, v);
                 }
             } else {
-                let raw_cookie = jar.cookie_header_all();
+                let raw_cookie = jar.cookie_header_for_host("www.youtube.com");
                 if !raw_cookie.is_empty() {
                     req = req.header("Cookie", raw_cookie);
                 }

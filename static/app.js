@@ -1035,7 +1035,39 @@ async function _awaitLoginTask(taskId) {
   await _onAuthSettled();
 }
 
-function openAccountPickerModal(accounts, activeAuthUser = 0, browserName = "") {
+async function logoutMusicAccount() {
+  try {
+    await api.post("/api/music/logout");
+    state.musicAuthState = "expired";
+    state.musicAccountName = "";
+    _musicSyncTriggered = false;
+    renderAuthStatus();
+    await refreshLists();
+    render();
+    toast("Sesión cerrada.");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function openConnectedAccountModal() {
+  try {
+    const resp = await api.post("/api/music/auth/refresh");
+    const accounts = Array.isArray(resp?.accounts) && resp.accounts.length
+      ? resp.accounts
+      : [{ authUser: resp?.activeAuthUser || 0, name: state.musicAccountName || "Cuenta actual", handle: "", photo: "" }];
+    openAccountPickerModal(accounts, resp?.activeAuthUser || 0, resp?.browser || "", true);
+  } catch (err) {
+    openAccountPickerModal(
+      [{ authUser: 0, name: state.musicAccountName || "Cuenta actual", handle: "", photo: "" }],
+      0,
+      "",
+      true,
+    );
+  }
+}
+
+function openAccountPickerModal(accounts, activeAuthUser = 0, browserName = "", showLogout = false) {
   const root = $("#modalRoot");
   if (!root) return;
   const close = () => { root.innerHTML = ""; };
@@ -1059,20 +1091,24 @@ function openAccountPickerModal(accounts, activeAuthUser = 0, browserName = "") 
     `;
   }).join("");
 
+  const canLogout = showLogout || state.musicAuthState === "ok";
   root.innerHTML = `
     <div class="modal-backdrop" id="accountPickerBackdrop">
       <div class="modal" style="max-width:440px">
         <div class="modal-header">
-          <h3>Seleccionar cuenta de YouTube</h3>
+          <h3>Cuenta de YouTube</h3>
           <button class="icon-btn" id="accountPickerClose" type="button">×</button>
         </div>
         <div class="modal-body">
           <p class="meta" style="margin-bottom:12px">${subtitle}</p>
           <div>${rows}</div>
         </div>
-        <div class="modal-actions" style="justify-content:space-between;margin-top:12px">
+        <div class="modal-actions" style="justify-content:space-between;flex-wrap:wrap;gap:8px;margin-top:12px">
           <button class="btn btn-ghost" id="accountPickerOpenBrowser" type="button">Usar otra cuenta (navegador)</button>
-          <button class="btn btn-ghost" id="accountPickerCancel" type="button">Cerrar</button>
+          <div style="display:flex;gap:8px">
+            ${canLogout ? `<button class="btn btn-ghost" id="accountPickerLogout" type="button" style="color:var(--danger, #f87171)">Cerrar sesión</button>` : ""}
+            <button class="btn btn-ghost" id="accountPickerCancel" type="button">Cerrar</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1083,6 +1119,13 @@ function openAccountPickerModal(accounts, activeAuthUser = 0, browserName = "") 
   $("#accountPickerBackdrop").onclick = (ev) => {
     if (ev.target.id === "accountPickerBackdrop") close();
   };
+  const logoutBtn = $("#accountPickerLogout");
+  if (logoutBtn) {
+    logoutBtn.onclick = async () => {
+      close();
+      await logoutMusicAccount();
+    };
+  }
   $("#accountPickerOpenBrowser").onclick = async () => {
     close();
     try {
@@ -3365,7 +3408,15 @@ function bindEvents() {
       await doSearch();
       return;
     }
-    if (ev.target.closest("[data-music-login]") || ev.target.closest("#authStatus")) {
+    if (ev.target.closest("#authStatus")) {
+      if (state.musicAuthState === "ok") {
+        openConnectedAccountModal();
+        return;
+      }
+      startLoginFlow();
+      return;
+    }
+    if (ev.target.closest("[data-music-login]")) {
       if (state.musicAuthState === "ok") {
         setView("music");
         return;

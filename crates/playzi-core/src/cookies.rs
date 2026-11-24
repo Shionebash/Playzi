@@ -177,6 +177,15 @@ impl CookieJar {
             .map(|c| c.value.as_str())
     }
 
+    pub fn get_for_host(&self, host: &str, name: &str) -> Option<&str> {
+        let now = now_unix_secs();
+        self.cookies
+            .iter()
+            .rev()
+            .find(|c| c.name == name && !c.is_expired(now) && c.matches_host(host))
+            .map(|c| c.value.as_str())
+    }
+
     /// Builds a `Cookie` header filtered to `host` (excluding expired entries).
     pub fn cookie_header_for_host(&self, host: &str) -> String {
         let now = now_unix_secs();
@@ -201,16 +210,40 @@ impl CookieJar {
             .join("; ")
     }
 
+    /// Returns a new jar containing only YouTube and Google domains so unrelated browser cookies
+    /// are never persisted on disk or leaked in requests.
+    pub fn filter_youtube_and_google(&self) -> Self {
+        let filtered = self
+            .cookies
+            .iter()
+            .filter(|c| is_youtube_or_google_domain(&c.domain))
+            .cloned()
+            .collect();
+        Self { cookies: filtered }
+    }
+
+    /// Returns the SAPISID token for a specific host (e.g. `music.youtube.com`), preventing
+    /// `.google.com` cookies from shadowing `.youtube.com` session tokens.
+    pub fn sapisid_for_host(&self, host: &str) -> Option<&str> {
+        self.get_for_host(host, "SAPISID")
+            .or_else(|| self.get_for_host(host, "__Secure-3PAPISID"))
+            .or_else(|| self.get_for_host(host, "__Secure-1PAPISID"))
+    }
+
     /// Returns the SAPISID token used to sign YouTube/YouTube Music InnerTube requests.
     pub fn sapisid(&self) -> Option<&str> {
-        self.get("SAPISID")
+        self.sapisid_for_host("music.youtube.com")
+            .or_else(|| self.get("SAPISID"))
             .or_else(|| self.get("__Secure-3PAPISID"))
             .or_else(|| self.get("__Secure-1PAPISID"))
     }
 
     /// Computes `SAPISIDHASH {timestamp}_{sha1_hex}` for the given origin and UNIX timestamp.
     pub fn sapisidhash(&self, origin: &str, timestamp_secs: i64) -> Option<String> {
-        let sapisid = self.sapisid()?;
+        let sapisid = origin_host(origin)
+            .and_then(|host| self.sapisid_for_host(host))
+            .or_else(|| self.sapisid_for_host("music.youtube.com"))
+            .or_else(|| self.sapisid())?;
         Some(compute_sapisidhash(sapisid, origin, timestamp_secs))
     }
 
@@ -226,7 +259,12 @@ impl CookieJar {
         auth_user: u8,
     ) -> Option<BTreeMap<String, String>> {
         let auth = self.sapisidhash(origin, now_unix_secs())?;
-        let cookie_header = self.cookie_header_all();
+        let mut cookie_header = origin_host(origin)
+            .map(|host| self.cookie_header_for_host(host))
+            .unwrap_or_default();
+        if cookie_header.is_empty() {
+            cookie_header = self.cookie_header_for_host("music.youtube.com");
+        }
         if cookie_header.is_empty() {
             return None;
         }
@@ -237,6 +275,36 @@ impl CookieJar {
         headers.insert("X-Goog-AuthUser".into(), auth_user.to_string());
         Some(headers)
     }
+}
+
+fn origin_host(origin: &str) -> Option<&str> {
+    let stripped = origin
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| origin.trim().strip_prefix("http://"))
+        .unwrap_or_else(|| origin.trim());
+    let authority = stripped.split('/').next()?;
+    let host = authority.split(':').next()?.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn is_youtube_or_google_domain(domain: &str) -> bool {
+    let norm = domain
+        .trim()
+        .trim_start_matches("#HttpOnly_")
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "youtube.com" | "google.com" | "googleusercontent.com" | "ytimg.com"
+    ) || norm.ends_with(".youtube.com")
+        || norm.ends_with(".google.com")
+        || norm.ends_with(".googleusercontent.com")
+        || norm.ends_with(".ytimg.com")
 }
 
 pub fn compute_sapisidhash(sapisid: &str, origin: &str, timestamp_secs: i64) -> String {
@@ -898,10 +966,20 @@ pub async fn export_cookies_from_browser(
     ]);
     hide_window_tokio(&mut cmd);
 
-    let output = tokio::time::timeout(Duration::from_secs(25), cmd.output())
-        .await
-        .map_err(|_| CoreError::Auth(format!("Timeout exporting cookies from {spec}")))?
-        .map_err(|e| CoreError::Auth(format!("Failed to run {ytdlp_bin}: {e}")))?;
+    let output_res = tokio::time::timeout(Duration::from_secs(25), cmd.output()).await;
+    let output = match output_res {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(CoreError::Auth(format!("Failed to run {ytdlp_bin}: {e}")));
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(CoreError::Auth(format!(
+                "Timeout exporting cookies from {spec}"
+            )));
+        }
+    };
 
     let jar_result = if tmp_path.exists() && looks_like_netscape_cookie_file(&tmp_path) {
         CookieJar::from_file(&tmp_path)
@@ -914,8 +992,8 @@ pub async fn export_cookies_from_browser(
     };
     let _ = fs::remove_file(&tmp_path);
 
-    let jar = jar_result?;
-    if jar.sapisid().is_none() {
+    let jar = jar_result?.filter_youtube_and_google();
+    if jar.sapisid_for_host("music.youtube.com").is_none() {
         return Err(CoreError::Auth(format!(
             "No authenticated YouTube session found in {spec}"
         )));

@@ -54,7 +54,10 @@ pub async fn api_request(
     )
     .await?;
 
-    if path.starts_with("/api/music/auth/refresh") || path.starts_with("/api/music/accounts/select") {
+    if path.starts_with("/api/music/auth/refresh")
+        || path.starts_with("/api/music/accounts/select")
+        || path.starts_with("/api/music/logout")
+    {
         let _ = app.emit("auth-status", &result);
     }
     Ok(result)
@@ -418,7 +421,16 @@ pub async fn dispatch_api_request(
                 .check_auth(Some(&runtime.state))
                 .await
                 .map_err(|e| e.to_string())?;
-            if status.state != "ok" && imported_from.is_none() && ytdlp_ok {
+            let has_saved_cookies = runtime
+                .cookie_store()
+                .managed_browser_cookies_path()
+                .exists()
+                || !runtime.config.snapshot().cookies_file.trim().is_empty();
+            if status.state != "ok"
+                && imported_from.is_none()
+                && ytdlp_ok
+                && (force_import || has_saved_cookies)
+            {
                 imported_from = try_import_cookies_from_system_browser(runtime).await;
                 if imported_from.is_some() {
                     let refreshed_ytm =
@@ -482,6 +494,33 @@ pub async fn dispatch_api_request(
                 "accountName": status.account_name,
                 "checkedAt": status.checked_at,
                 "activeAuthUser": auth_user,
+            }))
+        }
+        ("POST", "/api/music/logout") => {
+            AUTH_POLL_GENERATION.fetch_add(1, Ordering::SeqCst);
+            let cookie_store = runtime.cookie_store();
+            let _ = fs::remove_file(cookie_store.managed_browser_cookies_path());
+            let _ = cookie_store.invalidate_cache();
+            runtime
+                .state
+                .update(|s| {
+                    s.music_auth_state = "expired".into();
+                    s.music_account_name.clear();
+                    s.music_auth_checked_at.clear();
+                    s.music_auth_user = 0;
+                    s.music_recommendations.clear();
+                    s.music_recom_last_sync.clear();
+                    s.music_playlists.clear();
+                    s.music_playlists_last_sync.clear();
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(json!({
+                "ok": false,
+                "authState": "expired",
+                "accountName": "",
+                "checkedAt": "",
+                "activeAuthUser": 0,
             }))
         }
         ("POST", "/api/music/login") => {

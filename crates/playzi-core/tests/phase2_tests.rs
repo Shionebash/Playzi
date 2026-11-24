@@ -123,6 +123,48 @@ fn cookies_netscape_parsing_sapisidhash_and_store_resolution() {
     assert!(!store.cache_path().exists());
 }
 
+#[test]
+fn cookies_ytmusic_headers_filter_host_and_ignore_google_or_third_party_cookies() {
+    let sample = "# Netscape HTTP Cookie File\n\
+        .youtube.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\tyt_sapisid_real\n\
+        .youtube.com\tTRUE\t/\tTRUE\t4102444800\tSID\tyt_sid\n\
+        .google.com\tTRUE\t/\tTRUE\t4102444800\tSAPISID\tgoogle_sapisid_other\n\
+        .google.com\tTRUE\t/\tTRUE\t4102444800\tNID\tgoogle_nid\n\
+        .claude.ai\tTRUE\t/\tTRUE\t4102444800\tsessionKey\tsecret_claude\n\
+        account.proton.me\tFALSE\t/\tTRUE\t4102444800\tAUTH\tsecret_proton\n";
+
+    let jar = CookieJar::parse(sample);
+    assert_eq!(jar.sapisid(), Some("yt_sapisid_real"));
+    assert_eq!(
+        jar.sapisid_for_host("music.youtube.com"),
+        Some("yt_sapisid_real")
+    );
+
+    let expected_hash =
+        compute_sapisidhash("yt_sapisid_real", "https://music.youtube.com", 1700000000);
+    assert_eq!(
+        jar.sapisidhash("https://music.youtube.com", 1700000000),
+        Some(expected_hash)
+    );
+
+    let headers = jar
+        .ytmusic_auth_headers_for_user("https://music.youtube.com", 1)
+        .unwrap();
+    let cookie_hdr = headers.get("Cookie").unwrap();
+    assert!(cookie_hdr.contains("SAPISID=yt_sapisid_real"));
+    assert!(cookie_hdr.contains("SID=yt_sid"));
+    assert!(!cookie_hdr.contains("google_sapisid_other"));
+    assert!(!cookie_hdr.contains("google_nid"));
+    assert!(!cookie_hdr.contains("secret_claude"));
+    assert!(!cookie_hdr.contains("secret_proton"));
+    assert_eq!(headers.get("X-Goog-AuthUser").map(String::as_str), Some("1"));
+
+    let filtered = jar.filter_youtube_and_google();
+    assert_eq!(filtered.len(), 4);
+    assert_eq!(filtered.get("sessionKey"), None);
+    assert_eq!(filtered.get("AUTH"), None);
+}
+
 #[tokio::test]
 async fn youtube_search_metadata_radio_and_channels_with_mock_innertube() {
     let base_url = spawn_mock_server(|path, _headers, body| {
