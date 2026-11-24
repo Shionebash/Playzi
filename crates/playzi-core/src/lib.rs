@@ -10,6 +10,7 @@ pub mod player;
 pub mod playlists;
 pub mod state;
 pub mod thumbs;
+pub mod updater;
 pub mod youtube;
 pub mod ytmusic;
 

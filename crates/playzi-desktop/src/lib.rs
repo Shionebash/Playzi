@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod media_controls;
 pub mod runtime;
+pub mod updater;
 
 use std::time::Duration;
 
@@ -8,17 +9,20 @@ use tauri::{Emitter, Manager};
 use url::Url;
 
 use crate::runtime::{AppRuntime, resolve_playzi_root};
+use crate::updater::DesktopUpdater;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let root = resolve_playzi_root();
     let app_runtime = AppRuntime::initialize(root).expect("failed to initialize Playzi core runtime");
+    let desktop_updater = DesktopUpdater::new();
     let thumbs_for_proto = app_runtime.thumbs.clone();
     let stream_client = playzi_core::player::build_stream_proxy_client()
         .expect("failed to initialize stream proxy HTTP client");
 
     tauri::Builder::default()
         .manage(app_runtime.clone())
+        .manage(desktop_updater.clone())
         .register_asynchronous_uri_scheme_protocol("playzi-thumb", move |_ctx, request, responder| {
             let thumbs = thumbs_for_proto.clone();
             let req_uri = request.uri().to_string();
@@ -250,6 +254,19 @@ pub fn run() {
                 }
             });
 
+            // Automatic background release check & self-update on startup
+            let disable_auto_update = std::env::var("PLAYZI_DISABLE_AUTO_UPDATE")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            if !disable_auto_update {
+                let updater = app.state::<DesktopUpdater>().inner().clone();
+                let app_update = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let _ = updater.check_and_install(app_update, true, false).await;
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -261,6 +278,8 @@ pub fn run() {
             commands::player_status,
             commands::player_control,
             commands::get_main_window_hwnd,
+            commands::get_update_status,
+            commands::check_for_updates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Playzi desktop application");

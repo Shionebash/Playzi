@@ -1,0 +1,60 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "${SKIP_VERSION_BUMP:-0}" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+CARGO_TOML="$REPO_ROOT/Cargo.toml"
+TAURI_CONF="$REPO_ROOT/crates/playzi-desktop/tauri.conf.json"
+
+extract_cargo_version() {
+  awk '
+    /^\[workspace\.package\]/ { in_ws = 1; next }
+    /^\[/ { in_ws = 0 }
+    in_ws && /^version[[:space:]]*=/ {
+      gsub(/.*"|".*/, "", $0)
+      print $0
+      exit
+    }
+  '
+}
+
+extract_tauri_version() {
+  awk '
+    /"version"[[:space:]]*:/ {
+      sub(/.*"version"[[:space:]]*:[[:space:]]*"/, "")
+      sub(/".*/, "")
+      print
+      exit
+    }
+  '
+}
+
+if [ -n "${PLAYZI_VERSION:-}" ]; then
+  sh "$REPO_ROOT/scripts/bump-version.sh" "$PLAYZI_VERSION"
+  git add "$CARGO_TOML" "$TAURI_CONF" "$REPO_ROOT/Cargo.lock"
+  exit 0
+fi
+
+HEAD_VER=""
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  HEAD_VER=$(git show HEAD:Cargo.toml 2>/dev/null | extract_cargo_version || true)
+fi
+
+STAGED_CARGO_VER=$(extract_cargo_version < "$CARGO_TOML")
+STAGED_TAURI_VER=$(extract_tauri_version < "$TAURI_CONF")
+
+if [ -n "$HEAD_VER" ] && [ "$STAGED_CARGO_VER" != "$HEAD_VER" ]; then
+  # User explicitly changed Cargo.toml version: sync all version files to it
+  sh "$REPO_ROOT/scripts/bump-version.sh" "$STAGED_CARGO_VER"
+elif [ -n "$HEAD_VER" ] && [ "$STAGED_TAURI_VER" != "$HEAD_VER" ]; then
+  # User explicitly changed tauri.conf.json version: sync all version files to it
+  sh "$REPO_ROOT/scripts/bump-version.sh" "$STAGED_TAURI_VER"
+else
+  # No explicit version specified: auto-bump patch x.x.(x+1)
+  sh "$REPO_ROOT/scripts/bump-version.sh"
+fi
+
+git add "$CARGO_TOML" "$TAURI_CONF" "$REPO_ROOT/Cargo.lock"

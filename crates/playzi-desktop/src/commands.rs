@@ -29,6 +29,7 @@ use url::Url;
 
 use crate::media_controls;
 use crate::runtime::AppRuntime;
+use crate::updater::DesktopUpdater;
 
 pub const AUTH_WINDOW_LABEL: &str = "auth-google";
 const AUTH_LOGIN_URL: &str =
@@ -41,8 +42,25 @@ pub async fn api_request(
     path: String,
     body: Option<Value>,
     runtime: State<'_, AppRuntime>,
+    updater: State<'_, DesktopUpdater>,
     app: AppHandle,
 ) -> Result<Value, String> {
+    let method_upper = method.to_ascii_uppercase();
+    if method_upper == "GET" && path == "/api/update/status" {
+        return serde_json::to_value(updater.snapshot()).map_err(|e| e.to_string());
+    }
+    if method_upper == "POST" && path == "/api/update/check" {
+        let auto_install = body
+            .as_ref()
+            .and_then(|v| v.get("autoInstall"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let status = updater
+            .check_and_install(app.clone(), auto_install, true)
+            .await;
+        return serde_json::to_value(status).map_err(|e| e.to_string());
+    }
+
     let app_for_auth = app.clone();
     let open_auth = move || open_auth_window_inner(&app_for_auth);
     let result = dispatch_api_request(
@@ -102,6 +120,23 @@ pub fn get_main_window_hwnd(app: AppHandle) -> Result<Option<i64>, String> {
         .get_webview_window("main")
         .and_then(|w| media_controls::window_hwnd_isize(&w))
         .map(|h| h as i64))
+}
+
+#[tauri::command]
+pub fn get_update_status(updater: State<'_, DesktopUpdater>) -> Result<Value, String> {
+    serde_json::to_value(updater.snapshot()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn check_for_updates(
+    auto_install: Option<bool>,
+    updater: State<'_, DesktopUpdater>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    let status = updater
+        .check_and_install(app, auto_install.unwrap_or(true), true)
+        .await;
+    serde_json::to_value(status).map_err(|e| e.to_string())
 }
 
 /// Saves Netscape-formatted browser cookies into `data/private/playzi_browser_cookies.txt`,

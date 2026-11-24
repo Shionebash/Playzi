@@ -42,6 +42,7 @@ const state = {
     capabilities: null,
   },
   config: null,
+  updateStatus: null,
   theme: localStorage.getItem("playzi-theme") || "dark",
   sidebarCollapsed: localStorage.getItem("playzi-sidebar-collapsed") === "1",
   channelView: { url: "", name: "", tab: "videos", items: [], page: 1, hasMore: false, loading: false, meta: null, error: "" },
@@ -1390,11 +1391,59 @@ function actionLabel(action) {
   return ({ play: "Reproducción", download: "Descarga", import: "Importación", sync: "Sync", playlist: "Playlist" }[action] || action);
 }
 
+function _formatUpdateStatusHtml() {
+  if (!IS_TAURI) return "";
+  const u = state.updateStatus || {};
+  const curVer = u.currentVersion ? `v${escapeHtml(u.currentVersion)}` : "Desconocida";
+  const latestVer = u.latestVersion ? `v${escapeHtml(u.latestVersion)}` : "";
+  const busy = u.status === "checking" || u.status === "downloading" || u.status === "installing";
+  let msg = "Las actualizaciones se revisan e instalan automáticamente al iniciar.";
+  if (u.status === "checking") msg = "Buscando nuevas versiones en GitHub Releases...";
+  else if (u.status === "up-to-date") msg = `Tienes la última versión disponible (${curVer}).`;
+  else if (u.status === "available") msg = `Nueva versión ${latestVer} disponible. Preparando descarga...`;
+  else if (u.status === "downloading") msg = `Descargando ${latestVer} (${Math.round(u.progress || 0)}%)...`;
+  else if (u.status === "installing") msg = `Instalando ${latestVer}... La aplicación se reiniciará automáticamente.`;
+  else if (u.status === "error") msg = `Error al revisar actualizaciones: ${escapeHtml(u.error || "desconocido")}`;
+
+  const progressBar = u.status === "downloading" ? `
+    <div style="margin-top:10px;height:6px;background:var(--bg3);border-radius:999px;overflow:hidden">
+      <div style="height:100%;width:${Math.min(100, Math.max(0, Number(u.progress || 0)))}%;background:var(--accent);transition:width .2s ease"></div>
+    </div>` : "";
+
+  return `
+    <div class="section-hdr"><span class="section-title">Actualizaciones</span></div>
+    <div class="config-panel" style="margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <div style="font-weight:600;margin-bottom:4px">Playzi ${curVer}</div>
+          <div style="font-size:13px;color:var(--tx2)">${msg}</div>
+        </div>
+        <button type="button" class="btn btn-primary" onclick="checkForAppUpdates()" ${busy ? "disabled" : ""}>
+          ${busy ? "Actualizando..." : "Buscar actualizaciones"}
+        </button>
+      </div>
+      ${progressBar}
+    </div>
+  `;
+}
+
+async function checkForAppUpdates() {
+  if (!IS_TAURI) return;
+  try {
+    const status = await api.post("/api/update/check", { autoInstall: true });
+    state.updateStatus = status;
+    if (state.view === "config") renderConfig();
+  } catch (err) {
+    toast(errorText(err));
+  }
+}
+
 function renderConfig() {
   const c = state.config || {};
   const playbackQuality = c.playbackQuality || "best";
   const curColor = document.documentElement.dataset.color || "pink";
   $("#view-config").innerHTML = `
+    ${_formatUpdateStatusHtml()}
     <div class="section-hdr"><span class="section-title">Apariencia</span></div>
     <div class="config-panel" style="margin-bottom:16px">
       <div style="margin-bottom:16px">
@@ -3951,6 +4000,21 @@ async function bindTauriEvents() {
     }
     refreshLists().catch(() => {});
   });
+  await listen("update-status", (event) => {
+    const prevStatus = state.updateStatus?.status || "";
+    const ev = event.payload || {};
+    state.updateStatus = ev;
+    if (state.view === "config") renderConfig();
+    if (ev.status === "available" && prevStatus !== "available") {
+      toast(`Nueva versión v${ev.latestVersion} encontrada. Descargando...`);
+    } else if (ev.status === "installing" && prevStatus !== "installing") {
+      toast(`Instalando Playzi v${ev.latestVersion}... La app se reiniciará.`);
+    } else if (ev.status === "up-to-date" && ev.manual && prevStatus === "checking") {
+      toast(`Playzi ya está actualizado (v${ev.currentVersion}).`);
+    } else if (ev.status === "error" && ev.manual && prevStatus !== "error") {
+      toast(`Error al actualizar: ${ev.error || "desconocido"}`);
+    }
+  });
   await listen("player-state", (event) => {
     const ev = event.payload || {};
     if (ev.state) {
@@ -4670,6 +4734,10 @@ async function main() {
   if (IS_TAURI) {
     refreshNativePlayerStatus().catch(() => {});
     _refreshPartyStatus().catch(() => {});
+    api.get("/api/update/status").then((st) => {
+      state.updateStatus = st;
+      if (state.view === "config") renderConfig();
+    }).catch(() => {});
   }
   await loadAll();
   scheduleNextPoll();
