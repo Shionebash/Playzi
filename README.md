@@ -1,178 +1,154 @@
 # Playzi
 
-Servidor web local para descargar y reproducir contenido de YouTube y YouTube Music. Interfaz en español, funciona en Windows y Linux.
+Aplicacion de escritorio nativa en **Rust** y **Tauri v2** para explorar, reproducir y descargar contenido de YouTube y YouTube Music. Interfaz en espanol, diseno ligero e independiente del navegador.
 
-## Características
+## Descarga (Windows)
 
-- Buscar y descargar videos/audio de YouTube
-- Explorar y reproducir YouTube Music
-- Gestión de listas de reproducción y colecciones
-- Suscripciones a canales con sincronización automática (cada 3 horas, paralela)
-- Reproductor web integrado (Video.js + DASH)
-- Reproducción directa en MPV o VLC
-- Autenticación con cuenta de Google via navegador gestionado (Playwright)
-- Historial de reproducción y recomendaciones personalizadas
-- **Cola de reproducción**: shuffle, repeat (ninguno / uno / todos), autoplay al terminar
-- **Añadir a cola** desde cualquier card sin interrumpir la reproducción actual
-- **Teclas multimedia del sistema** (MediaSession API): play/pause/next/prev desde teclado o SO
-- **Radio/Autoplay**: al terminar la cola carga un mix relacionado automáticamente
-- Atajos de teclado en el reproductor: `Space` play/pausa · `←/→` seek · `N/P` siguiente/anterior · `S` shuffle · `R` repeat
+Descarga el instalador para Windows x64 desde la seccion de Releases:
+
+- **Ultima version (`v1.0.0`)**: [Playzi_1.0.0_x64-setup.exe](https://github.com/Shionebash/Playzi/releases/download/v1.0.0/Playzi_1.0.0_x64-setup.exe)
+- **Todas las releases**: https://github.com/Shionebash/Playzi/releases
+
+---
+
+## Caracteristicas
+
+- **Aplicacion de escritorio nativa (Rust + Tauri v2)**: ejecutable independiente sin necesidad de servidor web local ni entorno de Python.
+- **YouTube y YouTube Music**: busqueda, exploracion de canales, recomendaciones personalizadas y navegacion por musica.
+- **Descargas concurrentes**: descarga de video y audio (`opus`, `mp3`, `m4a`) gestionada en Rust mediante `yt-dlp` y `ffmpeg`.
+- **Reproductor integrado y reproductores externos**: reproduccion directa dentro de la app con proxy de streaming, o envio directo a **MPV** / **VLC**.
+- **Modo Party (Watch Party)**: salas sincronizadas en tiempo real sobre WebSocket con cola compartida, roles y politicas de control.
+- **Controles multimedia nativos del SO**: integracion con teclas multimedia y controles del sistema operativo mediante `souvlaki`.
+- **Autenticacion integrada con Google/YouTube**: inicio de sesion desde ventana WebView integrada dentro de la propia aplicacion con gestion local de cookies.
+- **Biblioteca local**: listas de reproduccion, colecciones, historial de reproduccion y cache de miniaturas.
+- **Sincronizacion automatica**: actualizacion periodica en segundo plano de suscripciones y secciones.
+- **Cola de reproduccion avanzada**: shuffle, repeat (ninguno / uno / todos), radio/autoplay al finalizar y atajos de teclado (`Space` play/pausa, `←/→` seek, `N/P` siguiente/anterior, `S` shuffle, `R` repeat).
+
+---
 
 ## Requisitos
 
-| Herramienta | Windows | Linux |
-|-------------|---------|-------|
-| Python 3.11+ | [python.org](https://www.python.org/downloads/) | `sudo apt install python3 python3-venv` |
-| ffmpeg | [ffmpeg.org](https://ffmpeg.org/download.html) | `sudo apt install ffmpeg` |
-| MPV (opcional) | [mpv.io](https://mpv.io/installation/) | `sudo apt install mpv` |
-| VLC (opcional) | [videolan.org](https://www.videolan.org/) | `sudo apt install vlc` |
-| Node.js (opcional) | [nodejs.org](https://nodejs.org/) | `sudo apt install nodejs` |
+### Para ejecutar la app instalada
 
-> Node.js solo se usa si yt-dlp requiere ejecución de JavaScript para ciertos videos.
+| Herramienta | Requerido | Notas |
+|-------------|-----------|-------|
+| Windows 10/11 (x64) | Si | Incluye WebView2 para la ventana nativa |
+| `yt-dlp` | Si | Resolucion de streams y descargas |
+| `ffmpeg` | Si | Conversion y mezcla de audio/video |
+| `mpv` / `vlc` | Opcional | Solo si deseas reproducir en un reproductor externo |
 
----
+### Para compilar desde el codigo fuente
 
-## Instalación y ejecución
-
-### Windows
-
-```powershell
-# 1. Clonar repositorio
-git clone https://github.com/Shionebash/Playzi.git
-cd Playzi
-
-# 2. Setup (crea venv, instala dependencias, genera .env)
-.\scripts\windows\setup.ps1
-
-# 3. Arrancar servidor
-.\scripts\windows\run.ps1
-```
-
-Abrir en el navegador: **http://127.0.0.1:8765**
-
-Para detener: `.\scripts\windows\stop.ps1`
+| Herramienta | Notas |
+|-------------|-------|
+| Rust (`cargo`, edition 2024) | [rustup.rs](https://rustup.rs/) |
+| Node.js (para Tauri CLI) | Usado para empaquetar instaladores con `@tauri-apps/cli` |
+| Dependencias de Tauri en Linux | `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` |
 
 ---
 
-### Linux
+## Desarrollo y compilacion
 
 ```bash
-# 1. Clonar repositorio
+# 1. Clonar el repositorio
 git clone https://github.com/Shionebash/Playzi.git
 cd Playzi
 
-# 2. Setup (crea venv, instala dependencias, genera .env)
-bash scripts/linux/setup.sh
+# 2. Ejecutar tests del workspace en Rust
+cargo test --workspace
 
-# 3. Arrancar servidor
-bash scripts/linux/run.sh
+# 3. Ejecutar la app de escritorio en modo desarrollo
+cargo run -p playzi-desktop
 ```
 
-Abrir en el navegador: **http://127.0.0.1:8765**
+### Generar el instalador `.exe` (Windows NSIS)
 
-Para detener: `bash scripts/linux/stop.sh`
+```powershell
+cd crates\playzi-desktop
+npx @tauri-apps/cli@2 build --bundles nsis
+```
+
+El instalador generado quedara en:
+
+```text
+target/release/bundle/nsis/Playzi_1.0.0_x64-setup.exe
+```
+
+Para generar los paquetes nativos de tu plataforma actual:
+
+```bash
+cd crates/playzi-desktop
+npx @tauri-apps/cli@2 build
+```
 
 ---
 
-## Configuración
+## Configuracion
 
-`setup.ps1` / `setup.sh` genera automáticamente un archivo `.env` con la configuración detectada. Puedes editarlo manualmente:
+Playzi carga su configuracion desde un archivo `.env` en el directorio raiz de datos (o mediante variables de entorno). Tambien puede editarse desde la propia interfaz de la aplicacion.
 
 ```env
-APP_HOST=127.0.0.1       # Interfaz de red del servidor
-APP_PORT=8765            # Puerto
+MEDIA_ROOT=./media        # Carpeta donde se guardan las descargas
+DATA_DIR=./data           # Carpeta de estado, cache y cookies
 
-MEDIA_ROOT=/ruta/media   # Dónde se guardan los archivos descargados
-DATA_DIR=/ruta/data      # Dónde se guarda el estado y caché
+DEFAULT_PLAYER=mpv        # Reproductor externo por defecto: mpv | vlc
+MPV_PATH=mpv              # Ruta o ejecutable de mpv
+VLC_PATH=vlc              # Ruta o ejecutable de vlc
+FFMPEG_PATH=ffmpeg        # Ruta o ejecutable de ffmpeg
 
-DEFAULT_PLAYER=mpv       # Reproductor por defecto: mpv | vlc
-MPV_PATH=mpv             # Ruta o nombre del ejecutable mpv
-VLC_PATH=vlc             # Ruta o nombre del ejecutable vlc
-FFMPEG_PATH=ffmpeg       # Ruta o nombre del ejecutable ffmpeg
+AUDIO_FORMAT=opus         # Formato de audio: opus | mp3 | m4a
+YTDLP_SEARCH_LIMIT=12     # Resultados por busqueda (1-100)
+PLAYBACK_QUALITY=best     # Calidad: best | 1080p | 720p | 480p | 360p
 
-AUDIO_FORMAT=opus        # Formato de audio: opus | mp3 | m4a
-YTDLP_SEARCH_LIMIT=12    # Resultados por búsqueda
-PLAYBACK_QUALITY=best    # Calidad: best | 1080p | 720p | 480p | 360p
-
-# Opcional - cookies para contenido con login
-COOKIES_BROWSER=         # Navegador para extraer cookies: chrome | firefox | etc.
-COOKIES_FILE=            # Ruta a un cookies.txt en formato Netscape
+# Opcional: cookies para contenido con sesion
+COOKIES_BROWSER=          # Navegador para extraer cookies (chrome, firefox, etc.)
+COOKIES_FILE=             # Ruta a un cookies.txt en formato Netscape
 ```
 
-> Ver `.env.example` para referencia.
+> Consulta `.env.example` para referencia completa.
 
 ---
 
-## Autenticación con YouTube
+## Arquitectura del proyecto
 
-Para acceder a contenido que requiere login (YouTube Music, recomendaciones personalizadas):
+El proyecto esta organizado como un **Cargo Workspace** en Rust:
 
-### Windows
-```powershell
-.\scripts\windows\login-youtube.ps1
-```
-
-### Linux
-```bash
-bash scripts/linux/login-youtube.sh
-```
-
-Se abre un navegador Chromium gestionado. Inicia sesión normalmente en YouTube. Las cookies quedan guardadas en `data/private/`.
-
----
-
-## Actualizar yt-dlp
-
-Si los downloads fallan, actualizar yt-dlp suele resolverlo:
-
-### Windows
-```powershell
-.\scripts\windows\update-ytdlp.ps1
-```
-
-### Linux
-```bash
-bash scripts/linux/update-ytdlp.sh
-```
-
----
-
-## Estructura del proyecto
-
-```
+```text
 Playzi/
-├── backend/           # Servidor FastAPI (Python)
-│   ├── main.py        # Rutas y app principal
-│   ├── config.py      # Configuración desde .env
-│   ├── downloads.py   # Cola de descargas
-│   ├── player.py      # Integración MPV/VLC
-│   ├── youtube.py     # Búsqueda y metadatos
-│   ├── ytmusic.py     # YouTube Music API
-│   ├── playlists.py   # Listas de reproducción
-│   ├── channels.py    # Suscripciones a canales
-│   └── ...
-├── static/            # Frontend web (HTML/CSS/JS)
-├── scripts/
-│   ├── windows/       # Scripts PowerShell
-│   └── linux/         # Scripts Bash
-├── .env.example       # Plantilla de configuración
-└── requirements.txt   # Dependencias Python
+├── Cargo.toml                  # Workspace principal de Rust (v1.0.0)
+├── crates/
+│   ├── playzi-core/            # Logica de negocio y persistencia en Rust
+│   │   └── src/
+│   │       ├── autosync.rs     # Sincronizacion automatica en segundo plano
+│   │       ├── collections.rs  # Colecciones locales
+│   │       ├── config.rs       # Lectura/escritura de configuracion (.env)
+│   │       ├── cookies.rs      # Gestion de cookies Netscape y SAPISIDHASH
+│   │       ├── downloads.rs    # Gestor de cola de descargas concurrentes
+│   │       ├── history.rs      # Historial de reproduccion
+│   │       ├── party.rs        # Salas Watch Party por WebSocket
+│   │       ├── player.rs       # Resolucion de streams, proxy y control MPV/VLC
+│   │       ├── playlists.rs    # Listas de reproduccion
+│   │       ├── state.rs        # Estado persistente de la aplicacion
+│   │       ├── thumbs.rs       # Cache de miniaturas
+│   │       ├── youtube.rs      # Integracion con YouTube
+│   │       └── ytmusic.rs      # Integracion con YouTube Music
+│   └── playzi-desktop/         # App de escritorio Tauri v2
+│       ├── tauri.conf.json     # Configuracion de ventana y bundle NSIS
+│       ├── build.rs            # Empaquetado de assets de static/ en dist/
+│       └── src/
+│           ├── main.rs         # Punto de entrada Windows/Desktop
+│           ├── lib.rs          # Inicializacion de Tauri, eventos y protocolos
+│           ├── commands.rs     # Comandos IPC y ventana de login WebView
+│           ├── media_controls.rs # Controles multimedia del SO (souvlaki)
+│           └── runtime.rs      # Inicializacion del runtime de playzi-core
+├── static/                     # Frontend embebido (HTML/CSS/JS)
+├── backend/                    # Backend web legado en Python/FastAPI (referencia)
+├── scripts/                    # Scripts legados para el servidor Python
+└── RUST_MIGRATION_ROADMAP.md   # Hoja de ruta de la migracion a Rust
 ```
 
 ---
 
-## Dependencias Python
+## Licencia
 
-```
-fastapi
-uvicorn[standard]
-yt-dlp
-ytmusicapi
-playwright
-python-dotenv
-pydantic
-httpx
-Pillow
-```
-
-Instaladas automáticamente por los scripts de setup en el entorno virtual `.venv/`.
+Distribuido bajo licencia **MIT**.
