@@ -38,13 +38,14 @@ impl AppRuntime {
         let state = StateStore::new(&snap.state_file);
         let youtube = YouTubeClient::new()?;
         let thumbs = ThumbnailCache::new(snap.data_dir.join("thumbs"))?;
+        let player = PlayerManager::new(state.clone(), config.clone());
         let downloads = DownloadManager::new(
             state.clone(),
             config.clone(),
             DEFAULT_MAX_CONCURRENT_DOWNLOADS,
-        );
+        )
+        .with_ytdlp_bin(player.resolve_ytdlp_bin());
         let autosync = AutoSyncManager::new(state.clone(), config.clone(), youtube.clone());
-        let player = PlayerManager::new(state.clone(), config.clone());
         let party = PartyManager::new(state.clone());
 
         Ok(Self {
@@ -73,7 +74,12 @@ impl AppRuntime {
             Some(snap.cookies_file.as_str())
         };
         let jar = self.cookie_store().load_jar(configured).ok();
-        YtMusicClient::new(jar)
+        let auth_user = self
+            .state
+            .read()
+            .map(|s| s.music_auth_user)
+            .unwrap_or(0);
+        Ok(YtMusicClient::new(jar)?.with_auth_user(auth_user))
     }
 
     pub fn bootstrap_payload(&self) -> Result<Value> {

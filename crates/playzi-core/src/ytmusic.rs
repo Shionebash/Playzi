@@ -44,6 +44,15 @@ pub struct MusicAuthStatus {
     pub checked_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleAccountOption {
+    pub auth_user: u8,
+    pub name: String,
+    pub handle: String,
+    pub photo: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct YtMusicClient {
     http: reqwest::Client,
@@ -52,6 +61,7 @@ pub struct YtMusicClient {
     hl: String,
     gl: String,
     cookies: Option<CookieJar>,
+    auth_user: u8,
 }
 
 impl YtMusicClient {
@@ -83,7 +93,13 @@ impl YtMusicClient {
             hl: "es".into(),
             gl: "EC".into(),
             cookies,
+            auth_user: 0,
         }
+    }
+
+    pub fn with_auth_user(mut self, auth_user: u8) -> Self {
+        self.auth_user = auth_user;
+        self
     }
 
     pub fn has_auth(&self) -> bool {
@@ -107,7 +123,9 @@ impl YtMusicClient {
     fn auth_header_map(&self) -> HeaderMap {
         let mut map = HeaderMap::new();
         if let Some(jar) = &self.cookies {
-            if let Some(auth_headers) = jar.ytmusic_auth_headers(DEFAULT_YTMUSIC_BASE_URL) {
+            if let Some(auth_headers) =
+                jar.ytmusic_auth_headers_for_user(DEFAULT_YTMUSIC_BASE_URL, self.auth_user)
+            {
                 for (k, v) in auth_headers {
                     if let (Ok(name), Ok(val)) = (
                         HeaderName::from_bytes(k.as_bytes()),
@@ -192,6 +210,59 @@ impl YtMusicClient {
 
         persist_auth_status(store, &status);
         Ok(status)
+    }
+
+    /// Probes signed-in Google accounts (`X-Goog-AuthUser: 0..5`) present in the cookie jar.
+    pub async fn list_signed_in_accounts(&self) -> Vec<GoogleAccountOption> {
+        let mut out = Vec::new();
+        if !self.has_auth() {
+            return out;
+        }
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for idx in 0..5u8 {
+            let probe = self.clone().with_auth_user(idx);
+            let Ok(val) = probe.post_innertube("account/account_menu", json!({})).await else {
+                if idx > 0 {
+                    break;
+                }
+                continue;
+            };
+            let header = val.pointer(
+                "/actions/0/openPopupAction/popup/multiPageMenuRenderer/header/activeAccountHeaderRenderer",
+            );
+            let Some(header) = header else {
+                if idx > 0 {
+                    break;
+                }
+                continue;
+            };
+            let name = text_from_node(header.get("accountName")).unwrap_or_default();
+            if name.is_empty() {
+                if idx > 0 {
+                    break;
+                }
+                continue;
+            }
+            let handle = text_from_node(header.get("channelHandle"))
+                .or_else(|| text_from_node(header.get("email")))
+                .unwrap_or_default();
+            let photo = header
+                .pointer("/accountPhoto/thumbnails/0/url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let key = (name.to_ascii_lowercase(), handle.to_ascii_lowercase());
+            if !seen.insert(key) {
+                break;
+            }
+            out.push(GoogleAccountOption {
+                auth_user: idx,
+                name,
+                handle,
+                photo,
+            });
+        }
+        out
     }
 
     /// Searches YouTube Music via `/youtubei/v1/search` with optional filter (`songs`, `videos`, `albums`, `artists`, `playlists`).

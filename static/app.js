@@ -1035,22 +1035,108 @@ async function _awaitLoginTask(taskId) {
   await _onAuthSettled();
 }
 
-// Silent-first login: try a headless cookie re-export from the persistent
-// profile; only open the visible Chromium if that profile lost its session.
+function openAccountPickerModal(accounts, activeAuthUser = 0, browserName = "") {
+  const root = $("#modalRoot");
+  if (!root) return;
+  const close = () => { root.innerHTML = ""; };
+  const subtitle = browserName
+    ? `Cuentas detectadas en ${escapeHtml(browserName)}. Elige cuál usar en Playzi:`
+    : "Elige qué cuenta de YouTube usar en Playzi:";
+  const rows = (accounts || []).map((acc) => {
+    const isActive = Number(acc.authUser) === Number(activeAuthUser);
+    const avatar = acc.photo
+      ? `<img src="${escapeHtml(acc.photo)}" alt="" style="width:36px;height:36px;border-radius:50%;object-fit:cover;flex-shrink:0">`
+      : `<div style="width:36px;height:36px;border-radius:50%;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0">${escapeHtml((acc.name || "?").slice(0, 1).toUpperCase())}</div>`;
+    return `
+      <button type="button" class="btn btn-ghost" data-pick-authuser="${Number(acc.authUser)}" style="width:100%;justify-content:flex-start;gap:12px;padding:10px 12px;text-align:left;border:1px solid ${isActive ? "var(--accent)" : "var(--border)"};margin-bottom:8px">
+        ${avatar}
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(acc.name || `Cuenta ${acc.authUser}`)}</div>
+          ${acc.handle ? `<div class="meta" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(acc.handle)}</div>` : ""}
+        </div>
+        ${isActive ? `<span class="badge" style="font-size:11px">Activa</span>` : ""}
+      </button>
+    `;
+  }).join("");
+
+  root.innerHTML = `
+    <div class="modal-backdrop" id="accountPickerBackdrop">
+      <div class="modal" style="max-width:440px">
+        <div class="modal-header">
+          <h3>Seleccionar cuenta de YouTube</h3>
+          <button class="icon-btn" id="accountPickerClose" type="button">×</button>
+        </div>
+        <div class="modal-body">
+          <p class="meta" style="margin-bottom:12px">${subtitle}</p>
+          <div>${rows}</div>
+        </div>
+        <div class="modal-actions" style="justify-content:space-between;margin-top:12px">
+          <button class="btn btn-ghost" id="accountPickerOpenBrowser" type="button">Usar otra cuenta (navegador)</button>
+          <button class="btn btn-ghost" id="accountPickerCancel" type="button">Cerrar</button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  $("#accountPickerClose").onclick = close;
+  $("#accountPickerCancel").onclick = close;
+  $("#accountPickerBackdrop").onclick = (ev) => {
+    if (ev.target.id === "accountPickerBackdrop") close();
+  };
+  $("#accountPickerOpenBrowser").onclick = async () => {
+    close();
+    try {
+      const visible = await api.post("/api/music/login");
+      const b = visible?.browser ? ` (${visible.browser})` : "";
+      toast(`Se abrió el selector de Google en tu navegador${b}. Inicia sesión y Playzi la detectará automáticamente.`);
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+  root.querySelectorAll("[data-pick-authuser]").forEach((btn) => {
+    btn.onclick = async () => {
+      const idx = Number(btn.dataset.pickAuthuser || 0);
+      close();
+      try {
+        toast("Cambiando de cuenta...");
+        await api.post("/api/music/accounts/select", { authUser: idx });
+        await _onAuthSettled(false);
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+  });
+}
+
+// Silent-first login: import cookies from the default browser; if multiple
+// Google accounts are signed in, show an account picker; otherwise open the
+// Google AccountChooser in the default browser.
 let _loginFlowBusy = false;
 async function startLoginFlow() {
   if (_loginFlowBusy) return;
   _loginFlowBusy = true;
   try {
-    toast("Reconectando con tu sesión...");
-    const resp = await api.post("/api/music/auth/refresh");
-    const task = await _pollTask(resp?.task?.id, 60);
+    toast("Buscando sesión en tu navegador predeterminado...");
+    const resp = await api.post("/api/music/auth/refresh", { forceImport: true });
+    if (resp?.task?.id) {
+      await _pollTask(resp.task.id, 60);
+    }
     await refreshLists();
-    if (state.musicAuthState === "ok") {
+
+    const accounts = Array.isArray(resp?.accounts) ? resp.accounts : [];
+    if (accounts.length > 1) {
+      openAccountPickerModal(accounts, resp.activeAuthUser || 0, resp.browser || "");
+      return;
+    }
+    if (state.musicAuthState === "ok" || resp?.ok) {
       await _onAuthSettled(true);
       return;
     }
-    // Not signed in yet -> open YouTube Music in the system default browser.
+    if (resp?.error) {
+      toast(resp.error);
+      return;
+    }
+    // Not signed in yet -> open Google AccountChooser in the system default browser.
     const visible = await api.post("/api/music/login");
     if (visible?.mode === "external-browser") {
       const b = visible.browser ? ` (${visible.browser})` : "";

@@ -81,6 +81,7 @@ pub struct AppState {
     pub music_auth_state: String,
     pub music_auth_checked_at: String,
     pub music_account_name: String,
+    pub music_auth_user: u8,
     pub music_library: MusicLibraryState,
     pub music_history: Vec<Value>,
     pub imported_playlists: Vec<Value>,

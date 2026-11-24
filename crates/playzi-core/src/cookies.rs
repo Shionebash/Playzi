@@ -216,6 +216,15 @@ impl CookieJar {
 
     /// Builds YouTube Music authenticated InnerTube headers (`Cookie`, `Authorization`, `x-origin`, `X-Goog-AuthUser`).
     pub fn ytmusic_auth_headers(&self, origin: &str) -> Option<BTreeMap<String, String>> {
+        self.ytmusic_auth_headers_for_user(origin, 0)
+    }
+
+    /// Builds YouTube Music authenticated InnerTube headers for a specific Google `authuser` index.
+    pub fn ytmusic_auth_headers_for_user(
+        &self,
+        origin: &str,
+        auth_user: u8,
+    ) -> Option<BTreeMap<String, String>> {
         let auth = self.sapisidhash(origin, now_unix_secs())?;
         let cookie_header = self.cookie_header_all();
         if cookie_header.is_empty() {
@@ -225,7 +234,7 @@ impl CookieJar {
         headers.insert("Cookie".into(), cookie_header);
         headers.insert("Authorization".into(), auth);
         headers.insert("x-origin".into(), origin.to_string());
-        headers.insert("X-Goog-AuthUser".into(), "0".into());
+        headers.insert("X-Goog-AuthUser".into(), auth_user.to_string());
         Some(headers)
     }
 }

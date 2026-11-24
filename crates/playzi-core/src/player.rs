@@ -300,15 +300,7 @@ impl PlayerManager {
             }
         }
         let cfg = self.config.snapshot();
-        let venv_candidate = if cfg!(windows) {
-            cfg.root.join(".venv").join("Scripts").join("yt-dlp.exe")
-        } else {
-            cfg.root.join(".venv").join("bin").join("yt-dlp")
-        };
-        if venv_candidate.is_file() {
-            return venv_candidate.to_string_lossy().to_string();
-        }
-        "yt-dlp".into()
+        discover_ytdlp_binary(&cfg.root)
     }
 
     fn resolve_cookie_file(&self) -> Option<PathBuf> {
@@ -1976,7 +1968,85 @@ fn resolve_explicit_binary_path(
     None
 }
 
-fn binary_exists(bin: &str) -> bool {
+pub fn discover_ytdlp_binary(root: &Path) -> String {
+    let venv_candidate = if cfg!(windows) {
+        root.join(".venv").join("Scripts").join("yt-dlp.exe")
+    } else {
+        root.join(".venv").join("bin").join("yt-dlp")
+    };
+    if venv_candidate.is_file() {
+        return venv_candidate.to_string_lossy().to_string();
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar = if cfg!(windows) {
+                dir.join("yt-dlp.exe")
+            } else {
+                dir.join("yt-dlp")
+            };
+            if sidecar.is_file() {
+                return sidecar.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    if binary_exists("yt-dlp") {
+        return "yt-dlp".into();
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(&local_app_data);
+            let direct_candidates = [
+                base.join("Microsoft").join("WinGet").join("Links").join("yt-dlp.exe"),
+                base.join("Programs").join("yt-dlp").join("yt-dlp.exe"),
+            ];
+            for cand in direct_candidates {
+                if cand.is_file() {
+                    return cand.to_string_lossy().to_string();
+                }
+            }
+            let winget_pkgs = base.join("Microsoft").join("WinGet").join("Packages");
+            if let Ok(entries) = std::fs::read_dir(&winget_pkgs) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                    if !name.contains("yt-dlp") {
+                        continue;
+                    }
+                    let dir = entry.path();
+                    let direct = dir.join("yt-dlp.exe");
+                    if direct.is_file() {
+                        return direct.to_string_lossy().to_string();
+                    }
+                    if let Ok(sub_entries) = std::fs::read_dir(&dir) {
+                        for sub in sub_entries.flatten() {
+                            let nested = sub.path().join("yt-dlp.exe");
+                            if nested.is_file() {
+                                return nested.to_string_lossy().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let scoop = PathBuf::from(profile).join("scoop").join("shims").join("yt-dlp.exe");
+            if scoop.is_file() {
+                return scoop.to_string_lossy().to_string();
+            }
+        }
+        let choco = PathBuf::from(r"C:\ProgramData\chocolatey\bin\yt-dlp.exe");
+        if choco.is_file() {
+            return choco.to_string_lossy().to_string();
+        }
+    }
+
+    "yt-dlp".into()
+}
+
+pub fn binary_exists(bin: &str) -> bool {
     let trimmed = bin.trim();
     if trimmed.is_empty() {
         return false;

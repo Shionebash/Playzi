@@ -31,7 +31,8 @@ use crate::media_controls;
 use crate::runtime::AppRuntime;
 
 pub const AUTH_WINDOW_LABEL: &str = "auth-google";
-const AUTH_LOGIN_URL: &str = "https://music.youtube.com/";
+const AUTH_LOGIN_URL: &str =
+    "https://accounts.google.com/AccountChooser?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F";
 static AUTH_POLL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[tauri::command]
@@ -53,7 +54,7 @@ pub async fn api_request(
     )
     .await?;
 
-    if path.starts_with("/api/music/auth/refresh") {
+    if path.starts_with("/api/music/auth/refresh") || path.starts_with("/api/music/accounts/select") {
         let _ = app.emit("auth-status", &result);
     }
     Ok(result)
@@ -400,13 +401,24 @@ pub async fn dispatch_api_request(
             serde_json::to_value(info).map_err(|e| e.to_string())
         }
         ("POST", "/api/music/auth/refresh") => {
+            let force_import = body
+                .get("forceImport")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let ytdlp_bin = runtime.player.resolve_ytdlp_bin();
+            let ytdlp_ok = playzi_core::player::binary_exists(&ytdlp_bin);
+            let mut imported_from: Option<String> = None;
+
+            if force_import && ytdlp_ok {
+                imported_from = try_import_cookies_from_system_browser(runtime).await;
+            }
+
             let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
             let mut status = ytm
                 .check_auth(Some(&runtime.state))
                 .await
                 .map_err(|e| e.to_string())?;
-            let mut imported_from: Option<String> = None;
-            if status.state != "ok" {
+            if status.state != "ok" && imported_from.is_none() && ytdlp_ok {
                 imported_from = try_import_cookies_from_system_browser(runtime).await;
                 if imported_from.is_some() {
                     let refreshed_ytm =
@@ -417,13 +429,59 @@ pub async fn dispatch_api_request(
                         .map_err(|e| e.to_string())?;
                 }
             }
+
+            let accounts = if status.state == "ok" {
+                let refreshed_ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
+                refreshed_ytm.list_signed_in_accounts().await
+            } else {
+                Vec::new()
+            };
+            let active_auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let error_msg = if status.state != "ok" && !ytdlp_ok {
+                Some("No se encontró yt-dlp instalado en el sistema. Instala yt-dlp para sincronizar cookies del navegador.")
+            } else {
+                None
+            };
             Ok(json!({
                 "ok": status.state == "ok",
                 "authState": status.state,
                 "accountName": status.account_name,
                 "checkedAt": status.checked_at,
                 "browser": imported_from,
+                "accounts": accounts,
+                "activeAuthUser": active_auth_user,
+                "error": error_msg,
                 "task": Value::Null,
+            }))
+        }
+        ("POST", "/api/music/accounts/select") => {
+            let auth_user = body
+                .get("authUser")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(10) as u8;
+            runtime
+                .state
+                .update(|s| {
+                    s.music_auth_user = auth_user;
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+            let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
+            let status = ytm
+                .check_auth(Some(&runtime.state))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({
+                "ok": status.state == "ok",
+                "authState": status.state,
+                "accountName": status.account_name,
+                "checkedAt": status.checked_at,
+                "activeAuthUser": auth_user,
             }))
         }
         ("POST", "/api/music/login") => {
