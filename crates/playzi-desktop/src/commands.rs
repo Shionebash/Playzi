@@ -1,10 +1,15 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use playzi_core::autosync::SyncSection;
 use playzi_core::collections::{create_collection, delete_collection, list_collections};
 use playzi_core::config::ConfigUpdate;
-use playzi_core::cookies::{CookieJar, NetscapeCookie, looks_like_netscape_cookie_file};
+use playzi_core::cookies::{
+    CookieJar, candidates_for_config, export_cookies_from_browser, looks_like_netscape_cookie_file,
+    open_url_in_default_browser,
+};
 use playzi_core::downloads::DownloadRequest;
 use playzi_core::history::{delete_history_event, list_history};
 use playzi_core::party::{
@@ -19,11 +24,7 @@ use playzi_core::playlists::{
 };
 use playzi_core::youtube::{delete_channel, list_channels, list_feed};
 use serde_json::{Value, json};
-use tauri::webview::PageLoadEvent;
-use tauri::{
-    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
-};
+use tauri::{AppHandle, Emitter, Manager, State};
 use url::Url;
 
 use crate::media_controls;
@@ -31,6 +32,7 @@ use crate::runtime::AppRuntime;
 
 pub const AUTH_WINDOW_LABEL: &str = "auth-google";
 const AUTH_LOGIN_URL: &str = "https://music.youtube.com/";
+static AUTH_POLL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[tauri::command]
 pub async fn api_request(
@@ -40,19 +42,6 @@ pub async fn api_request(
     runtime: State<'_, AppRuntime>,
     app: AppHandle,
 ) -> Result<Value, String> {
-    // Before refreshing auth, sync any Google/YouTube cookies already present in WebView2
-    if path.starts_with("/api/music/auth/refresh") {
-        if let Some(win) = app
-            .get_webview_window(AUTH_WINDOW_LABEL)
-            .or_else(|| app.get_webview_window("main"))
-        {
-            let jar = extract_webview_cookies_to_jar(&win);
-            if jar.sapisid().is_some() {
-                let _ = persist_cookie_jar(&jar, runtime.inner());
-            }
-        }
-    }
-
     let app_for_auth = app.clone();
     let open_auth = move || open_auth_window_inner(&app_for_auth);
     let result = dispatch_api_request(
@@ -163,128 +152,48 @@ async fn check_and_emit_auth(runtime: &AppRuntime, app: &AppHandle) -> Result<Va
     Ok(payload)
 }
 
-fn extract_webview_cookies_to_jar(window: &WebviewWindow) -> CookieJar {
-    const AUTH_COOKIE_URLS: &[(&str, &str)] = &[
-        ("https://music.youtube.com/", ".youtube.com"),
-        ("https://www.youtube.com/", ".youtube.com"),
-        ("https://accounts.google.com/", ".google.com"),
-        ("https://www.google.com/", ".google.com"),
-    ];
+async fn try_import_cookies_from_system_browser(runtime: &AppRuntime) -> Option<String> {
+    let cfg = runtime.config.snapshot();
+    let ytdlp_bin = runtime.player.resolve_ytdlp_bin();
+    let temp_dir = runtime.cookie_store().private_dir();
+    let candidates = candidates_for_config(&cfg.cookies_browser);
 
-    let mut dedup: BTreeMap<(String, String, String), NetscapeCookie> = BTreeMap::new();
-    let mut push_cookie = |c: tauri::webview::Cookie<'_>, fallback_domain: &str| {
-        let raw_domain = c.domain().unwrap_or(fallback_domain).trim();
-        if raw_domain.is_empty() {
-            return;
-        }
-        let lower_dom = raw_domain.to_ascii_lowercase();
-        if !(lower_dom.ends_with("youtube.com") || lower_dom.ends_with("google.com")) {
-            return;
-        }
-        let domain = raw_domain.to_string();
-        let include_subdomains = domain.starts_with('.');
-        let path = c.path().unwrap_or("/").to_string();
-        let secure = c.secure().unwrap_or(false);
-        let http_only = c.http_only().unwrap_or(false);
-        let expires = c
-            .expires_datetime()
-            .map(|dt| dt.unix_timestamp())
-            .unwrap_or(0);
-        let name = c.name().to_string();
-        let value = c.value().to_string();
-        if name.is_empty() {
-            return;
-        }
-        dedup.insert(
-            (domain.clone(), path.clone(), name.clone()),
-            NetscapeCookie {
-                domain,
-                include_subdomains,
-                path,
-                secure,
-                expires,
-                name,
-                value,
-                http_only,
-            },
-        );
-    };
-
-    // First pull ALL cookies from the WebView2 cookie manager (captures SameSite=Lax/1P cookies like SID, SAPISID, LOGIN_INFO)
-    if let Ok(all_cookies) = window.cookies() {
-        for c in all_cookies {
-            push_cookie(c, "");
+    for candidate in candidates {
+        if let Ok(jar) =
+            export_cookies_from_browser(&ytdlp_bin, &candidate.ytdlp_spec, &temp_dir).await
+        {
+            if jar.sapisid().is_some() && persist_cookie_jar(&jar, runtime).is_ok() {
+                return Some(candidate.label);
+            }
         }
     }
-
-    for (raw_url, fallback_domain) in AUTH_COOKIE_URLS {
-        let Ok(url) = Url::parse(raw_url) else {
-            continue;
-        };
-        let Ok(cookies) = window.cookies_for_url(url) else {
-            continue;
-        };
-        for c in cookies {
-            push_cookie(c, fallback_domain);
-        }
-    }
-    CookieJar::new(dedup.into_values().collect())
+    None
 }
 
 fn open_auth_window_inner(app: &AppHandle) -> Result<(), String> {
-    if let Some(existing) = app.get_webview_window(AUTH_WINDOW_LABEL) {
-        let _ = existing.show();
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    let url = Url::parse(AUTH_LOGIN_URL).map_err(|e| e.to_string())?;
-    let app_on_load = app.clone();
-    let win = WebviewWindowBuilder::new(app, AUTH_WINDOW_LABEL, WebviewUrl::External(url))
-        .title("Iniciar sesion en YouTube / Google - Playzi")
-        .inner_size(980.0, 740.0)
-        .resizable(true)
-        .on_page_load(move |window, payload| {
-            if payload.event() != PageLoadEvent::Finished {
-                return;
+    open_url_in_default_browser(AUTH_LOGIN_URL)
+        .map_err(|e| format!("No se pudo abrir el navegador predeterminado: {e}"))?;
+
+    let poll_gen = AUTH_POLL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let runtime = app_handle.state::<AppRuntime>().inner().clone();
+        // Poll the user's default browser for up to ~3 minutes until signed in.
+        for _ in 0..45 {
+            if AUTH_POLL_GENERATION.load(Ordering::SeqCst) != poll_gen {
+                break;
             }
-            let host = payload.url().host_str().unwrap_or("");
-            if !host.ends_with("youtube.com") {
-                return;
-            }
-            let jar = extract_webview_cookies_to_jar(&window);
-            if jar.sapisid().is_none() {
-                return;
-            }
-            let app_handle = app_on_load.clone();
-            let win_clone = window.clone();
-            tauri::async_runtime::spawn(async move {
-                let runtime = app_handle.state::<AppRuntime>().inner().clone();
-                if persist_cookie_jar(&jar, &runtime).is_ok() {
-                    if let Ok(status) = check_and_emit_auth(&runtime, &app_handle).await {
-                        if status.get("ok").and_then(Value::as_bool) == Some(true) {
-                            let _ = win_clone.close();
-                        }
+            if try_import_cookies_from_system_browser(&runtime)
+                .await
+                .is_some()
+            {
+                if let Ok(status) = check_and_emit_auth(&runtime, &app_handle).await {
+                    if status.get("ok").and_then(Value::as_bool) == Some(true) {
+                        break;
                     }
                 }
-            });
-        })
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let app_on_close = app.clone();
-    let win_on_close = win.clone();
-    win.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { .. } = event {
-            let jar = extract_webview_cookies_to_jar(&win_on_close);
-            if jar.sapisid().is_some() {
-                let app_handle = app_on_close.clone();
-                tauri::async_runtime::spawn(async move {
-                    let runtime = app_handle.state::<AppRuntime>().inner().clone();
-                    if persist_cookie_jar(&jar, &runtime).is_ok() {
-                        let _ = check_and_emit_auth(&runtime, &app_handle).await;
-                    }
-                });
             }
+            tokio::time::sleep(Duration::from_secs(4)).await;
         }
     });
 
@@ -492,15 +401,28 @@ pub async fn dispatch_api_request(
         }
         ("POST", "/api/music/auth/refresh") => {
             let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
-            let status = ytm
+            let mut status = ytm
                 .check_auth(Some(&runtime.state))
                 .await
                 .map_err(|e| e.to_string())?;
+            let mut imported_from: Option<String> = None;
+            if status.state != "ok" {
+                imported_from = try_import_cookies_from_system_browser(runtime).await;
+                if imported_from.is_some() {
+                    let refreshed_ytm =
+                        runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
+                    status = refreshed_ytm
+                        .check_auth(Some(&runtime.state))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             Ok(json!({
                 "ok": status.state == "ok",
                 "authState": status.state,
                 "accountName": status.account_name,
                 "checkedAt": status.checked_at,
+                "browser": imported_from,
                 "task": Value::Null,
             }))
         }
@@ -508,7 +430,16 @@ pub async fn dispatch_api_request(
             if let Some(cb) = open_auth {
                 cb()?;
             }
-            Ok(json!({ "ok": true, "mode": "webview", "task": Value::Null }))
+            let browser_label = candidates_for_config(&runtime.config.snapshot().cookies_browser)
+                .into_iter()
+                .next()
+                .map(|c| c.label);
+            Ok(json!({
+                "ok": true,
+                "mode": "external-browser",
+                "browser": browser_label,
+                "task": Value::Null,
+            }))
         }
         ("GET", "/api/sync/status") => {
             let status = runtime

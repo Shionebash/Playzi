@@ -1050,10 +1050,15 @@ async function startLoginFlow() {
       await _onAuthSettled(true);
       return;
     }
-    // Profile itself is logged out -> fall back to the visible browser login.
+    // Not signed in yet -> open YouTube Music in the system default browser.
     const visible = await api.post("/api/music/login");
-    toast("Abriendo navegador... inicia sesión en YouTube y cierra la ventana al terminar.");
-    await _awaitLoginTask(visible?.task?.id);
+    if (visible?.mode === "external-browser") {
+      const b = visible.browser ? ` (${visible.browser})` : "";
+      toast(`Se abrió tu navegador predeterminado${b}. Inicia sesión en YouTube Music y Playzi detectará tu sesión automáticamente.`);
+    } else {
+      toast("Abriendo navegador... inicia sesión en YouTube y cierra la ventana al terminar.");
+      await _awaitLoginTask(visible?.task?.id);
+    }
   } catch (err) {
     toast(err.message);
   } finally {
@@ -1306,8 +1311,8 @@ function renderConfig() {
       <label>Límite búsqueda<input class="form-input" name="searchLimit" type="number" min="1" max="50" value="${escapeHtml(c.searchLimit || 12)}"></label>
       <label>Navegador para cookies automaticas
         <select class="form-input" name="cookiesBrowser">
-          ${["", "playzi", "chrome", "firefox", "edge", "brave", "chromium", "opera"].map((b) =>
-            `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Playzi automatico" : (b || "Ninguno")}</option>`
+          ${["", "playzi", "zen", "firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi"].map((b) =>
+            `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Navegador predeterminado (automático)" : (b || "Ninguno")}</option>`
           ).join("")}
         </select>
       </label>

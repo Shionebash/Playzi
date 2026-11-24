@@ -453,3 +453,463 @@ fn restrict_file_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn restrict_file_permissions(_path: &Path) {}
+
+/// Describes a system browser and the `--cookies-from-browser` spec yt-dlp expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCandidate {
+    pub label: String,
+    pub ytdlp_spec: String,
+}
+
+#[cfg(windows)]
+fn hide_window_std(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_window_std(_cmd: &mut std::process::Command) {}
+
+#[cfg(windows)]
+fn hide_window_tokio(cmd: &mut tokio::process::Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_window_tokio(_cmd: &mut tokio::process::Command) {}
+
+/// Finds the most recently modified Firefox-style profile directory containing `cookies.sqlite`.
+fn newest_firefox_profile_dir(profiles_root: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(profiles_root).ok()?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let cookies_db = dir.join("cookies.sqlite");
+        if !cookies_db.is_file() {
+            continue;
+        }
+        let mtime = fs::metadata(&cookies_db)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        match &best {
+            Some((best_time, _)) if mtime <= *best_time => {}
+            _ => best = Some((mtime, dir)),
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn firefox_fork_candidate(label: &str, profiles_roots: &[PathBuf]) -> Option<BrowserCandidate> {
+    for root in profiles_roots {
+        if let Some(profile) = newest_firefox_profile_dir(root) {
+            return Some(BrowserCandidate {
+                label: label.to_string(),
+                ytdlp_spec: format!("firefox:{}", profile.display()),
+            });
+        }
+    }
+    None
+}
+
+fn known_firefox_fork_roots(name: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(windows)]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let base = PathBuf::from(appdata);
+        match name {
+            "zen" => roots.push(base.join("zen").join("Profiles")),
+            "floorp" => roots.push(base.join("Floorp").join("Profiles")),
+            "librewolf" => roots.push(base.join("librewolf").join("Profiles")),
+            "waterfox" => roots.push(base.join("Waterfox").join("Profiles")),
+            _ => {}
+        }
+    }
+    #[cfg(not(windows))]
+    if let Ok(home) = std::env::var("HOME") {
+        let base = PathBuf::from(home);
+        match name {
+            "zen" => {
+                roots.push(base.join(".zen"));
+                roots.push(base.join(".var/app/io.github.zen_browser.zen/.zen"));
+            }
+            "floorp" => roots.push(base.join(".floorp")),
+            "librewolf" => roots.push(base.join(".librewolf")),
+            "waterfox" => roots.push(base.join(".waterfox")),
+            _ => {}
+        }
+    }
+    roots
+}
+
+fn push_unique_candidate(list: &mut Vec<BrowserCandidate>, candidate: BrowserCandidate) {
+    if !list
+        .iter()
+        .any(|c| c.ytdlp_spec.eq_ignore_ascii_case(&candidate.ytdlp_spec))
+    {
+        list.push(candidate);
+    }
+}
+
+#[cfg(windows)]
+fn query_windows_registry_value(key: &str, value_name: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("reg");
+    cmd.arg("query").arg(key);
+    match value_name {
+        Some(v) => {
+            cmd.arg("/v").arg(v);
+        }
+        None => {
+            cmd.arg("/ve");
+        }
+    }
+    hide_window_std(&mut cmd);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(pos) = line.find("REG_SZ") {
+            let val = line[pos + "REG_SZ".len()..].trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn detect_primary_browser_windows() -> Option<BrowserCandidate> {
+    let prog_id = query_windows_registry_value(
+        r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        Some("ProgId"),
+    )?;
+
+    let command_str = query_windows_registry_value(
+        &format!(r"HKCU\Software\Classes\{prog_id}\shell\open\command"),
+        None,
+    )
+    .or_else(|| {
+        query_windows_registry_value(
+            &format!(r"HKLM\Software\Classes\{prog_id}\shell\open\command"),
+            None,
+        )
+    })
+    .unwrap_or_default();
+
+    let combined = format!("{} {}", prog_id, command_str).to_ascii_lowercase();
+    if combined.contains("zen.exe") || combined.contains("zen browser") {
+        if let Some(c) = firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen")) {
+            return Some(c);
+        }
+    }
+    if combined.contains("floorp") {
+        if let Some(c) = firefox_fork_candidate("Floorp", &known_firefox_fork_roots("floorp")) {
+            return Some(c);
+        }
+    }
+    if combined.contains("librewolf") {
+        if let Some(c) = firefox_fork_candidate("LibreWolf", &known_firefox_fork_roots("librewolf"))
+        {
+            return Some(c);
+        }
+    }
+    if combined.contains("waterfox") {
+        if let Some(c) = firefox_fork_candidate("Waterfox", &known_firefox_fork_roots("waterfox")) {
+            return Some(c);
+        }
+    }
+    if combined.contains("firefox") {
+        return Some(BrowserCandidate {
+            label: "Firefox".into(),
+            ytdlp_spec: "firefox".into(),
+        });
+    }
+    if combined.contains("brave") {
+        return Some(BrowserCandidate {
+            label: "Brave".into(),
+            ytdlp_spec: "brave".into(),
+        });
+    }
+    if combined.contains("msedge") || combined.contains("edge") {
+        return Some(BrowserCandidate {
+            label: "Edge".into(),
+            ytdlp_spec: "edge".into(),
+        });
+    }
+    if combined.contains("opera") {
+        return Some(BrowserCandidate {
+            label: "Opera".into(),
+            ytdlp_spec: "opera".into(),
+        });
+    }
+    if combined.contains("vivaldi") {
+        return Some(BrowserCandidate {
+            label: "Vivaldi".into(),
+            ytdlp_spec: "vivaldi".into(),
+        });
+    }
+    if combined.contains("chromium") {
+        return Some(BrowserCandidate {
+            label: "Chromium".into(),
+            ytdlp_spec: "chromium".into(),
+        });
+    }
+    if combined.contains("chrome") {
+        return Some(BrowserCandidate {
+            label: "Chrome".into(),
+            ytdlp_spec: "chrome".into(),
+        });
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn detect_primary_browser_unix() -> Option<BrowserCandidate> {
+    let output = std::process::Command::new("xdg-settings")
+        .args(["get", "default-web-browser"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let lower = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    if lower.contains("zen") {
+        if let Some(c) = firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen")) {
+            return Some(c);
+        }
+    }
+    if lower.contains("floorp") {
+        if let Some(c) = firefox_fork_candidate("Floorp", &known_firefox_fork_roots("floorp")) {
+            return Some(c);
+        }
+    }
+    if lower.contains("librewolf") {
+        if let Some(c) = firefox_fork_candidate("LibreWolf", &known_firefox_fork_roots("librewolf"))
+        {
+            return Some(c);
+        }
+    }
+    if lower.contains("firefox") {
+        return Some(BrowserCandidate {
+            label: "Firefox".into(),
+            ytdlp_spec: "firefox".into(),
+        });
+    }
+    if lower.contains("brave") {
+        return Some(BrowserCandidate {
+            label: "Brave".into(),
+            ytdlp_spec: "brave".into(),
+        });
+    }
+    if lower.contains("edge") {
+        return Some(BrowserCandidate {
+            label: "Edge".into(),
+            ytdlp_spec: "edge".into(),
+        });
+    }
+    if lower.contains("opera") {
+        return Some(BrowserCandidate {
+            label: "Opera".into(),
+            ytdlp_spec: "opera".into(),
+        });
+    }
+    if lower.contains("vivaldi") {
+        return Some(BrowserCandidate {
+            label: "Vivaldi".into(),
+            ytdlp_spec: "vivaldi".into(),
+        });
+    }
+    if lower.contains("chromium") {
+        return Some(BrowserCandidate {
+            label: "Chromium".into(),
+            ytdlp_spec: "chromium".into(),
+        });
+    }
+    if lower.contains("chrome") {
+        return Some(BrowserCandidate {
+            label: "Chrome".into(),
+            ytdlp_spec: "chrome".into(),
+        });
+    }
+    None
+}
+
+/// Detects the user's default browser first, followed by installed fallback browsers.
+pub fn detect_default_browser_candidates() -> Vec<BrowserCandidate> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    if let Some(primary) = detect_primary_browser_windows() {
+        push_unique_candidate(&mut out, primary);
+    }
+    #[cfg(not(windows))]
+    if let Some(primary) = detect_primary_browser_unix() {
+        push_unique_candidate(&mut out, primary);
+    }
+
+    for (name, label) in [
+        ("zen", "Zen Browser"),
+        ("floorp", "Floorp"),
+        ("librewolf", "LibreWolf"),
+        ("waterfox", "Waterfox"),
+    ] {
+        if let Some(c) = firefox_fork_candidate(label, &known_firefox_fork_roots(name)) {
+            push_unique_candidate(&mut out, c);
+        }
+    }
+
+    for (spec, label) in [
+        ("firefox", "Firefox"),
+        ("edge", "Edge"),
+        ("chrome", "Chrome"),
+        ("brave", "Brave"),
+        ("opera", "Opera"),
+        ("vivaldi", "Vivaldi"),
+        ("chromium", "Chromium"),
+    ] {
+        push_unique_candidate(
+            &mut out,
+            BrowserCandidate {
+                label: label.into(),
+                ytdlp_spec: spec.into(),
+            },
+        );
+    }
+    out
+}
+
+/// Resolves browser candidates honoring an explicit `COOKIES_BROWSER` setting when provided.
+pub fn candidates_for_config(cookies_browser: &str) -> Vec<BrowserCandidate> {
+    let mut out = Vec::new();
+    let trimmed = cookies_browser.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.is_empty() && lower != "playzi" && lower != "auto" && lower != "default" {
+        match lower.as_str() {
+            "zen" => {
+                if let Some(c) =
+                    firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen"))
+                {
+                    push_unique_candidate(&mut out, c);
+                }
+            }
+            "floorp" => {
+                if let Some(c) =
+                    firefox_fork_candidate("Floorp", &known_firefox_fork_roots("floorp"))
+                {
+                    push_unique_candidate(&mut out, c);
+                }
+            }
+            "librewolf" => {
+                if let Some(c) =
+                    firefox_fork_candidate("LibreWolf", &known_firefox_fork_roots("librewolf"))
+                {
+                    push_unique_candidate(&mut out, c);
+                }
+            }
+            "waterfox" => {
+                if let Some(c) =
+                    firefox_fork_candidate("Waterfox", &known_firefox_fork_roots("waterfox"))
+                {
+                    push_unique_candidate(&mut out, c);
+                }
+            }
+            _ => {
+                push_unique_candidate(
+                    &mut out,
+                    BrowserCandidate {
+                        label: trimmed.to_string(),
+                        ytdlp_spec: trimmed.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    for c in detect_default_browser_candidates() {
+        push_unique_candidate(&mut out, c);
+    }
+    out
+}
+
+/// Opens `url` in the operating system's default web browser.
+pub fn open_url_in_default_browser(url: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("rundll32.exe");
+        cmd.args(["url.dll,FileProtocolHandler", url]);
+        hide_window_std(&mut cmd);
+        cmd.spawn()?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+}
+
+/// Exports cookies from a browser profile via `yt-dlp --cookies-from-browser <spec> --cookies <tmp>`.
+pub async fn export_cookies_from_browser(
+    ytdlp_bin: &str,
+    spec: &str,
+    temp_dir: &Path,
+) -> Result<CookieJar> {
+    fs::create_dir_all(temp_dir)?;
+    let unique = format!(
+        "playzi_browser_import_{}_{}.txt",
+        std::process::id(),
+        now_unix_secs()
+    );
+    let tmp_path = temp_dir.join(unique);
+    let _ = fs::remove_file(&tmp_path);
+
+    let mut cmd = tokio::process::Command::new(ytdlp_bin);
+    cmd.args([
+        "--cookies-from-browser",
+        spec,
+        "--cookies",
+        &tmp_path.to_string_lossy(),
+        "--skip-download",
+        "--flat-playlist",
+        "--playlist-end",
+        "1",
+        "--no-warnings",
+        "https://www.youtube.com/feed/subscriptions",
+    ]);
+    hide_window_tokio(&mut cmd);
+
+    let output = tokio::time::timeout(Duration::from_secs(25), cmd.output())
+        .await
+        .map_err(|_| CoreError::Auth(format!("Timeout exporting cookies from {spec}")))?
+        .map_err(|e| CoreError::Auth(format!("Failed to run {ytdlp_bin}: {e}")))?;
+
+    let jar_result = if tmp_path.exists() && looks_like_netscape_cookie_file(&tmp_path) {
+        CookieJar::from_file(&tmp_path)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(CoreError::Auth(format!(
+            "Could not export cookies from {spec}: {}",
+            stderr.lines().next().unwrap_or("no cookie file produced")
+        )))
+    };
+    let _ = fs::remove_file(&tmp_path);
+
+    let jar = jar_result?;
+    if jar.sapisid().is_none() {
+        return Err(CoreError::Auth(format!(
+            "No authenticated YouTube session found in {spec}"
+        )));
+    }
+    Ok(jar)
+}

@@ -19,7 +19,7 @@ Descarga el instalador para Windows x64 desde la seccion de Releases:
 - **Reproductor integrado y reproductores externos**: reproduccion directa dentro de la app con proxy de streaming, o envio directo a **MPV** / **VLC**.
 - **Modo Party (Watch Party)**: salas sincronizadas en tiempo real sobre WebSocket con cola compartida, roles y politicas de control.
 - **Controles multimedia nativos del SO**: integracion con teclas multimedia y controles del sistema operativo mediante `souvlaki`.
-- **Autenticacion integrada con Google/YouTube**: inicio de sesion desde ventana WebView integrada dentro de la propia aplicacion con gestion local de cookies.
+- **Autenticacion con Google/YouTube desde tu navegador predeterminado**: abre YouTube Music en tu navegador del sistema (Zen, Firefox, Chrome, Edge, Brave, Opera, Vivaldi) y sincroniza la sesion automaticamente.
 - **Biblioteca local**: listas de reproduccion, colecciones, historial de reproduccion y cache de miniaturas.
 - **Sincronizacion automatica**: actualizacion periodica en segundo plano de suscripciones y secciones.
 - **Cola de reproduccion avanzada**: shuffle, repeat (ninguno / uno / todos), radio/autoplay al finalizar y atajos de teclado (`Space` play/pausa, `←/→` seek, `N/P` siguiente/anterior, `S` shuffle, `R` repeat).
