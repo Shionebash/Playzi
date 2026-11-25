@@ -13,9 +13,10 @@ use playzi_core::cookies::{
 use playzi_core::downloads::DownloadRequest;
 use playzi_core::history::{delete_history_event, list_history};
 use playzi_core::party::{
-    AddQueueItemInput, FriendUpsertRequest, JoinSessionRequest, PlaybackSyncUpdate,
-    PolicyUpdateRequest, ProfileUpdateRequest, StartHostRequest, ensure_user_profile,
-    list_friends, remove_friend, update_user_profile, upsert_friend,
+    AddQueueItemInput, FriendUpsertRequest, JoinSessionRequest,
+    ParticipantPermissionsUpdateRequest, PlaybackSyncUpdate, PolicyUpdateRequest,
+    ProfileUpdateRequest, StartHostRequest, ensure_user_profile, list_friends, remove_friend,
+    update_user_profile, upsert_friend,
 };
 use playzi_core::player::{PlayRequest, PlayerControlCommand};
 use playzi_core::playlists::{
@@ -345,6 +346,93 @@ pub async fn dispatch_api_request(
                 .get("page_size")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
+            if tab.eq_ignore_ascii_case("music") {
+                let resolved_url = if playzi_core::youtube::extract_video_id(url).is_some()
+                    && !url.contains("/channel/")
+                    && !url.contains("/@")
+                {
+                    let meta = runtime
+                        .youtube
+                        .metadata_for_url(url)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    meta.channel_url
+                        .ok_or_else(|| "No se pudo identificar el canal de este video".to_string())?
+                } else {
+                    url.to_string()
+                };
+                let channel_id = runtime
+                    .youtube
+                    .resolve_channel_id(&resolved_url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
+                let artist = ytm
+                    .get_artist_info(&channel_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let canonical = format!("https://www.youtube.com/channel/{channel_id}");
+                let mut items = artist.songs.clone();
+                for rel in &artist.releases {
+                    items.push(playzi_core::youtube::MediaItem {
+                        id: rel.id.clone(),
+                        url: rel.url.clone(),
+                        title: rel.title.clone(),
+                        channel: if rel.subtitle.is_empty() {
+                            artist.name.clone()
+                        } else {
+                            rel.subtitle.clone()
+                        },
+                        channel_url: Some(canonical.clone()),
+                        duration: None,
+                        duration_text: "Lanzamiento".into(),
+                        thumbnail: if rel.thumbnail.is_empty() {
+                            None
+                        } else {
+                            Some(rel.thumbnail.clone())
+                        },
+                        view_count: None,
+                        live: false,
+                        members_only: false,
+                        result_type: Some("album".into()),
+                    });
+                }
+                let followed_id = runtime
+                    .state
+                    .read()
+                    .ok()
+                    .and_then(|s| {
+                        s.channels.iter().find_map(|c| {
+                            let cu = c.get("url").and_then(Value::as_str).unwrap_or("");
+                            if cu.eq_ignore_ascii_case(&canonical) || cu.contains(&channel_id) {
+                                c.get("id").and_then(Value::as_str).map(ToString::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                let tab_error = if items.is_empty() {
+                    "Este canal no tiene perfil o canciones en YouTube Music.".to_string()
+                } else {
+                    String::new()
+                };
+                return Ok(json!({
+                    "name": artist.name,
+                    "url": canonical,
+                    "channelId": channel_id,
+                    "handle": "",
+                    "avatar": artist.thumbnail,
+                    "subscriberCount": null,
+                    "tab": "music",
+                    "page": 1,
+                    "pageSize": page_size,
+                    "hasMore": false,
+                    "items": items,
+                    "tabError": tab_error,
+                    "alreadyFollowed": followed_id.is_some(),
+                    "followedChannelId": followed_id,
+                }));
+            }
             let res = runtime
                 .youtube
                 .browse_channel(url, tab, page, page_size, Some(&runtime.state))
@@ -395,6 +483,35 @@ pub async fn dispatch_api_request(
             .refresh_section(SyncSection::Recommendations)
             .await
             .map_err(|e| e.to_string()),
+        ("POST", "/api/recommendations/more") => {
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let items = runtime
+                .youtube
+                .fetch_recommendations_more_with_cookies_and_user(
+                    jar.as_ref(),
+                    auth_user,
+                    Some(&runtime.state),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let last_sync = runtime
+                .state
+                .read()
+                .map(|s| s.recommendations_last_sync)
+                .unwrap_or_default();
+            Ok(json!({ "ok": true, "items": items, "lastSync": last_sync }))
+        }
         ("GET", "/api/music/recommendations") => {
             let s = runtime.state.read().map_err(|e| e.to_string())?;
             Ok(json!({
@@ -407,6 +524,62 @@ pub async fn dispatch_api_request(
             .refresh_section(SyncSection::MusicRecommendations)
             .await
             .map_err(|e| e.to_string()),
+        ("POST", "/api/music/recommendations/more") => {
+            let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
+            let items = ytm
+                .fetch_recommendations_more(Some(&runtime.state))
+                .await
+                .map_err(|e| e.to_string())?;
+            let last_sync = runtime
+                .state
+                .read()
+                .map(|s| s.music_recom_last_sync)
+                .unwrap_or_default();
+            Ok(json!({ "ok": true, "items": items, "lastSync": last_sync }))
+        }
+        ("POST", "/api/youtube/watch-report") => {
+            let video_ref = body
+                .get("videoId")
+                .or_else(|| body.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let event_type = body
+                .get("eventType")
+                .and_then(Value::as_str)
+                .unwrap_or("start");
+            let current_time = body
+                .get("currentTime")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let duration = body.get("duration").and_then(Value::as_f64);
+            let cpn = body.get("cpn").and_then(Value::as_str).unwrap_or("");
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let reported = runtime
+                .youtube
+                .report_watch_event(
+                    video_ref,
+                    event_type,
+                    current_time,
+                    duration,
+                    cpn,
+                    jar.as_ref(),
+                    auth_user,
+                )
+                .await
+                .unwrap_or(false);
+            Ok(json!({ "ok": true, "reported": reported }))
+        }
         ("GET", "/api/music/playlists") => {
             let s = runtime.state.read().map_err(|e| e.to_string())?;
             Ok(json!({
@@ -787,6 +960,16 @@ pub async fn dispatch_api_request(
             let snap = runtime
                 .party
                 .update_policy(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/party/permissions") => {
+            let req: ParticipantPermissionsUpdateRequest = serde_json::from_value(body)
+                .map_err(|e| format!("Invalid permissions update: {e}"))?;
+            let snap = runtime
+                .party
+                .update_participant_permissions(req)
                 .await
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(snap).map_err(|e| e.to_string())

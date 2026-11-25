@@ -117,6 +117,13 @@ impl<T: Clone> TtlCache<T> {
 }
 
 #[derive(Debug, Clone)]
+struct PlaybackTrackingUrls {
+    playback_url: Option<String>,
+    watchtime_url: Option<String>,
+    length_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct YouTubeClient {
     http: reqwest::Client,
     base_url: String,
@@ -125,6 +132,7 @@ pub struct YouTubeClient {
     search_cache: Arc<TtlCache<Vec<MediaItem>>>,
     metadata_cache: Arc<TtlCache<MediaItem>>,
     browse_cache: Arc<TtlCache<ChannelBrowseResult>>,
+    tracking_cache: Arc<TtlCache<PlaybackTrackingUrls>>,
 }
 
 impl YouTubeClient {
@@ -153,6 +161,7 @@ impl YouTubeClient {
             search_cache: Arc::new(TtlCache::new(SEARCH_CACHE_TTL, SEARCH_CACHE_MAX)),
             metadata_cache: Arc::new(TtlCache::new(SEARCH_CACHE_TTL, SEARCH_CACHE_MAX)),
             browse_cache: Arc::new(TtlCache::new(BROWSE_CACHE_TTL, BROWSE_CACHE_MAX)),
+            tracking_cache: Arc::new(TtlCache::new(Duration::from_secs(600), 128)),
         }
     }
 
@@ -168,14 +177,26 @@ impl YouTubeClient {
     }
 
     async fn post_innertube(&self, endpoint: &str, body: Value) -> Result<Value> {
-        self.post_innertube_with_cookies(endpoint, body, None).await
+        self.post_innertube_with_cookies_and_user(endpoint, body, None, 0)
+            .await
     }
 
     async fn post_innertube_with_cookies(
         &self,
         endpoint: &str,
+        body: Value,
+        cookies: Option<&CookieJar>,
+    ) -> Result<Value> {
+        self.post_innertube_with_cookies_and_user(endpoint, body, cookies, 0)
+            .await
+    }
+
+    async fn post_innertube_with_cookies_and_user(
+        &self,
+        endpoint: &str,
         mut body: Value,
         cookies: Option<&CookieJar>,
+        auth_user: u8,
     ) -> Result<Value> {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("context".into(), self.web_context());
@@ -183,7 +204,7 @@ impl YouTubeClient {
         let url = format!("{}/youtubei/v1/{}?prettyPrint=false", self.base_url, endpoint);
         let mut req = self.http.post(url).json(&body);
         if let Some(jar) = cookies {
-            if let Some(headers) = jar.ytmusic_auth_headers(&self.base_url) {
+            if let Some(headers) = jar.ytmusic_auth_headers_for_user(&self.base_url, auth_user) {
                 for (k, v) in headers {
                     req = req.header(k, v);
                 }
@@ -296,7 +317,8 @@ impl YouTubeClient {
         &self,
         store: Option<&StateStore>,
     ) -> Result<Vec<MediaItem>> {
-        self.fetch_recommendations_with_cookies(None, store).await
+        self.fetch_recommendations_with_cookies_and_user(None, 0, store)
+            .await
     }
 
     pub async fn fetch_recommendations_with_cookies(
@@ -304,14 +326,50 @@ impl YouTubeClient {
         cookies: Option<&CookieJar>,
         store: Option<&StateStore>,
     ) -> Result<Vec<MediaItem>> {
-        let data = self
-            .post_innertube_with_cookies(
+        self.fetch_recommendations_with_cookies_and_user(cookies, 0, store)
+            .await
+    }
+
+    pub async fn fetch_recommendations_with_cookies_and_user(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+        store: Option<&StateStore>,
+    ) -> Result<Vec<MediaItem>> {
+        self.fetch_recommendations_pages(cookies, auth_user, store, 2, false)
+            .await
+    }
+
+    /// Fetches additional YouTube home recommendations via InnerTube continuation tokens
+    /// and merges them into the persisted recommendation list.
+    pub async fn fetch_recommendations_more_with_cookies_and_user(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+        store: Option<&StateStore>,
+    ) -> Result<Vec<MediaItem>> {
+        self.fetch_recommendations_pages(cookies, auth_user, store, 3, true)
+            .await
+    }
+
+    async fn fetch_recommendations_pages(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+        store: Option<&StateStore>,
+        max_pages: usize,
+        merge_existing: bool,
+    ) -> Result<Vec<MediaItem>> {
+        let mut data = self
+            .post_innertube_with_cookies_and_user(
                 "browse",
                 json!({ "browseId": "FEwhat_to_watch" }),
                 cookies,
+                auth_user,
             )
             .await?;
-        let mixes = parse_recommended_mixes(&data);
+
+        let mut mixes = parse_recommended_mixes(&data);
         let mut items = parse_channel_videos(&data, "", "");
         let mut seen: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
         for item in parse_lockup_videos(&data) {
@@ -319,9 +377,87 @@ impl YouTubeClient {
                 items.push(item);
             }
         }
-        let mut combined: Vec<MediaItem> = mixes.into_iter().take(16).collect();
-        let mut combined_ids: HashSet<String> = combined.iter().map(|i| i.id.clone()).collect();
-        for item in items.into_iter().take(40) {
+
+        let mut page = 1usize;
+        while page < max_pages {
+            let Some(token) = extract_yt_continuation(&data) else {
+                break;
+            };
+            let Ok(next_data) = self
+                .post_innertube_with_cookies_and_user(
+                    "browse",
+                    json!({ "continuation": token }),
+                    cookies,
+                    auth_user,
+                )
+                .await
+            else {
+                break;
+            };
+            mixes.extend(parse_recommended_mixes(&next_data));
+            for item in parse_channel_videos(&next_data, "", "") {
+                if seen.insert(item.id.clone()) {
+                    items.push(item);
+                }
+            }
+            for item in parse_lockup_videos(&next_data) {
+                if seen.insert(item.id.clone()) {
+                    items.push(item);
+                }
+            }
+            data = next_data;
+            page += 1;
+        }
+
+        // Deprioritize recently watched videos (from local history) so refreshes surface fresh videos first.
+        let watched_ids: HashSet<String> = store
+            .and_then(|st| st.read().ok())
+            .map(|s| {
+                s.history
+                    .iter()
+                    .take(100)
+                    .filter_map(|h| {
+                        h.get("url")
+                            .or_else(|| h.get("target"))
+                            .and_then(Value::as_str)
+                            .and_then(extract_video_id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !watched_ids.is_empty() && !merge_existing {
+            let (fresh, watched): (Vec<MediaItem>, Vec<MediaItem>) = items
+                .into_iter()
+                .partition(|item| !watched_ids.contains(&item.id));
+            items = fresh;
+            items.extend(watched);
+        }
+
+        let mut combined: Vec<MediaItem> = Vec::new();
+        let mut combined_ids: HashSet<String> = HashSet::new();
+
+        if merge_existing {
+            if let Some(st) = store {
+                if let Ok(guard) = st.read() {
+                    for val in &guard.recommendations {
+                        if let Ok(existing) = serde_json::from_value::<MediaItem>(val.clone()) {
+                            if combined_ids.insert(existing.id.clone()) {
+                                combined.push(existing);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for mix in mixes.into_iter().take(20) {
+            if combined_ids.insert(mix.id.clone()) {
+                combined.push(mix);
+            }
+        }
+        let video_cap = if merge_existing { 120 } else { 60 };
+        for item in items.into_iter().take(video_cap) {
             if combined_ids.insert(item.id.clone()) {
                 combined.push(item);
             }
@@ -343,6 +479,171 @@ impl YouTubeClient {
         }
 
         Ok(combined)
+    }
+
+    /// Reports video playback and watchtime directly to YouTube's official playback tracking endpoints
+    /// (`/api/stats/playback` and `/api/stats/watchtime`) using authenticated cookies so YouTube's
+    /// Watch History and recommendation algorithm stay updated when watching in Playzi.
+    pub async fn report_watch_event(
+        &self,
+        video_id: &str,
+        event_type: &str,
+        current_time: f64,
+        duration: Option<f64>,
+        cpn: &str,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+    ) -> Result<bool> {
+        let Some(jar) = cookies else {
+            return Ok(false);
+        };
+        let Some(vid) = extract_video_id(video_id) else {
+            return Ok(false);
+        };
+        let cookie_header = jar.cookie_header_for_host("www.youtube.com");
+        if cookie_header.is_empty() {
+            return Ok(false);
+        }
+
+        let tracking = if let Some(cached) = self.tracking_cache.get(&vid) {
+            cached
+        } else {
+            let player = self
+                .post_innertube_with_cookies_and_user(
+                    "player",
+                    json!({ "videoId": vid }),
+                    Some(jar),
+                    auth_user,
+                )
+                .await?;
+            let playback_url = player
+                .pointer("/playbackTracking/videostatsPlaybackUrl/baseUrl")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let watchtime_url = player
+                .pointer("/playbackTracking/videostatsWatchtimeUrl/baseUrl")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let length_seconds = player
+                .pointer("/videoDetails/lengthSeconds")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| v.as_f64())
+                });
+            let info = PlaybackTrackingUrls {
+                playback_url,
+                watchtime_url,
+                length_seconds,
+            };
+            self.tracking_cache.set(vid.clone(), info.clone());
+            info
+        };
+
+        let cpn_clean = if cpn.trim().len() >= 8 {
+            cpn.trim().to_string()
+        } else {
+            format!("playzi{:010x}", chrono::Utc::now().timestamp_millis() & 0xffff_ffff_ff)
+        };
+        let len_secs = duration.or(tracking.length_seconds).unwrap_or(0.0).max(0.0);
+        let cmt = current_time.max(0.0);
+        let referer = format!("https://www.youtube.com/watch?v={vid}");
+
+        let mut reported = false;
+
+        if event_type == "start" {
+            if let Some(base_url) = tracking.playback_url.as_deref() {
+                if let Ok(mut parsed) = reqwest::Url::parse(base_url) {
+                    {
+                        let mut qp = parsed.query_pairs_mut();
+                        qp.append_pair("cpn", &cpn_clean);
+                        qp.append_pair("ver", "2");
+                        qp.append_pair("fmt", "251");
+                        qp.append_pair("fs", "0");
+                        qp.append_pair("rt", "0.5");
+                        qp.append_pair("euri", "");
+                        qp.append_pair("el", "detailpage");
+                        qp.append_pair("c", "WEB");
+                        qp.append_pair("cver", DEFAULT_WEB_CLIENT_VERSION);
+                        qp.append_pair("hl", &self.hl);
+                        qp.append_pair("gl", &self.gl);
+                    }
+                    let mut req = self
+                        .http
+                        .get(parsed)
+                        .header("Cookie", &cookie_header)
+                        .header("Referer", &referer)
+                        .header("Origin", "https://www.youtube.com")
+                        .header("X-Goog-AuthUser", auth_user.to_string());
+                    if let Some(auth) = jar.sapisidhash("https://www.youtube.com", chrono::Utc::now().timestamp()) {
+                        req = req.header("Authorization", auth);
+                    }
+                    if let Ok(resp) = req.send().await {
+                        if resp.status().is_success() {
+                            reported = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(base_url) = tracking.watchtime_url.as_deref() {
+            if let Ok(mut parsed) = reqwest::Url::parse(base_url) {
+                let state_str = match event_type {
+                    "ended" => "paused",
+                    "pause" => "paused",
+                    _ => "playing",
+                };
+                let et_val = if event_type == "start" {
+                    cmt.max(0.5)
+                } else {
+                    cmt.max(1.0)
+                };
+                let st_val = if event_type == "start" {
+                    0.0
+                } else {
+                    (et_val - 15.0).max(0.0)
+                };
+                {
+                    let mut qp = parsed.query_pairs_mut();
+                    qp.append_pair("cpn", &cpn_clean);
+                    qp.append_pair("ver", "2");
+                    qp.append_pair("fmt", "251");
+                    qp.append_pair("fs", "0");
+                    qp.append_pair("rt", &format!("{:.1}", et_val.max(0.5)));
+                    qp.append_pair("cmt", &format!("{:.1}", et_val));
+                    qp.append_pair("st", &format!("{:.1}", st_val));
+                    qp.append_pair("et", &format!("{:.1}", et_val));
+                    if len_secs > 0.0 {
+                        qp.append_pair("len", &format!("{:.1}", len_secs));
+                    }
+                    qp.append_pair("state", state_str);
+                    qp.append_pair("final", if event_type == "ended" { "1" } else { "0" });
+                    qp.append_pair("el", "detailpage");
+                    qp.append_pair("c", "WEB");
+                    qp.append_pair("cver", DEFAULT_WEB_CLIENT_VERSION);
+                    qp.append_pair("hl", &self.hl);
+                    qp.append_pair("gl", &self.gl);
+                }
+                let mut req = self
+                    .http
+                    .get(parsed)
+                    .header("Cookie", &cookie_header)
+                    .header("Referer", &referer)
+                    .header("Origin", "https://www.youtube.com")
+                    .header("X-Goog-AuthUser", auth_user.to_string());
+                if let Some(auth) = jar.sapisidhash("https://www.youtube.com", chrono::Utc::now().timestamp()) {
+                    req = req.header("Authorization", auth);
+                }
+                if let Ok(resp) = req.send().await {
+                    if resp.status().is_success() {
+                        reported = true;
+                    }
+                }
+            }
+        }
+
+        Ok(reported)
     }
 
     /// Fetches YouTube Radio Mix (`RD<videoId>`) items via `/youtubei/v1/next`, skipping the seed video.
@@ -819,6 +1120,8 @@ pub fn resolve_channel_base(url: &str) -> Result<String> {
         } else {
             clean = format!("https://www.youtube.com/@{}", clean.trim_start_matches('@'));
         }
+    } else if clean.contains("music.youtube.com/") {
+        clean = clean.replace("music.youtube.com/", "www.youtube.com/");
     }
     let stripped = tab_re.replace(&clean, "").trim_end_matches('/').to_string();
     Ok(stripped)
@@ -871,12 +1174,30 @@ fn extract_uc_id(base_url: &str) -> Option<String> {
 fn tab_params(tab: &str) -> Option<&'static str> {
     match tab {
         "videos" => Some("EgZ2aWRlb3PyBgQKAjoA"),
-        "shorts" => Some("EgZzaG9ydHPyBgUKA5oBAA%3D%3D"),
-        "streams" => Some("EgdzdHJlYW1z8gYECgJ6AA%3D%3D"),
+        "shorts" => Some("EgZzaG9ydHPyBgUKA5oBAA=="),
+        "streams" => Some("EgdzdHJlYW1z8gYECgJ6AA=="),
         "playlists" => Some("EglwbGF5bGlzdHPyBgQKAkIA"),
         "releases" => Some("EghyZWxlYXNlc_IGBQoDsgEA"),
         _ => None,
     }
+}
+
+fn extract_yt_continuation(data: &Value) -> Option<String> {
+    for node in walk_renderers(data, "continuationCommand") {
+        if let Some(tok) = node.get("token").and_then(Value::as_str) {
+            if !tok.is_empty() {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    for node in walk_renderers(data, "nextContinuationData") {
+        if let Some(tok) = node.get("continuation").and_then(Value::as_str) {
+            if !tok.is_empty() {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn find_followed_channel(
@@ -946,6 +1267,47 @@ fn parse_channel_videos(data: &Value, channel_name: &str, channel_id: &str) -> V
                 }
             }
         }
+    }
+    // Also parse modern lockupViewModel and shortsLockupViewModel used on channel Videos/Streams/Shorts tabs
+    for mut item in parse_lockup_videos(data) {
+        if (item.channel.is_empty() || item.channel == "YouTube") && fallback_channel.is_some() {
+            item.channel = fallback_channel.unwrap().to_string();
+        }
+        if item.channel_url.is_none() && fallback_url.is_some() {
+            item.channel_url = fallback_url.clone();
+        }
+        if seen.insert(item.id.clone()) {
+            items.push(item);
+        }
+    }
+    for shorts in walk_renderers(data, "shortsLockupViewModel") {
+        let vid = shorts
+            .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if vid.len() != 11 || !seen.insert(vid.to_string()) {
+            continue;
+        }
+        let title = shorts
+            .pointer("/overlayMetadata/primaryText/content")
+            .and_then(Value::as_str)
+            .unwrap_or("Short")
+            .to_string();
+        let thumbnail = lockup_thumbnail(shorts).or_else(|| Some(default_thumbnail(vid)));
+        items.push(MediaItem {
+            id: vid.to_string(),
+            url: format!("https://www.youtube.com/shorts/{vid}"),
+            title,
+            channel: fallback_channel.unwrap_or("YouTube").to_string(),
+            channel_url: fallback_url.clone(),
+            duration: None,
+            duration_text: "Short".into(),
+            thumbnail,
+            view_count: None,
+            live: false,
+            members_only: is_members_only_renderer(shorts),
+            result_type: Some("short".into()),
+        });
     }
     items
 }

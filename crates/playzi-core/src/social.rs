@@ -160,6 +160,61 @@ pub fn normalize_hub_ws_base(raw: &str) -> Option<String> {
     Some(parsed.to_string().trim_end_matches('/').to_string())
 }
 
+pub fn normalize_hub_http_base(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        trimmed.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        format!("https://{trimmed}")
+    };
+
+    let mut parsed = Url::parse(&with_scheme).ok()?;
+    let clean_path = {
+        let path = parsed.path().trim_end_matches('/');
+        path.strip_suffix("/social/ws")
+            .or_else(|| path.strip_suffix("/api/social"))
+            .or_else(|| path.strip_suffix("/api/room"))
+            .or_else(|| path.strip_suffix("/api/health"))
+            .or_else(|| path.strip_suffix("/ws"))
+            .unwrap_or(path)
+            .to_string()
+    };
+    parsed.set_path(&clean_path);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+/// Detects whether a configured Hub URL uses the Vercel HTTP serverless transport (`/api/health` -> `transport: "http"`).
+pub async fn detect_http_hub(http: &reqwest::Client, raw: &str) -> Option<String> {
+    let base = normalize_hub_http_base(raw)?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains(".vercel.app") || lower.contains("/api/room") || lower.contains("/api/social") {
+        return Some(base);
+    }
+    let health_url = format!("{base}/api/health");
+    let resp = tokio::time::timeout(Duration::from_secs(4), http.get(&health_url).send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<Value>().await.ok()?;
+    if body.get("transport").and_then(Value::as_str) == Some("http") {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 pub fn build_relay_ws_url(hub_url: &str, room_code: &str, role: Option<&str>) -> Option<String> {
     let base = normalize_hub_ws_base(hub_url)?;
     let mut parsed = Url::parse(&format!("{base}/ws")).ok()?;
@@ -497,6 +552,165 @@ impl SocialManager {
                     continue;
                 };
 
+                let http_client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(12))
+                    .build()
+                    .unwrap_or_default();
+
+                if let Some(http_base) = detect_http_hub(&http_client, &raw_hub).await {
+                    let social_endpoint = format!("{http_base}/api/social");
+                    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+
+                    let initial_res = http_client
+                        .post(&social_endpoint)
+                        .json(&json!({
+                            "userId": profile.user_id,
+                            "displayName": profile.display_name,
+                            "googleAccountName": profile.google_account_name,
+                            "action": "sync",
+                        }))
+                        .send()
+                        .await;
+
+                    match initial_res {
+                        Ok(resp) if resp.status().is_success() => {
+                            let body = resp.json::<Value>().await.ok();
+                            let published_room = {
+                                let mut rt = manager.inner.runtime.write().await;
+                                rt.connected = true;
+                                rt.hub_url = raw_hub.clone();
+                                rt.last_error.clear();
+                                rt.outbound_tx = Some(outbound_tx.clone());
+                                rt.published_room.clone()
+                            };
+                            if let Some(val) = body {
+                                manager.apply_http_social_response(&val).await;
+                            } else {
+                                manager.emit_snapshot().await;
+                            }
+                            if let Some(room) = published_room {
+                                let _ = outbound_tx.send(json!({
+                                    "type": "room_presence_update",
+                                    "room": room,
+                                }));
+                            }
+                        }
+                        Ok(resp) => {
+                            {
+                                let mut rt = manager.inner.runtime.write().await;
+                                rt.connected = false;
+                                rt.hub_url = raw_hub.clone();
+                                rt.outbound_tx = None;
+                                rt.last_error = format!("Hub Social HTTP error ({})", resp.status());
+                            }
+                            manager.emit_snapshot().await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(6)) => {}
+                                res = reconnect_rx.changed() => {
+                                    if res.is_err() { break; }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            {
+                                let mut rt = manager.inner.runtime.write().await;
+                                rt.connected = false;
+                                rt.hub_url = raw_hub.clone();
+                                rt.outbound_tx = None;
+                                rt.last_error = format!("No se pudo conectar al Hub Social (Vercel): {e}");
+                            }
+                            manager.emit_snapshot().await;
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(6)) => {}
+                                res = reconnect_rx.changed() => {
+                                    if res.is_err() { break; }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    let mut poll_interval = tokio::time::interval(Duration::from_secs(3));
+                    poll_interval.tick().await;
+                    let mut consecutive_errors = 0u32;
+
+                    loop {
+                        tokio::select! {
+                            res = reconnect_rx.changed() => {
+                                let _ = res;
+                                break;
+                            }
+                            maybe_msg = outbound_rx.recv() => {
+                                let Some(val) = maybe_msg else { break; };
+                                let action = val.get("type").and_then(Value::as_str).unwrap_or("sync");
+                                if action == "ping" {
+                                    continue;
+                                }
+                                let resp = http_client
+                                    .post(&social_endpoint)
+                                    .json(&json!({
+                                        "userId": profile.user_id,
+                                        "displayName": profile.display_name,
+                                        "googleAccountName": profile.google_account_name,
+                                        "action": action,
+                                        "payload": val,
+                                    }))
+                                    .send()
+                                    .await;
+                                if let Ok(r) = resp && r.status().is_success() {
+                                    consecutive_errors = 0;
+                                    if let Ok(body) = r.json::<Value>().await {
+                                        manager.apply_http_social_response(&body).await;
+                                    }
+                                }
+                            }
+                            _ = poll_interval.tick() => {
+                                let resp = http_client
+                                    .post(&social_endpoint)
+                                    .json(&json!({
+                                        "userId": profile.user_id,
+                                        "displayName": profile.display_name,
+                                        "googleAccountName": profile.google_account_name,
+                                        "action": "sync",
+                                    }))
+                                    .send()
+                                    .await;
+                                match resp {
+                                    Ok(r) if r.status().is_success() => {
+                                        consecutive_errors = 0;
+                                        if let Ok(body) = r.json::<Value>().await {
+                                            manager.apply_http_social_response(&body).await;
+                                        }
+                                    }
+                                    _ => {
+                                        consecutive_errors += 1;
+                                        if consecutive_errors >= 4 {
+                                            let mut rt = manager.inner.runtime.write().await;
+                                            rt.last_error = "Conexión perdida con Hub Social (Vercel).".to_string();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    {
+                        let mut rt = manager.inner.runtime.write().await;
+                        rt.connected = false;
+                        rt.outbound_tx = None;
+                    }
+                    manager.emit_snapshot().await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                        res = reconnect_rx.changed() => {
+                            if res.is_err() { break; }
+                        }
+                    }
+                    continue;
+                }
+
                 let mut url = match Url::parse(&format!("{ws_base}/social/ws")) {
                     Ok(u) => u,
                     Err(e) => {
@@ -637,6 +851,28 @@ impl SocialManager {
                 }
             }
         });
+    }
+
+    async fn apply_http_social_response(&self, body: &Value) {
+        if let Some(sync_val) = body.get("sync") {
+            if let Ok(txt) = serde_json::to_string(sync_val) {
+                self.handle_incoming_text(&txt).await;
+            }
+        }
+        if let Some(events) = body.get("events").and_then(Value::as_array) {
+            for ev in events {
+                if let Ok(txt) = serde_json::to_string(ev) {
+                    self.handle_incoming_text(&txt).await;
+                }
+            }
+        }
+        if let Some(notice) = body.get("notice") {
+            let level = notice.get("level").and_then(Value::as_str).unwrap_or("info");
+            let message = notice.get("message").and_then(Value::as_str).unwrap_or("");
+            if !message.is_empty() {
+                self.emit_notice(level, message);
+            }
+        }
     }
 
     async fn handle_incoming_text(&self, text: &str) {

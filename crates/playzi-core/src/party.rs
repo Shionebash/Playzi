@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::config::ConfigStore;
 use crate::error::{CoreError, Result};
-use crate::social::build_relay_ws_url;
+use crate::social::{build_relay_ws_url, detect_http_hub, normalize_hub_http_base};
 use crate::state::{FriendRecord, StateStore, UserProfile};
 
 pub const DEFAULT_PARTY_PORT: u16 = 8766;
@@ -64,12 +64,23 @@ impl From<&UserProfile> for PartyUserRef {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
+pub struct ParticipantPermissions {
+    pub can_seek: bool,
+    pub can_play_pause: bool,
+    pub can_remove_queue: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct PartyParticipant {
     pub user_id: String,
     pub display_name: String,
     pub google_account_name: String,
     pub is_host: bool,
     pub can_queue: bool,
+    pub can_seek: bool,
+    pub can_play_pause: bool,
+    pub can_remove_queue: bool,
     pub joined_at: String,
 }
 
@@ -105,6 +116,7 @@ pub struct PartyPlaybackState {
     pub is_playing: bool,
     pub position_secs: f64,
     pub updated_at_ms: i64,
+    pub updated_by: String,
     pub playback_rate: f64,
     pub repeat: String,
     pub shuffle: bool,
@@ -118,6 +130,7 @@ impl Default for PartyPlaybackState {
             is_playing: false,
             position_secs: 0.0,
             updated_at_ms: Utc::now().timestamp_millis(),
+            updated_by: String::new(),
             playback_rate: 1.0,
             repeat: "none".to_string(),
             shuffle: false,
@@ -160,6 +173,9 @@ pub struct PartyRoomSnapshot {
     pub queue_policy: QueuePolicy,
     pub allowed_queue_user_ids: Vec<String>,
     pub can_self_queue: bool,
+    pub can_self_seek: bool,
+    pub can_self_play_pause: bool,
+    pub can_self_remove_queue: bool,
     pub self_user_id: String,
     pub participants: Vec<PartyParticipant>,
     pub queue: Vec<PartyQueueItem>,
@@ -218,6 +234,15 @@ pub struct PolicyUpdateRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct ParticipantPermissionsUpdateRequest {
+    pub user_id: String,
+    pub can_seek: Option<bool>,
+    pub can_play_pause: Option<bool>,
+    pub can_remove_queue: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct FriendUpsertRequest {
     pub user_id: String,
     pub display_name: String,
@@ -242,6 +267,13 @@ enum ClientMessage {
     AddQueue {
         item: AddQueueItemInput,
         play_next: bool,
+    },
+    RemoveQueue {
+        index: usize,
+    },
+    PlaybackControl {
+        is_playing: Option<bool>,
+        position_secs: Option<f64>,
     },
     Ping {
         sent_at_ms: i64,
@@ -287,6 +319,7 @@ struct HostSessionState {
     public_ws_url: String,
     queue_policy: QueuePolicy,
     allowed_queue_user_ids: HashSet<String>,
+    user_permissions: HashMap<String, ParticipantPermissions>,
     queue: Vec<PartyQueueItem>,
     playback: PartyPlaybackState,
     clients: HashMap<String, ConnectedClient>,
@@ -674,6 +707,55 @@ impl HostSessionState {
         }
     }
 
+    fn permissions_for(&self, user_id: &str) -> ParticipantPermissions {
+        if user_id == self.host_user.user_id {
+            return ParticipantPermissions {
+                can_seek: true,
+                can_play_pause: true,
+                can_remove_queue: true,
+            };
+        }
+        self.user_permissions
+            .get(user_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn can_user_seek(&self, user_id: &str) -> bool {
+        self.permissions_for(user_id).can_seek
+    }
+
+    fn can_user_play_pause(&self, user_id: &str) -> bool {
+        self.permissions_for(user_id).can_play_pause
+    }
+
+    fn can_user_remove_queue(&self, user_id: &str) -> bool {
+        self.permissions_for(user_id).can_remove_queue
+    }
+
+    fn remove_queue_at(&mut self, index: usize, actor_user_id: &str) -> Result<PartyQueueItem> {
+        if index >= self.queue.len() {
+            return Err(CoreError::Validation("Índice fuera de rango".to_string()));
+        }
+        let removed = self.queue.remove(index);
+        if self.queue.is_empty() {
+            self.playback.current_index = None;
+            self.playback.is_playing = false;
+            self.playback.position_secs = 0.0;
+        } else if let Some(cur) = self.playback.current_index {
+            if index < cur {
+                self.playback.current_index = Some(cur - 1);
+            } else if index == cur {
+                self.playback.current_index = Some(cur.min(self.queue.len() - 1));
+                self.playback.position_secs = 0.0;
+            }
+        }
+        self.playback.updated_at_ms = Utc::now().timestamp_millis();
+        self.playback.updated_by = actor_user_id.to_string();
+        self.playback.version += 1;
+        Ok(removed)
+    }
+
     fn wire_state(&self) -> WireRoomState {
         let mut participants = Vec::with_capacity(self.clients.len() + 1);
         participants.push(PartyParticipant {
@@ -682,18 +764,25 @@ impl HostSessionState {
             google_account_name: self.host_user.google_account_name.clone(),
             is_host: true,
             can_queue: true,
+            can_seek: true,
+            can_play_pause: true,
+            can_remove_queue: true,
             joined_at: String::new(),
         });
 
         let mut guests: Vec<&ConnectedClient> = self.clients.values().collect();
         guests.sort_by(|a, b| a.joined_at.cmp(&b.joined_at));
         for client in guests {
+            let perms = self.permissions_for(&client.user.user_id);
             participants.push(PartyParticipant {
                 user_id: client.user.user_id.clone(),
                 display_name: client.user.display_name.clone(),
                 google_account_name: client.user.google_account_name.clone(),
                 is_host: false,
                 can_queue: self.can_user_queue(&client.user.user_id),
+                can_seek: perms.can_seek,
+                can_play_pause: perms.can_play_pause,
+                can_remove_queue: perms.can_remove_queue,
                 joined_at: client.joined_at.clone(),
             });
         }
@@ -739,6 +828,9 @@ impl HostSessionState {
             queue_policy: wire.queue_policy,
             allowed_queue_user_ids: wire.allowed_queue_user_ids,
             can_self_queue: true,
+            can_self_seek: true,
+            can_self_play_pause: true,
+            can_self_remove_queue: true,
             self_user_id: self.host_user.user_id.clone(),
             participants: wire.participants,
             queue: wire.queue,
@@ -813,11 +905,13 @@ impl HostSessionState {
 
 impl GuestSessionState {
     fn snapshot(&self) -> PartyRoomSnapshot {
-        let can_self_queue = self
+        let self_participant = self
             .wire_state
             .participants
             .iter()
-            .find(|p| p.user_id == self.self_user_id)
+            .find(|p| p.user_id == self.self_user_id);
+
+        let can_self_queue = self_participant
             .map(|p| p.can_queue)
             .unwrap_or_else(|| match self.wire_state.queue_policy {
                 QueuePolicy::HostOnly => false,
@@ -828,6 +922,11 @@ impl GuestSessionState {
                     .iter()
                     .any(|id| id == &self.self_user_id),
             });
+        let can_self_seek = self_participant.map(|p| p.can_seek).unwrap_or(false);
+        let can_self_play_pause = self_participant.map(|p| p.can_play_pause).unwrap_or(false);
+        let can_self_remove_queue = self_participant
+            .map(|p| p.can_remove_queue)
+            .unwrap_or(false);
 
         PartyRoomSnapshot {
             active: true,
@@ -852,6 +951,9 @@ impl GuestSessionState {
             queue_policy: self.wire_state.queue_policy,
             allowed_queue_user_ids: self.wire_state.allowed_queue_user_ids.clone(),
             can_self_queue,
+            can_self_seek,
+            can_self_play_pause,
+            can_self_remove_queue,
             self_user_id: self.self_user_id.clone(),
             participants: self.wire_state.participants.clone(),
             queue: self.wire_state.queue.clone(),
@@ -1004,6 +1106,7 @@ impl PartyManager {
             is_playing: req.initial_is_playing.unwrap_or(false) && current_index.is_some(),
             position_secs: req.initial_position_secs.unwrap_or(0.0).max(0.0),
             updated_at_ms: Utc::now().timestamp_millis(),
+            updated_by: host_user.user_id.clone(),
             playback_rate: 1.0,
             repeat: "none".to_string(),
             shuffle: false,
@@ -1022,6 +1125,7 @@ impl PartyManager {
             public_ws_url: public_ws_url.clone(),
             queue_policy: req.queue_policy.unwrap_or(QueuePolicy::All),
             allowed_queue_user_ids: allowed_set,
+            user_permissions: HashMap::new(),
             queue,
             playback,
             clients: HashMap::new(),
@@ -1073,11 +1177,22 @@ impl PartyManager {
             .map(|c| c.snapshot().social_hub_url)
             .unwrap_or_default();
 
-        if req.use_relay.unwrap_or(true) && !configured_hub.trim().is_empty() && public_ws_url.is_empty() {
+        let using_relay = req.use_relay.unwrap_or(true)
+            && !configured_hub.trim().is_empty()
+            && public_ws_url.is_empty();
+
+        if using_relay {
             self.spawn_host_relay(configured_hub, room_code, relay_shutdown_rx);
         }
 
-        if req.start_tunnel.unwrap_or(false) {
+        // If no online relay or public host is configured, auto-start Cloudflare Tunnel by default
+        // (unless the caller explicitly passed start_tunnel: Some(false)).
+        let should_start_tunnel = match req.start_tunnel {
+            Some(v) => v,
+            None => !using_relay && public_ws_url.is_empty(),
+        };
+
+        if should_start_tunnel {
             let _ = self.start_cloudflare_tunnel().await;
             return Ok(self.status().await);
         }
@@ -1180,15 +1295,180 @@ impl PartyManager {
         room_code: String,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
-        let Some(host_relay_url) = build_relay_ws_url(&hub_url, &room_code, Some("host")) else {
-            return;
-        };
-        let Some(guest_relay_url) = build_relay_ws_url(&hub_url, &room_code, None) else {
-            return;
-        };
         let manager = self.clone();
 
         tokio::spawn(async move {
+            let http_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(12))
+                .build()
+                .unwrap_or_default();
+
+            if let Some(http_base) = detect_http_hub(&http_client, &hub_url).await {
+                let room_endpoint = format!("{http_base}/api/room");
+                let public_room_url = format!("{room_endpoint}?room={room_code}");
+                let mut since_seq = 0u64;
+                let mut relay_guests: HashMap<
+                    String,
+                    (mpsc::UnboundedSender<ServerMessage>, Option<String>),
+                > = HashMap::new();
+                let (relay_out_tx, mut relay_out_rx) = mpsc::unbounded_channel::<Value>();
+                let mut marked_connected = false;
+                let mut poll_interval = tokio::time::interval(Duration::from_millis(450));
+
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = poll_interval.tick() => {
+                            let mut outgoing = Vec::new();
+                            while let Ok(item) = relay_out_rx.try_recv() {
+                                outgoing.push(item);
+                            }
+                            let resp = http_client
+                                .post(&room_endpoint)
+                                .json(&json!({
+                                    "action": "host_poll",
+                                    "room": room_code,
+                                    "since": since_seq,
+                                    "messages": outgoing,
+                                }))
+                                .send()
+                                .await;
+                            match resp {
+                                Ok(r) if r.status().is_success() => {
+                                    if !marked_connected {
+                                        marked_connected = true;
+                                        let mut mode = manager.inner.mode.write().await;
+                                        if let SessionMode::Host(host) = &mut *mode {
+                                            host.relay_connected = true;
+                                            host.relay_error.clear();
+                                            if host.public_ws_url.is_empty() || host.public_ws_url == public_room_url {
+                                                host.public_ws_url = public_room_url.clone();
+                                            }
+                                            let snap = host.snapshot();
+                                            drop(mode);
+                                            manager.emit_snapshot(snap);
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    if let Ok(body) = r.json::<Value>().await {
+                                        if let Some(seq) = body.get("seq").and_then(Value::as_u64) {
+                                            since_seq = seq;
+                                        }
+                                        if let Some(events) = body.get("events").and_then(Value::as_array) {
+                                            for val in events {
+                                                if let Some(conn_id) = val.get("relayOpen").and_then(Value::as_str) {
+                                                    let cid = conn_id.to_string();
+                                                    let (guest_tx, mut guest_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                                                    let rtx = relay_out_tx.clone();
+                                                    let cid_clone = cid.clone();
+                                                    tokio::spawn(async move {
+                                                        while let Some(smsg) = guest_rx.recv().await {
+                                                            if let Ok(payload) = serde_json::to_string(&smsg) {
+                                                                if rtx.send(json!({ "relayTo": cid_clone, "payload": payload })).is_err() {
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    });
+                                                    relay_guests.insert(cid, (guest_tx, None));
+                                                } else if let Some(conn_id) = val.get("relayFrom").and_then(Value::as_str)
+                                                    && let Some(payload) = val.get("payload").and_then(Value::as_str)
+                                                {
+                                                    if !relay_guests.contains_key(conn_id) {
+                                                        let cid = conn_id.to_string();
+                                                        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                                                        let rtx = relay_out_tx.clone();
+                                                        let cid_clone = cid.clone();
+                                                        tokio::spawn(async move {
+                                                            while let Some(smsg) = guest_rx.recv().await {
+                                                                if let Ok(p) = serde_json::to_string(&smsg) {
+                                                                    if rtx.send(json!({ "relayTo": cid_clone, "payload": p })).is_err() {
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        });
+                                                        relay_guests.insert(cid, (guest_tx, None));
+                                                    }
+                                                    if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(payload)
+                                                        && let Some((guest_tx, reg_uid)) = relay_guests.get_mut(conn_id)
+                                                    {
+                                                        let _ = manager
+                                                            .handle_client_message(client_msg, guest_tx, reg_uid)
+                                                            .await;
+                                                    }
+                                                } else if let Some(conn_id) = val.get("relayClose").or_else(|| val.get("relayClosed")).and_then(Value::as_str)
+                                                    && let Some((_, reg_uid)) = relay_guests.remove(conn_id)
+                                                    && let Some(uid) = reg_uid
+                                                {
+                                                    manager.unregister_client(&uid).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(r) => {
+                                    if marked_connected {
+                                        marked_connected = false;
+                                    }
+                                    let mut mode = manager.inner.mode.write().await;
+                                    if let SessionMode::Host(host) = &mut *mode {
+                                        host.relay_connected = false;
+                                        host.relay_error = format!("Relay Vercel HTTP error ({})", r.status());
+                                        let snap = host.snapshot();
+                                        drop(mode);
+                                        manager.emit_snapshot(snap);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    if marked_connected {
+                                        marked_connected = false;
+                                    }
+                                    let mut mode = manager.inner.mode.write().await;
+                                    if let SessionMode::Host(host) = &mut *mode {
+                                        host.relay_connected = false;
+                                        host.relay_error = format!("Relay Vercel desconectado: {e}");
+                                        let snap = host.snapshot();
+                                        drop(mode);
+                                        manager.emit_snapshot(snap);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (_, (_, reg_uid)) in relay_guests.drain() {
+                    if let Some(uid) = reg_uid {
+                        manager.unregister_client(&uid).await;
+                    }
+                }
+                let mut mode = manager.inner.mode.write().await;
+                if let SessionMode::Host(host) = &mut *mode {
+                    host.relay_connected = false;
+                    let snap = host.snapshot();
+                    drop(mode);
+                    manager.emit_snapshot(snap);
+                }
+                return;
+            }
+
+            let Some(host_relay_url) = build_relay_ws_url(&hub_url, &room_code, Some("host")) else {
+                return;
+            };
+            let Some(guest_relay_url) = build_relay_ws_url(&hub_url, &room_code, None) else {
+                return;
+            };
+
             loop {
                 if *shutdown_rx.borrow() {
                     break;
@@ -1626,6 +1906,105 @@ impl PartyManager {
                 }
                 true
             }
+            ClientMessage::RemoveQueue { index } => {
+                let Some(uid) = registered_user_id.clone() else {
+                    return true;
+                };
+                let mut mode = self.inner.mode.write().await;
+                let SessionMode::Host(host) = &mut *mode else {
+                    return false;
+                };
+                if !host.can_user_remove_queue(&uid) {
+                    let _ = out_tx.send(ServerMessage::ActionResult {
+                        ok: false,
+                        action: "remove_queue".to_string(),
+                        message: "El host no ha habilitado permisos para quitar videos de la cola"
+                            .to_string(),
+                    });
+                    return true;
+                }
+                let uname = host
+                    .clients
+                    .get(&uid)
+                    .map(|c| c.user.display_name.clone())
+                    .unwrap_or_else(|| uid.clone());
+                match host.remove_queue_at(index, &uid) {
+                    Ok(removed) => {
+                        let _ = out_tx.send(ServerMessage::ActionResult {
+                            ok: true,
+                            action: "remove_queue".to_string(),
+                            message: format!("Quitado de la cola: {}", removed.title),
+                        });
+                        host.broadcast_state();
+                        let snap = host.snapshot();
+                        drop(mode);
+                        self.emit_snapshot(snap);
+                        self.emit_notice(
+                            "info",
+                            format!("{uname} quitó \"{}\" de la cola", removed.title),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(ServerMessage::ActionResult {
+                            ok: false,
+                            action: "remove_queue".to_string(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+                true
+            }
+            ClientMessage::PlaybackControl {
+                is_playing,
+                position_secs,
+            } => {
+                let Some(uid) = registered_user_id.clone() else {
+                    return true;
+                };
+                let mut mode = self.inner.mode.write().await;
+                let SessionMode::Host(host) = &mut *mode else {
+                    return false;
+                };
+                if is_playing.is_some() && !host.can_user_play_pause(&uid) {
+                    let _ = out_tx.send(ServerMessage::ActionResult {
+                        ok: false,
+                        action: "playback".to_string(),
+                        message: "El host no te ha dado permiso para pausar o reproducir"
+                            .to_string(),
+                    });
+                    return true;
+                }
+                if position_secs.is_some() && !host.can_user_seek(&uid) {
+                    let _ = out_tx.send(ServerMessage::ActionResult {
+                        ok: false,
+                        action: "playback".to_string(),
+                        message: "El host no te ha dado permiso para adelantar o retroceder"
+                            .to_string(),
+                    });
+                    return true;
+                }
+                let mut changed = false;
+                if let Some(playing) = is_playing {
+                    host.playback.is_playing = playing;
+                    changed = true;
+                }
+                if let Some(pos) = position_secs
+                    && pos.is_finite()
+                {
+                    host.playback.position_secs = pos.max(0.0);
+                    changed = true;
+                }
+                if changed {
+                    host.playback.updated_at_ms = Utc::now().timestamp_millis();
+                    host.playback.updated_by = uid;
+                    host.playback.version += 1;
+                    host.broadcast_state();
+                    let snap = host.snapshot();
+                    drop(mode);
+                    self.emit_snapshot(snap);
+                }
+                true
+            }
             ClientMessage::Ping { sent_at_ms } => {
                 let _ = out_tx.send(ServerMessage::Pong {
                     sent_at_ms,
@@ -1706,7 +2085,222 @@ impl PartyManager {
     pub async fn join_session(&self, req: JoinSessionRequest) -> Result<PartyRoomSnapshot> {
         self.leave_or_stop().await;
 
-        let (ws_url, room_code) = parse_invite_input(&req.invite, req.room_code.as_deref())?;
+        let raw_invite = req.invite.trim();
+        let is_bare_room_code = !raw_invite.is_empty()
+            && raw_invite.len() <= 12
+            && raw_invite.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .build()
+            .unwrap_or_default();
+
+        // Check if joining via a Vercel HTTP room relay (either by bare code with Vercel hub, or full /api/room URL)
+        let http_room_target: Option<(String, String)> = if is_bare_room_code {
+            let hub_url = self
+                .inner
+                .config
+                .as_ref()
+                .map(|c| c.snapshot().social_hub_url)
+                .unwrap_or_default();
+            if let Some(http_base) = detect_http_hub(&http_client, &hub_url).await {
+                Some((format!("{http_base}/api/room"), raw_invite.to_uppercase()))
+            } else {
+                None
+            }
+        } else if raw_invite.contains("/api/room") || raw_invite.to_ascii_lowercase().contains(".vercel.app") {
+            let parsed_url = Url::parse(raw_invite).ok();
+            let code_from_query = parsed_url
+                .as_ref()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "room")
+                        .map(|(_, v)| v.trim().to_uppercase())
+                })
+                .filter(|s| !s.is_empty())
+                .or_else(|| req.room_code.as_deref().map(|s| s.trim().to_uppercase()));
+            if let (Some(base), Some(code)) = (normalize_hub_http_base(raw_invite), code_from_query) {
+                Some((format!("{base}/api/room"), code))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((room_endpoint, room_code)) = http_room_target {
+            let profile = ensure_user_profile(&self.inner.state_store)?;
+            let user_ref = PartyUserRef::from(&profile);
+            let invite_url = format!("{room_endpoint}?room={room_code}");
+
+            let join_resp = http_client
+                .post(&room_endpoint)
+                .json(&json!({
+                    "action": "guest_join",
+                    "room": room_code,
+                }))
+                .send()
+                .await
+                .map_err(|e| CoreError::External(format!("No se pudo conectar al Hub Vercel: {e}")))?;
+            if !join_resp.status().is_success() {
+                return Err(CoreError::External(format!(
+                    "Hub Vercel rechazó la conexión (HTTP {})",
+                    join_resp.status()
+                )));
+            }
+            let join_body = join_resp
+                .json::<Value>()
+                .await
+                .map_err(|e| CoreError::External(format!("Respuesta inválida del Hub Vercel: {e}")))?;
+            let conn_id = join_body
+                .get("connId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CoreError::External("Hub Vercel no devolvió connId".into()))?
+                .to_string();
+            let mut since_seq = join_body.get("seq").and_then(Value::as_u64).unwrap_or(0);
+
+            let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
+            let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+            let _ = outbound_tx.send(ClientMessage::Hello {
+                room_code: room_code.clone(),
+                user: user_ref.clone(),
+            });
+
+            let guest = GuestSessionState {
+                room_code: room_code.clone(),
+                invite_url: invite_url.clone(),
+                self_user_id: user_ref.user_id.clone(),
+                connected: true,
+                wire_state: WireRoomState {
+                    room_code: room_code.clone(),
+                    ..Default::default()
+                },
+                last_error: String::new(),
+                outbound_tx,
+                shutdown_tx,
+            };
+            let initial_snap = guest.snapshot();
+            {
+                let mut mode = self.inner.mode.write().await;
+                *mode = SessionMode::Guest(guest);
+            }
+            self.emit_snapshot(initial_snap.clone());
+
+            let manager = self.clone();
+            tokio::spawn(async move {
+                let mut poll_interval = tokio::time::interval(Duration::from_millis(450));
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = poll_interval.tick() => {
+                            let mut outgoing = Vec::new();
+                            while let Ok(msg) = outbound_rx.try_recv() {
+                                if let Ok(txt) = serde_json::to_string(&msg) {
+                                    outgoing.push(txt);
+                                }
+                            }
+                            let resp = http_client
+                                .post(&room_endpoint)
+                                .json(&json!({
+                                    "action": "guest_poll",
+                                    "room": room_code,
+                                    "connId": conn_id,
+                                    "since": since_seq,
+                                    "messages": outgoing,
+                                }))
+                                .send()
+                                .await;
+                            let Ok(r) = resp else { continue; };
+                            if !r.status().is_success() {
+                                continue;
+                            }
+                            let Ok(body) = r.json::<Value>().await else { continue; };
+                            if let Some(seq) = body.get("seq").and_then(Value::as_u64) {
+                                since_seq = seq;
+                            }
+                            if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
+                                for m in msgs {
+                                    let Some(text) = m.as_str() else { continue; };
+                                    if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(text) {
+                                        match server_msg {
+                                            ServerMessage::Welcome { self_user_id, state, .. } => {
+                                                let mut mode = manager.inner.mode.write().await;
+                                                if let SessionMode::Guest(g) = &mut *mode {
+                                                    g.self_user_id = self_user_id;
+                                                    g.connected = true;
+                                                    g.wire_state = state;
+                                                    g.last_error.clear();
+                                                    let snap = g.snapshot();
+                                                    drop(mode);
+                                                    manager.emit_snapshot(snap);
+                                                }
+                                            }
+                                            ServerMessage::StateSync { state } => {
+                                                let mut mode = manager.inner.mode.write().await;
+                                                if let SessionMode::Guest(g) = &mut *mode {
+                                                    g.wire_state = state;
+                                                    let snap = g.snapshot();
+                                                    drop(mode);
+                                                    manager.emit_snapshot(snap);
+                                                }
+                                            }
+                                            ServerMessage::ActionResult { ok, message, .. } => {
+                                                manager.emit_notice(if ok { "ok" } else { "error" }, message);
+                                            }
+                                            ServerMessage::RoomClosed { reason } => {
+                                                let mut mode = manager.inner.mode.write().await;
+                                                *mode = SessionMode::Idle;
+                                                drop(mode);
+                                                let idle = manager.status().await;
+                                                manager.emit_snapshot(idle);
+                                                manager.emit_notice("error", reason);
+                                                return;
+                                            }
+                                            ServerMessage::Pong { .. } => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = http_client
+                    .post(&room_endpoint)
+                    .json(&json!({
+                        "action": "guest_leave",
+                        "room": room_code,
+                        "connId": conn_id,
+                    }))
+                    .send()
+                    .await;
+            });
+
+            return Ok(initial_snap);
+        }
+
+        let (ws_url, room_code) = if is_bare_room_code {
+            let hub_url = self
+                .inner
+                .config
+                .as_ref()
+                .map(|c| c.snapshot().social_hub_url)
+                .unwrap_or_default();
+            if let Some(relay_url) = build_relay_ws_url(&hub_url, raw_invite, None) {
+                (relay_url, raw_invite.to_uppercase())
+            } else {
+                return Err(CoreError::Validation(
+                    "Para unirte solo con el código de sala necesitas estar conectado al servicio online, o pega el enlace completo de la sala."
+                        .to_string(),
+                ));
+            }
+        } else {
+            parse_invite_input(raw_invite, req.room_code.as_deref())?
+        };
         let profile = ensure_user_profile(&self.inner.state_store)?;
         let user_ref = PartyUserRef::from(&profile);
 
@@ -1930,75 +2524,107 @@ impl PartyManager {
 
     pub async fn remove_queue_item(&self, index: usize) -> Result<PartyRoomSnapshot> {
         let mut mode = self.inner.mode.write().await;
-        let SessionMode::Host(host) = &mut *mode else {
-            return Err(CoreError::Validation(
-                "Solo el host puede eliminar elementos de la cola".to_string(),
-            ));
-        };
-        if index >= host.queue.len() {
-            return Err(CoreError::Validation("Índice fuera de rango".to_string()));
-        }
-        host.queue.remove(index);
-        if host.queue.is_empty() {
-            host.playback.current_index = None;
-            host.playback.is_playing = false;
-            host.playback.position_secs = 0.0;
-        } else if let Some(cur) = host.playback.current_index {
-            if index < cur {
-                host.playback.current_index = Some(cur - 1);
-            } else if index == cur {
-                host.playback.current_index = Some(cur.min(host.queue.len() - 1));
-                host.playback.position_secs = 0.0;
+        match &mut *mode {
+            SessionMode::Idle => Err(CoreError::Validation(
+                "No estás en una sesión compartida".to_string(),
+            )),
+            SessionMode::Host(host) => {
+                let host_uid = host.host_user.user_id.clone();
+                host.remove_queue_at(index, &host_uid)?;
+                host.broadcast_state();
+                let snap = host.snapshot();
+                drop(mode);
+                self.emit_snapshot(snap.clone());
+                Ok(snap)
+            }
+            SessionMode::Guest(guest) => {
+                let snap = guest.snapshot();
+                if !snap.can_self_remove_queue {
+                    return Err(CoreError::Validation(
+                        "El host no te ha dado permiso para quitar videos de la cola".to_string(),
+                    ));
+                }
+                guest
+                    .outbound_tx
+                    .send(ClientMessage::RemoveQueue { index })
+                    .map_err(|_| {
+                        CoreError::External("No se pudo enviar la solicitud al host".to_string())
+                    })?;
+                Ok(snap)
             }
         }
-        host.playback.updated_at_ms = Utc::now().timestamp_millis();
-        host.playback.version += 1;
-        host.broadcast_state();
-        let snap = host.snapshot();
-        drop(mode);
-        self.emit_snapshot(snap.clone());
-        Ok(snap)
     }
 
     pub async fn sync_playback(&self, update: PlaybackSyncUpdate) -> Result<PartyRoomSnapshot> {
         let mut mode = self.inner.mode.write().await;
-        let SessionMode::Host(host) = &mut *mode else {
-            return Err(CoreError::Validation(
-                "Solo el host puede controlar la reproducción sincronizada".to_string(),
-            ));
-        };
-        if let Some(idx) = update.current_index {
-            if idx < host.queue.len() {
-                host.playback.current_index = Some(idx);
+        match &mut *mode {
+            SessionMode::Idle => Err(CoreError::Validation(
+                "No estás en una sesión compartida".to_string(),
+            )),
+            SessionMode::Host(host) => {
+                if let Some(idx) = update.current_index {
+                    if idx < host.queue.len() {
+                        host.playback.current_index = Some(idx);
+                    }
+                }
+                if let Some(playing) = update.is_playing {
+                    host.playback.is_playing = playing;
+                }
+                if let Some(pos) = update.position_secs
+                    && pos.is_finite()
+                {
+                    host.playback.position_secs = pos.max(0.0);
+                }
+                if let Some(rate) = update.playback_rate
+                    && rate.is_finite()
+                    && rate > 0.0
+                {
+                    host.playback.playback_rate = rate;
+                }
+                if let Some(repeat) = update.repeat {
+                    host.playback.repeat = repeat;
+                }
+                if let Some(shuffle) = update.shuffle {
+                    host.playback.shuffle = shuffle;
+                }
+                host.playback.updated_at_ms = Utc::now().timestamp_millis();
+                host.playback.updated_by = host.host_user.user_id.clone();
+                host.playback.version += 1;
+                host.broadcast_state();
+                let snap = host.snapshot();
+                drop(mode);
+                self.emit_snapshot(snap.clone());
+                Ok(snap)
+            }
+            SessionMode::Guest(guest) => {
+                let snap = guest.snapshot();
+                if update.is_playing.is_some() && !snap.can_self_play_pause {
+                    return Err(CoreError::Validation(
+                        "El host no te ha dado permiso para pausar o reproducir".to_string(),
+                    ));
+                }
+                if update.position_secs.is_some() && !snap.can_self_seek {
+                    return Err(CoreError::Validation(
+                        "El host no te ha dado permiso para adelantar o retroceder".to_string(),
+                    ));
+                }
+                if update.is_playing.is_none() && update.position_secs.is_none() {
+                    return Err(CoreError::Validation(
+                        "Solo el host puede cambiar esa opción de reproducción".to_string(),
+                    ));
+                }
+                guest
+                    .outbound_tx
+                    .send(ClientMessage::PlaybackControl {
+                        is_playing: update.is_playing,
+                        position_secs: update.position_secs,
+                    })
+                    .map_err(|_| {
+                        CoreError::External("No se pudo enviar la solicitud al host".to_string())
+                    })?;
+                Ok(snap)
             }
         }
-        if let Some(playing) = update.is_playing {
-            host.playback.is_playing = playing;
-        }
-        if let Some(pos) = update.position_secs
-            && pos.is_finite()
-        {
-            host.playback.position_secs = pos.max(0.0);
-        }
-        if let Some(rate) = update.playback_rate
-            && rate.is_finite()
-            && rate > 0.0
-        {
-            host.playback.playback_rate = rate;
-        }
-        if let Some(repeat) = update.repeat {
-            host.playback.repeat = repeat;
-        }
-        if let Some(shuffle) = update.shuffle {
-            host.playback.shuffle = shuffle;
-        }
-        host.playback.updated_at_ms = Utc::now().timestamp_millis();
-        host.playback.version += 1;
-        host.broadcast_state();
-        let snap = host.snapshot();
-        drop(mode);
-        self.emit_snapshot(snap.clone());
-        Ok(snap)
     }
 
     pub async fn update_policy(&self, req: PolicyUpdateRequest) -> Result<PartyRoomSnapshot> {
@@ -2015,6 +2641,38 @@ impl PartyManager {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+        host.playback.version += 1;
+        host.broadcast_state();
+        let snap = host.snapshot();
+        drop(mode);
+        self.emit_snapshot(snap.clone());
+        Ok(snap)
+    }
+
+    pub async fn update_participant_permissions(
+        &self,
+        req: ParticipantPermissionsUpdateRequest,
+    ) -> Result<PartyRoomSnapshot> {
+        let mut mode = self.inner.mode.write().await;
+        let SessionMode::Host(host) = &mut *mode else {
+            return Err(CoreError::Validation(
+                "Solo el host puede cambiar los permisos de los usuarios".to_string(),
+            ));
+        };
+        let uid = req.user_id.trim().to_string();
+        if uid.is_empty() || uid == host.host_user.user_id {
+            return Err(CoreError::Validation("Usuario inválido".to_string()));
+        }
+        let perms = host.user_permissions.entry(uid).or_default();
+        if let Some(v) = req.can_seek {
+            perms.can_seek = v;
+        }
+        if let Some(v) = req.can_play_pause {
+            perms.can_play_pause = v;
+        }
+        if let Some(v) = req.can_remove_queue {
+            perms.can_remove_queue = v;
         }
         host.playback.version += 1;
         host.broadcast_state();
@@ -2192,6 +2850,69 @@ mod tests {
         let g_status = guest_mgr.status().await;
         assert!(g_status.playback.is_playing);
         assert!((g_status.playback.position_secs - 42.5).abs() < 0.01);
+        assert!(!g_status.can_self_seek);
+        assert!(!g_status.can_self_play_pause);
+        assert!(!g_status.can_self_remove_queue);
+
+        // Guest cannot seek, pause, or remove queue items without permissions
+        assert!(
+            guest_mgr
+                .sync_playback(PlaybackSyncUpdate {
+                    is_playing: Some(false),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            guest_mgr
+                .sync_playback(PlaybackSyncUpdate {
+                    position_secs: Some(90.0),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(guest_mgr.remove_queue_item(0).await.is_err());
+
+        // Host grants seek, play/pause, and remove_queue to guest
+        host_mgr
+            .update_participant_permissions(ParticipantPermissionsUpdateRequest {
+                user_id: guest_profile.user_id.clone(),
+                can_seek: Some(true),
+                can_play_pause: Some(true),
+                can_remove_queue: Some(true),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let g_status = guest_mgr.status().await;
+        assert!(g_status.can_self_seek);
+        assert!(g_status.can_self_play_pause);
+        assert!(g_status.can_self_remove_queue);
+
+        // Permitted guest pauses and seeks -> host receives updated playback state
+        guest_mgr
+            .sync_playback(PlaybackSyncUpdate {
+                is_playing: Some(false),
+                position_secs: Some(95.0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let h_status = host_mgr.status().await;
+        assert!(!h_status.playback.is_playing);
+        assert!((h_status.playback.position_secs - 95.0).abs() < 0.01);
+        assert_eq!(h_status.playback.updated_by, guest_profile.user_id);
+
+        // Permitted guest removes queue item -> queue becomes empty on host
+        guest_mgr.remove_queue_item(0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let h_status = host_mgr.status().await;
+        assert!(h_status.queue.is_empty());
 
         // Cleanup
         host_mgr.leave_or_stop().await;

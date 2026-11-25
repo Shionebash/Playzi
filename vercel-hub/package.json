@@ -1,0 +1,11 @@
+{
+  "name": "playzi-vercel-hub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Serverless HTTP Social Hub & Watch Party Relay for Playzi on Vercel",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  }
+}

@@ -289,9 +289,14 @@ impl AutoSyncManager {
             Some(cfg.cookies_file.as_str())
         };
         let jar = cookie_store.load_jar(configured).ok();
+        let auth_user = self
+            .state
+            .read()
+            .map(|s| s.music_auth_user)
+            .unwrap_or(0);
         let items = self
             .youtube
-            .fetch_recommendations_with_cookies(jar.as_ref(), Some(&self.state))
+            .fetch_recommendations_with_cookies_and_user(jar.as_ref(), auth_user, Some(&self.state))
             .await?;
         let now = self.state.read()?.recommendations_last_sync;
         Ok(json!({ "ok": true, "count": items.len(), "lastSync": now }))
@@ -320,7 +325,13 @@ impl AutoSyncManager {
             Some(cfg.cookies_file.as_str())
         };
         let jar = cookie_store.load_jar(configured).ok();
+        let auth_user = self
+            .state
+            .read()
+            .map(|s| s.music_auth_user)
+            .unwrap_or(0);
         YtMusicClient::with_client(self.http.clone(), &self.ytmusic_base_url, jar)
+            .with_auth_user(auth_user)
     }
 
     fn mark_running(&self, section: SyncSection, attempt: &str) -> Result<()> {

@@ -15,6 +15,9 @@ const state = {
   recommendationsLastSync: "",
   musicRecommendations: [],
   musicRecomLastSync: "",
+  recomExpanded: { songs: false, videos: false, mixes: false },
+  recomLoadingMore: { songs: false, videos: false },
+  homeExpanded: { music: false, videos: false },
   musicPlaylists: [],
   musicPlaylistsLastSync: "",
   channelsLastSync: "",
@@ -537,9 +540,19 @@ function syncNotice(section) {
 
 function renderHome() {
   const recent = state.history.filter((item) => item.url || item.target).slice(0, 8);
-  const music = [...(state.musicLibrary?.liked || []), ...state.musicRecommendations].slice(0, 8);
-  const videos = [...state.recommendations, ...state.feed].slice(0, 8);
+  const allMusic = _uniqueByUrl([...(state.musicLibrary?.liked || []), ...state.musicRecommendations]);
+  const allVideos = _uniqueByUrl([...state.recommendations, ...state.feed]);
+  const musicLimit = state.homeExpanded.music ? allMusic.length : 8;
+  const videosLimit = state.homeExpanded.videos ? allVideos.length : 8;
+  const music = allMusic.slice(0, musicLimit);
+  const videos = allVideos.slice(0, videosLimit);
   const imported = state.playlists.filter((pl) => pl.externalUrl || pl.importMode !== "local").slice(0, 6);
+  const musicMoreBtn = allMusic.length > 8
+    ? `<button class="btn btn-ghost btn-sm" type="button" data-home-expand="music">${state.homeExpanded.music ? "Mostrar menos" : `Mostrar más (${allMusic.length})`}</button>`
+    : "";
+  const videosMoreBtn = allVideos.length > 8
+    ? `<button class="btn btn-ghost btn-sm" type="button" data-home-expand="videos">${state.homeExpanded.videos ? "Mostrar menos" : `Mostrar más (${allVideos.length})`}</button>`
+    : "";
   $("#view-home").innerHTML = `
     <div class="home-hero">
       <div>
@@ -555,17 +568,17 @@ function renderHome() {
     </div>
 
     ${recent.length ? homeSection("Continuar", recent.map(historyCard).join("")) : ""}
-    ${music.length ? homeSection("Música para ti", `<div class="grid">${music.map(videoCard).join("")}</div>`) : ""}
-    ${videos.length ? homeSection("Videos y canales", `<div class="grid">${videos.map(videoCard).join("")}</div>`) : ""}
+    ${music.length ? homeSection("Música para ti", `<div class="grid">${music.map(videoCard).join("")}</div>`, musicMoreBtn) : ""}
+    ${videos.length ? homeSection("Videos y canales", `<div class="grid">${videos.map(videoCard).join("")}</div>`, videosMoreBtn) : ""}
     ${imported.length ? homeSection("Playlists importadas", playlistGrid(imported)) : ""}
     ${state.library.length ? homeSection("Biblioteca local", `<div class="grid">${state.library.slice(0, 8).map(libraryCard).join("")}</div>`) : ""}
   `;
 }
 
-function homeSection(title, body) {
+function homeSection(title, body, actionHtml = "") {
   return `
     <section class="home-section">
-      <div class="section-hdr"><span class="section-title">${escapeHtml(title)}</span></div>
+      <div class="section-hdr"><span class="section-title">${escapeHtml(title)}</span>${actionHtml}</div>
       ${body}
     </section>
   `;
@@ -657,13 +670,112 @@ function _resolveItemChannelUrl(item) {
   return "";
 }
 
+function _isNonChannelPart(part) {
+  const lower = String(part || "").trim().toLowerCase();
+  if (!lower) return true;
+  if ([
+    "canción", "cancion", "song", "video", "vídeo", "episodio", "episode",
+    "podcast", "álbum", "album", "sencillo", "single", "ep",
+  ].includes(lower)) return true;
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(lower)) return true;
+  if (/^\d{4}$/.test(lower)) return true;
+  if (/(visualizaciones|visualización|vistas|views|reproducciones|plays|listeners|oyentes)/i.test(lower)) {
+    return true;
+  }
+  return false;
+}
+
+function _splitChannelMeta(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return { prefix: "", name: "", suffix: "" };
+  const parts = text.split(/\s*[•·]\s*/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return { prefix: "", name: text, suffix: "" };
+  const nameIdx = parts.findIndex((p) => !_isNonChannelPart(p));
+  if (nameIdx === -1) return { prefix: "", name: text, suffix: "" };
+  const prefixParts = parts.slice(0, nameIdx);
+  const suffixParts = parts.slice(nameIdx + 1);
+  return {
+    prefix: prefixParts.length ? `${prefixParts.join(" • ")} • ` : "",
+    name: parts[nameIdx],
+    suffix: suffixParts.length ? ` • ${suffixParts.join(" • ")}` : "",
+  };
+}
+
+function _renderChannelMetaHtml(rawChannelName, resolvedChannelUrl, allowLink) {
+  const { prefix, name, suffix } = _splitChannelMeta(rawChannelName);
+  const clickable = Boolean(
+    allowLink
+    && resolvedChannelUrl
+    && name
+    && !["YouTube", "YouTube Music", "YouTube Mix", "Playlist de YouTube"].includes(name)
+  );
+  const nameHtml = clickable
+    ? `<span class="channel-link" data-watch-channel="${escapeHtml(resolvedChannelUrl)}" data-watch-channel-name="${escapeHtml(name)}" title="Ver canal (YouTube + YT Music)">${escapeHtml(name)}</span>`
+    : escapeHtml(name);
+  return `${escapeHtml(prefix)}${nameHtml}${escapeHtml(suffix)}`;
+}
+
+async function _expandRecomSection(kind) {
+  if (kind === "mixes") {
+    state.recomExpanded.mixes = !state.recomExpanded.mixes;
+    renderRecom();
+    return;
+  }
+  const currentlyExpanded = Boolean(state.recomExpanded[kind]);
+  if (currentlyExpanded) {
+    state.recomExpanded[kind] = false;
+    renderRecom();
+    return;
+  }
+  state.recomExpanded[kind] = true;
+  state.recomLoadingMore[kind] = true;
+  renderRecom();
+  try {
+    if (kind === "songs") {
+      const res = await api.post("/api/music/recommendations/more");
+      if (Array.isArray(res?.items) && res.items.length) {
+        state.musicRecommendations = res.items;
+        if (res.lastSync) state.musicRecomLastSync = res.lastSync;
+      }
+    } else if (kind === "videos") {
+      const res = await api.post("/api/recommendations/more");
+      if (Array.isArray(res?.items) && res.items.length) {
+        state.recommendations = res.items;
+        if (res.lastSync) state.recommendationsLastSync = res.lastSync;
+      }
+    }
+  } catch (err) {
+    toast(errorText(err));
+  } finally {
+    state.recomLoadingMore[kind] = false;
+    renderRecom();
+  }
+}
+
 function renderRecom() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
-  const mixes = _uniqueByUrl(state.recommendations.filter(_isRecommendedMix));
-  const mixedFeed = _uniqueByUrl([
+  const songsAll = _uniqueByUrl(state.musicRecommendations.filter((item) => !_isRecommendedMix(item)));
+  const videosAll = _uniqueByUrl([
     ...state.recommendations.filter((item) => !_isRecommendedMix(item)),
     ...state.feed,
   ]);
+  const mixesAll = _uniqueByUrl([
+    ...state.recommendations.filter(_isRecommendedMix),
+    ...state.musicRecommendations.filter(_isRecommendedMix),
+  ]);
+
+  const INITIAL_LIMIT = 8;
+  const songsVisible = state.recomExpanded.songs ? songsAll : songsAll.slice(0, INITIAL_LIMIT);
+  const videosVisible = state.recomExpanded.videos ? videosAll : videosAll.slice(0, INITIAL_LIMIT);
+  const mixesVisible = state.recomExpanded.mixes ? mixesAll : mixesAll.slice(0, INITIAL_LIMIT);
+
+  const songsMoreLabel = state.recomLoadingMore.songs
+    ? "Cargando más..."
+    : (state.recomExpanded.songs ? "Mostrar menos" : "Mostrar más");
+  const videosMoreLabel = state.recomLoadingMore.videos
+    ? "Cargando más..."
+    : (state.recomExpanded.videos ? "Mostrar menos" : "Mostrar más");
+
   $("#view-recom").innerHTML = `
     <div class="section-hdr">
       <span class="section-title">Para ti ${state.recommendationsLastSync ? `<span class="meta" style="font-size:10px;margin-left:8px">· ${escapeHtml(state.recommendationsLastSync)}</span>` : ""}</span>
@@ -682,20 +794,32 @@ function renderRecom() {
         <button class="btn btn-ghost" type="button" data-view-go="config">Configurar</button>
       </div>` : ""}
     ${hasCookies ? syncNotice("recommendations") : ""}
-    ${mixes.length ? `
+    ${songsAll.length ? `
       <div class="section-hdr" style="margin-top:4px;margin-bottom:12px">
-        <span class="section-title">Mixes y playlists para ti</span>
-        <span class="meta">${mixes.length} mixes</span>
+        <span class="section-title">Canciones para ti <span class="meta" style="font-size:11px;margin-left:6px">${songsAll.length}</span></span>
+        <button class="btn btn-ghost btn-sm" type="button" data-recom-expand="songs" ${state.recomLoadingMore.songs ? "disabled" : ""}>${songsMoreLabel}</button>
       </div>
-      <div class="grid" style="margin-bottom:28px">${mixes.map(videoCard).join("")}</div>
+      <div class="grid" style="margin-bottom:28px">${songsVisible.map(videoCard).join("")}</div>
     ` : ""}
-    ${mixedFeed.length
-      ? `${mixes.length ? `<div class="section-hdr" style="margin-top:4px;margin-bottom:12px"><span class="section-title">Videos recomendados</span></div>` : ""}<div class="grid">${mixedFeed.map(videoCard).join("")}</div>`
-      : (!mixes.length
-        ? (hasCookies
-          ? empty("Sin feed cargado", "Actualiza recomendaciones o canales para llenar Para ti.")
-          : empty("Configura cookies primero", "Necesitas seleccionar el navegador con tu sesión de YouTube."))
-        : "")}
+    ${videosAll.length ? `
+      <div class="section-hdr" style="margin-top:4px;margin-bottom:12px">
+        <span class="section-title">Videos para ti <span class="meta" style="font-size:11px;margin-left:6px">${videosAll.length}</span></span>
+        <button class="btn btn-ghost btn-sm" type="button" data-recom-expand="videos" ${state.recomLoadingMore.videos ? "disabled" : ""}>${videosMoreLabel}</button>
+      </div>
+      <div class="grid" style="margin-bottom:28px">${videosVisible.map(videoCard).join("")}</div>
+    ` : ""}
+    ${mixesAll.length ? `
+      <div class="section-hdr" style="margin-top:4px;margin-bottom:12px">
+        <span class="section-title">Mixes y playlists para ti <span class="meta" style="font-size:11px;margin-left:6px">${mixesAll.length}</span></span>
+        ${mixesAll.length > INITIAL_LIMIT ? `<button class="btn btn-ghost btn-sm" type="button" data-recom-expand="mixes">${state.recomExpanded.mixes ? "Mostrar menos" : "Mostrar más"}</button>` : ""}
+      </div>
+      <div class="grid" style="margin-bottom:28px">${mixesVisible.map(videoCard).join("")}</div>
+    ` : ""}
+    ${(!songsAll.length && !videosAll.length && !mixesAll.length)
+      ? (hasCookies
+        ? empty("Sin feed cargado", "Actualiza recomendaciones o canales para llenar Para ti.")
+        : empty("Configura cookies primero", "Necesitas seleccionar el navegador con tu sesión de YouTube."))
+      : ""}
   `;
 }
 
@@ -773,14 +897,23 @@ function _followButtonHtml(channelUrl, name) {
 
 // ── Channel view (browse full uploads) ───────────────────────────────────────
 
-const CHANNEL_TABS = [["videos", "Videos"], ["shorts", "Shorts"], ["streams", "Directos"], ["playlists", "Playlists"], ["releases", "Lanzamientos"]];
+const CHANNEL_TABS = [
+  ["videos", "Videos"],
+  ["streams", "Directos"],
+  ["shorts", "Shorts"],
+  ["playlists", "Playlists"],
+  ["releases", "Lanzamientos"],
+  ["music", "YT Music"],
+];
 let _channelObserver = null;
 let _channelLoadId = 0;
 
-async function openChannelView(url, name, tab = "videos") {
+async function openChannelView(url, name, tab = "videos", opts = {}) {
   if (!url) return;
   const cv = state.channelView;
-  if (cv.url !== url) cv._triedReleases = false;
+  if (cv.url !== url || !opts._autoFallback) {
+    cv._fallbackStep = 0;
+  }
   cv.url = url;
   cv.name = name || "";
   cv.tab = tab;
@@ -804,7 +937,7 @@ async function _fetchChannelPage(page) {
     if (loadId !== _channelLoadId) return;
     cv.meta = data;
     cv.name = data.name || cv.name;
-    // URL canonica por channel id: cache keys estables entre @handle y UC id
+    // Canonical channel URL by UC id so cache keys stay stable between @handle and UC id
     if (data.url) cv.url = data.url;
     cv.page = page;
     cv.hasMore = !!data.hasMore;
@@ -812,17 +945,15 @@ async function _fetchChannelPage(page) {
     cv.loading = false;
     if (page === 1) {
       cv.items = data.items || [];
-      // Canales "Topic" de música: /videos vacio, contenido en /releases;
-      // si tampoco hay releases, probar la pagina de artista de YT Music.
-      if (!cv.items.length && cv.tab === "videos" && !cv._triedReleases) {
-        cv._triedReleases = true;
-        openChannelView(cv.url, cv.name, "releases");
-        return;
-      }
-      if (!cv.items.length && cv.tab === "releases" && cv._triedReleases) {
-        const uc = (cv.url.match(/channel\/(UC[\w-]{22})/) || [])[1];
-        if (uc) {
-          openArtistView(uc, cv.name);
+      // Dual YouTube + YT Music fallback chain: if Videos is empty, check Directos -> Lanzamientos -> YT Music,
+      // staying inside the unified channel view so all tabs (YouTube & YT Music) remain accessible.
+      const fallbackOrder = ["videos", "streams", "releases", "music"];
+      if (!cv.items.length && cv._fallbackStep < fallbackOrder.length - 1) {
+        const curIdx = fallbackOrder.indexOf(cv.tab);
+        if (curIdx !== -1 && curIdx === cv._fallbackStep) {
+          cv._fallbackStep += 1;
+          const nextTab = fallbackOrder[cv._fallbackStep];
+          openChannelView(cv.url, cv.name, nextTab, { _autoFallback: true });
           return;
         }
       }
@@ -921,6 +1052,14 @@ function _setupChannelObserver() {
 // ── Artist view (YT Music) ────────────────────────────────────────────────────
 
 async function openArtistView(channelId, name) {
+  if (!channelId) return;
+  const url = channelId.startsWith("http")
+    ? channelId
+    : `https://www.youtube.com/channel/${channelId}`;
+  await openChannelView(url, name, "music");
+}
+
+async function _legacyOpenArtistView(channelId, name) {
   if (!channelId) return;
   const av = state.artistView;
   av.channelId = channelId;
@@ -1268,8 +1407,8 @@ function renderAuthStatus() {
   const name = state.musicAccountName || "";
   el.classList.toggle("auth-ok", ok);
   el.classList.toggle("auth-off", !ok);
-  const label = ok ? (name || "Conectado") : "No conectado";
-  el.title = ok ? `Conectado como ${name || "tu cuenta"}` : "Inicia sesión en YouTube";
+  const label = ok ? (name || "Conectado") : "Iniciar sesión";
+  el.title = ok ? `Conectado como ${name || "tu cuenta"}` : "Iniciar sesión con Google";
   el.innerHTML = `<span class="auth-dot"></span><span class="auth-label">${escapeHtml(label)}</span>`;
 }
 
@@ -1686,6 +1825,7 @@ function renderWatch() {
   _updateWatchQueue();
   _updateWatchRelated();
   _updateWatchPartyBar();
+  _applyPartyPlayerRestrictions();
 }
 
 function _updateWatchMeta(error = "") {
@@ -1719,11 +1859,10 @@ function _updateVideoMeta(error = "") {
   const channelUrl = item?.channelUrl || "";
   const browseChannelUrl = _resolveItemChannelUrl(item);
   const duration = item?.durationText || "";
-  const channelHtml = (browseChannelUrl && channel)
-    ? `<span class="channel-link" data-watch-channel="${escapeHtml(browseChannelUrl)}" data-watch-channel-name="${escapeHtml(channel)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channel)}</span>`
-    : escapeHtml(channel);
-  const hasPrev = state.player.index > 0;
-  const hasNext = state.player.index < state.player.queue.length - 1;
+  const channelHtml = _renderChannelMetaHtml(channel, browseChannelUrl, true);
+  const isPartyGuest = _partyIsGuest();
+  const hasPrev = !isPartyGuest && state.player.index > 0;
+  const hasNext = !isPartyGuest && state.player.index < state.player.queue.length - 1;
   const membersOnlyErr = _isMembersOnlyError(error);
   const isMembers = Boolean(item?.membersOnly || membersOnlyErr);
   const errorBannerHtml = !error
@@ -1758,6 +1897,7 @@ function _updateVideoMeta(error = "") {
     ${state.player.loading ? `<div class="player-status">Cargando...</div>` : ""}
     ${errorBannerHtml}
   `;
+  _applyPartyPlayerRestrictions();
 }
 
 function _nativePlayerBarHtml() {
@@ -1821,9 +1961,7 @@ function _updateMusicMeta(error = "") {
   const browseChannelUrl = _resolveItemChannelUrl(item);
   if (titleEl) titleEl.textContent = item?.title || "...";
   if (artistEl) {
-    artistEl.innerHTML = (browseChannelUrl && channel)
-      ? `<span class="channel-link" data-watch-channel="${escapeHtml(browseChannelUrl)}" data-watch-channel-name="${escapeHtml(channel)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channel)}</span>`
-      : escapeHtml(channel);
+    artistEl.innerHTML = _renderChannelMetaHtml(channel, browseChannelUrl, true);
   }
   const followEl = $("#musicFollow");
   if (followEl) followEl.innerHTML = _followButtonHtml(channelUrl, channel);
@@ -1903,23 +2041,24 @@ function _setupMusicListeners(sig) {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "⏸";
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
-    _onLocalMediaEvent();
+    _onLocalMediaEvent("play");
   }, sig);
 
   audio.addEventListener("pause", () => {
     const btn = $("#musicPlayPause");
     if (btn) btn.textContent = "▶";
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
-    _onLocalMediaEvent();
+    _onLocalMediaEvent("pause");
   }, sig);
 
   audio.addEventListener("seeked", () => {
-    _onLocalMediaEvent();
+    _onLocalMediaEvent("seeked");
   }, sig);
 
   const wrap = $("#musicProgressWrap");
   if (wrap) {
     wrap.addEventListener("click", (ev) => {
+      if (!_partyCanSeek()) return;
       if (!audio.duration) return;
       const rect = wrap.getBoundingClientRect();
       audio.currentTime = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)) * audio.duration;
@@ -1929,6 +2068,7 @@ function _setupMusicListeners(sig) {
   const playBtn = $("#musicPlayPause");
   if (playBtn) {
     playBtn.addEventListener("click", () => {
+      if (!_partyCanPlayPause()) return;
       if (audio.paused) audio.play().catch(() => {});
       else audio.pause();
     }, sig);
@@ -1969,7 +2109,7 @@ function _updateWatchQueue() {
   const q = state.player.queue;
   const idx = state.player.index;
   const isParty = Boolean(state.party?.active);
-  const isPartyHost = isParty && state.party.role === "host";
+  const canRemoveFromQueue = isParty && _partyCanRemoveQueue();
   if (hdr) {
     hdr.textContent = isParty
       ? `Cola compartida · ${q.length ? `${idx + 1} / ${q.length}` : "0"}`
@@ -1980,7 +2120,7 @@ function _updateWatchQueue() {
     const addedLabel = addedBy?.displayName
       ? `<div class="queue-added-by" title="${escapeHtml(addedBy.googleAccountName ? `${addedBy.displayName} (Google: ${addedBy.googleAccountName} · ${addedBy.userId})` : `${addedBy.displayName} (${addedBy.userId || ""})`)}">Agregado por ${escapeHtml(addedBy.displayName)}</div>`
       : "";
-    const removeBtn = isPartyHost
+    const removeBtn = canRemoveFromQueue
       ? `<button class="queue-remove-btn" type="button" data-party-remove-idx="${i}" title="Quitar de la cola">×</button>`
       : "";
     return `
@@ -2083,6 +2223,7 @@ function _playerCtrlsHtml() {
 }
 
 async function _onTrackEnded() {
+  _finishYtWatchReporting();
   if (state.player.repeat === "one") {
     loadWebPlayerItem(state.player.index);
     return;
@@ -2279,6 +2420,105 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   await loadWebPlayerItem(index);
 }
 
+let _ytWatchSession = null;
+
+function _randomCpn() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let out = "";
+  for (let i = 0; i < 16; i += 1) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return out;
+}
+
+function _currentPlaybackPosition() {
+  try {
+    if (state.player.vjs && !state.player.vjs.isDisposed()) {
+      return {
+        currentTime: Number(state.player.vjs.currentTime() || 0),
+        duration: Number(state.player.vjs.duration() || 0) || null,
+        paused: Boolean(state.player.vjs.paused()),
+      };
+    }
+    const audio = _getAudioEl();
+    if (audio) {
+      return {
+        currentTime: Number(audio.currentTime || 0),
+        duration: Number(audio.duration || 0) || null,
+        paused: Boolean(audio.paused),
+      };
+    }
+  } catch (_) {}
+  return { currentTime: 0, duration: null, paused: false };
+}
+
+function _stopYtWatchReporting() {
+  if (_ytWatchSession?.timer) {
+    clearInterval(_ytWatchSession.timer);
+  }
+  _ytWatchSession = null;
+}
+
+function _finishYtWatchReporting() {
+  if (!_ytWatchSession) return;
+  const sess = _ytWatchSession;
+  _stopYtWatchReporting();
+  const pos = _currentPlaybackPosition();
+  const dur = pos.duration || sess.duration || null;
+  api.post("/api/youtube/watch-report", {
+    url: sess.url,
+    eventType: "ended",
+    currentTime: Math.max(pos.currentTime || 0, dur || 15),
+    duration: dur,
+    cpn: sess.cpn,
+  }).catch(() => {});
+}
+
+function _startYtWatchReporting(item) {
+  _stopYtWatchReporting();
+  const url = String(item?.url || "");
+  if (!/(?:youtube\.com|youtu\.be)/i.test(url)) return;
+  const cpn = _randomCpn();
+  const sess = {
+    url,
+    cpn,
+    duration: Number(item?.duration || 0) || null,
+    lastSentAt: 0,
+    timer: null,
+  };
+  _ytWatchSession = sess;
+  // Report initial playback start so YouTube registers the view in Watch History immediately
+  api.post("/api/youtube/watch-report", {
+    url,
+    eventType: "start",
+    currentTime: 0.5,
+    duration: sess.duration,
+    cpn,
+  }).catch(() => {});
+  // Periodically send watchtime pings while playing so YouTube's recommendation algorithm learns watch duration
+  sess.timer = setInterval(() => {
+    if (_ytWatchSession !== sess) return;
+    const pos = _currentPlaybackPosition();
+    if (pos.paused || pos.currentTime < 5) return;
+    if (pos.duration && !sess.duration) {
+      sess.duration = pos.duration;
+      if (state.player.current && (!state.player.current.durationText || state.player.current.durationText === "--:--")) {
+        state.player.current.duration = Math.round(pos.duration);
+        state.player.current.durationText = _formatTime(pos.duration);
+      }
+    }
+    if (pos.currentTime - sess.lastSentAt < 12) return;
+    sess.lastSentAt = pos.currentTime;
+    api.post("/api/youtube/watch-report", {
+      url: sess.url,
+      eventType: "progress",
+      currentTime: pos.currentTime,
+      duration: pos.duration || sess.duration,
+      cpn: sess.cpn,
+    }).catch(() => {});
+  }, 15000);
+}
+
 async function loadWebPlayerItem(index, opts = {}) {
   const item = state.player.queue[index];
   if (!item) return;
@@ -2295,6 +2535,7 @@ async function loadWebPlayerItem(index, opts = {}) {
   _updateWatchRelated();
 
   try {
+    _startYtWatchReporting(item);
     if (state.player.sourceContext === "music" || state.player.audioOnly) {
       await _loadMusicItem(item, loadId);
     } else {
@@ -2501,6 +2742,15 @@ async function ensureVideoPlayer() {
     fill: true,
     playbackRates: [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2],
     html5: { vhs: { overrideNative: true } },
+    userActions: {
+      click: () => {
+        if (!_partyCanPlayPause()) return;
+        if (player.paused()) player.play().catch(() => {});
+        else player.pause();
+      },
+      doubleClick: true,
+      hotkeys: false,
+    },
   });
   state.player.vjs = player;
   player.on("error", () => {
@@ -2517,14 +2767,15 @@ async function ensureVideoPlayer() {
     _updateWatchMeta(msg);
   });
   player.on("ended", () => { _onTrackEnded(); });
-  player.on("play", () => { _onLocalMediaEvent(); });
-  player.on("pause", () => { _onLocalMediaEvent(); });
-  player.on("seeked", () => { _onLocalMediaEvent(); });
-  player.on("ratechange", () => { _onLocalMediaEvent(); });
+  player.on("play", () => { _onLocalMediaEvent("play"); });
+  player.on("pause", () => { _onLocalMediaEvent("pause"); });
+  player.on("seeked", () => { _onLocalMediaEvent("seeked"); });
+  player.on("ratechange", () => { _onLocalMediaEvent("ratechange"); });
   // Restore / persist volume
   player.ready(() => {
     const savedVol = localStorage.getItem("playzi-volume");
     if (savedVol !== null) player.volume(parseFloat(savedVol));
+    _applyPartyPlayerRestrictions();
   });
   player.on("volumechange", () => {
     localStorage.setItem("playzi-volume", player.volume());
@@ -2532,6 +2783,7 @@ async function ensureVideoPlayer() {
   _registerQualityMenu(player);
   _registerAudioMenu(player);
   _registerTheaterBtn(player);
+  _applyPartyPlayerRestrictions();
 }
 
 function _registerAudioMenu(player) {
@@ -2558,8 +2810,10 @@ function _registerAudioMenu(player) {
       toast(`Cambiando audio a ${track.name}...`);
       player.src({ type: "application/dash+xml", src });
       player.one("canplay", () => {
+        _applyingPartySync = true;
         player.currentTime(curTime);
         player.play().catch(() => {});
+        setTimeout(() => { _applyingPartySync = false; }, 250);
       });
       const btn = player.controlBar.getChild("AudioLangButton");
       if (btn) btn.items.forEach((it) => it.options_.track && it.selected(it.options_.track.lang === track.lang));
@@ -2617,8 +2871,10 @@ function _registerQualityMenu(player) {
       const newSrc = curSrc.replace(/quality=[^&]*/, `quality=${encodeURIComponent(activeQ)}`);
       player.src({ type: "application/dash+xml", src: newSrc });
       player.one("canplay", () => {
+        _applyingPartySync = true;
         player.currentTime(curTime);
         player.play().catch(() => {});
+        setTimeout(() => { _applyingPartySync = false; }, 250);
       });
       const btn = player.controlBar.getChild("QualityButton");
       if (btn) btn.items.forEach((it) => it.selected(it.options_.label === activeQ));
@@ -2704,11 +2960,15 @@ function _updateMiniPlayer() {
   const fill = document.getElementById("miniProgFill");
   if (fill) fill.style.width = duration ? `${(currentTime / duration) * 100}%` : "0%";
   const playBtn = document.getElementById("miniPlayPause");
-  if (playBtn) playBtn.textContent = paused ? "▶" : "⏸";
+  if (playBtn) {
+    playBtn.textContent = paused ? "▶" : "⏸";
+    playBtn.disabled = !_partyCanPlayPause();
+  }
+  const isPartyGuest = _partyIsGuest();
   const prevBtn = document.getElementById("miniPrev");
-  if (prevBtn) prevBtn.disabled = state.player.index <= 0;
+  if (prevBtn) prevBtn.disabled = isPartyGuest || state.player.index <= 0;
   const nextBtn = document.getElementById("miniNext");
-  if (nextBtn) nextBtn.disabled = state.player.index >= state.player.queue.length - 1;
+  if (nextBtn) nextBtn.disabled = isPartyGuest || state.player.index >= state.player.queue.length - 1;
 }
 
 function _showMiniPlayer() {
@@ -2733,6 +2993,7 @@ function _hideMiniPlayer() {
 }
 
 function _miniTogglePlay() {
+  if (!_partyCanPlayPause()) return;
   if (state.player.sourceContext === "music" || state.player.audioOnly) {
     const audio = document.querySelector("#view-watch audio");
     if (!audio) return;
@@ -2761,11 +3022,11 @@ function _miniPlayerClick(ev) {
     _miniTogglePlay();
     return;
   }
-  if (ev.target.closest("#miniPrev") && state.player.index > 0) {
+  if (ev.target.closest("#miniPrev") && !_partyIsGuest() && state.player.index > 0) {
     loadWebPlayerItem(state.player.index - 1);
     return;
   }
-  if (ev.target.closest("#miniNext") && state.player.index < state.player.queue.length - 1) {
+  if (ev.target.closest("#miniNext") && !_partyIsGuest() && state.player.index < state.player.queue.length - 1) {
     loadWebPlayerItem(state.player.index + 1);
     return;
   }
@@ -2872,15 +3133,7 @@ function videoCard(item) {
   }
 
   const resolvedChannelUrl = _resolveItemChannelUrl(item);
-  const clickableChannel = Boolean(
-    resolvedChannelUrl
-    && channelName
-    && !isPlaylist
-    && !["YouTube", "YouTube Music", "YouTube Mix", "Playlist de YouTube"].includes(channelName)
-  );
-  const channelNameHtml = clickableChannel
-    ? `<span class="channel-link" data-watch-channel="${escapeHtml(resolvedChannelUrl)}" data-watch-channel-name="${escapeHtml(channelName)}" title="Ver canal (videos, directos, shorts, playlists)">${escapeHtml(channelName)}</span>`
-    : escapeHtml(channelName);
+  const channelNameHtml = _renderChannelMetaHtml(channelName, resolvedChannelUrl, !isPlaylist);
 
   return `
     <article class="card">
@@ -3720,6 +3973,18 @@ function bindEvents() {
       }
       return;
     }
+    const homeExpand = ev.target.closest("[data-home-expand]");
+    if (homeExpand) {
+      const key = homeExpand.dataset.homeExpand;
+      state.homeExpanded[key] = !state.homeExpanded[key];
+      renderHome();
+      return;
+    }
+    const recomExpand = ev.target.closest("[data-recom-expand]");
+    if (recomExpand) {
+      _expandRecomSection(recomExpand.dataset.recomExpand);
+      return;
+    }
     const watchChannel = ev.target.closest("[data-watch-channel]");
     if (watchChannel) {
       openChannelView(watchChannel.dataset.watchChannel, watchChannel.dataset.watchChannelName);
@@ -3907,15 +4172,15 @@ function bindEvents() {
     if (ev.target.closest("#watchBack")) {
       await closeWebPlayer();
     }
-    if (ev.target.closest("#watchPrev") && state.player.index > 0) {
+    if (ev.target.closest("#watchPrev") && !_partyIsGuest() && state.player.index > 0) {
       await loadWebPlayerItem(state.player.index - 1);
     }
-    if (ev.target.closest("#watchNext") && state.player.index < state.player.queue.length - 1) {
+    if (ev.target.closest("#watchNext") && !_partyIsGuest() && state.player.index < state.player.queue.length - 1) {
       await loadWebPlayerItem(state.player.index + 1);
     }
-    if (ev.target.closest("#ctrlShuffle")) { toggleShuffle(); }
-    if (ev.target.closest("#ctrlRepeat")) { cycleRepeat(); }
-    if (ev.target.closest("#ctrlAutoplay")) { toggleAutoplay(); }
+    if (ev.target.closest("#ctrlShuffle") && !_partyIsGuest()) { toggleShuffle(); }
+    if (ev.target.closest("#ctrlRepeat") && !_partyIsGuest()) { cycleRepeat(); }
+    if (ev.target.closest("#ctrlAutoplay") && !_partyIsGuest()) { toggleAutoplay(); }
     if (ev.target.closest("#playerExternal") && state.player.current?.url) {
       const cur = state.player.current;
       try { state.player.vjs?.pause(); } catch (_) {}
@@ -3972,24 +4237,31 @@ function bindEvents() {
     const vjs = state.player.vjs;
     if (ev.code === "Space") {
       ev.preventDefault();
+      if (!_partyCanPlayPause()) return;
       if (audio) { audio.paused ? audio.play().catch(() => {}) : audio.pause(); }
-      else if (vjs) { vjs.paused() ? vjs.play() : vjs.pause(); }
+      else if (vjs) { vjs.paused() ? vjs.play().catch(() => {}) : vjs.pause(); }
     } else if (ev.code === "ArrowLeft") {
       ev.preventDefault();
+      if (!_partyCanSeek()) return;
       if (audio) audio.currentTime = Math.max(0, audio.currentTime - 10);
       else if (vjs) vjs.currentTime(Math.max(0, vjs.currentTime() - 10));
     } else if (ev.code === "ArrowRight") {
       ev.preventDefault();
+      if (!_partyCanSeek()) return;
       if (audio) audio.currentTime = Math.min(audio.duration || Infinity, audio.currentTime + 10);
       else if (vjs) vjs.currentTime(Math.min(vjs.duration() || Infinity, vjs.currentTime() + 10));
     } else if (ev.code === "KeyN") {
+      if (_partyIsGuest()) return;
       if (state.player.index < state.player.queue.length - 1) await loadWebPlayerItem(state.player.index + 1);
       else _onTrackEnded();
     } else if (ev.code === "KeyP") {
+      if (_partyIsGuest()) return;
       if (state.player.index > 0) await loadWebPlayerItem(state.player.index - 1);
     } else if (ev.code === "KeyS") {
+      if (_partyIsGuest()) return;
       toggleShuffle();
     } else if (ev.code === "KeyR") {
+      if (_partyIsGuest()) return;
       cycleRepeat();
     }
   });
@@ -4117,6 +4389,70 @@ let _applyingPartySync = false;
 let _partyHeartbeatTimer = null;
 let _partySyncDebounce = null;
 let _partyLastSyncedUrl = "";
+let _partyUsersCardOpen = false;
+
+function _partyIsGuest() {
+  return Boolean(state.party?.active && state.party.role === "guest");
+}
+
+function _partyCanPlayPause() {
+  if (!_partyIsGuest()) return true;
+  return Boolean(state.party.canSelfPlayPause);
+}
+
+function _partyCanSeek() {
+  if (!_partyIsGuest()) return true;
+  return Boolean(state.party.canSelfSeek);
+}
+
+function _partyCanRemoveQueue() {
+  if (!state.party?.active) return false;
+  if (state.party.role === "host") return true;
+  return Boolean(state.party.canSelfRemoveQueue);
+}
+
+function _partyExpectedPlaybackPos() {
+  const pb = state.party?.playback || {};
+  const elapsedSecs = pb.isPlaying && pb.updatedAtMs
+    ? Math.max(0, (Date.now() - Number(pb.updatedAtMs)) / 1000) * Number(pb.playbackRate || 1)
+    : 0;
+  return Math.max(0, Number(pb.positionSecs || 0) + elapsedSecs);
+}
+
+function _applyPartyPlayerRestrictions() {
+  const canPlayPause = _partyCanPlayPause();
+  const canSeek = _partyCanSeek();
+  const isGuest = _partyIsGuest();
+
+  if (state.player.vjs && !state.player.vjs.isDisposed()) {
+    const vjsEl = state.player.vjs.el();
+    if (vjsEl) {
+      vjsEl.classList.toggle("vjs-party-no-playpause", !canPlayPause);
+      vjsEl.classList.toggle("vjs-party-no-seek", !canSeek);
+    }
+  }
+
+  const musicPlayBtn = $("#musicPlayPause");
+  if (musicPlayBtn) {
+    musicPlayBtn.disabled = !canPlayPause;
+    musicPlayBtn.classList.toggle("music-btn--locked", !canPlayPause);
+  }
+  const musicProg = $("#musicProgressWrap");
+  if (musicProg) {
+    musicProg.classList.toggle("music-track--locked", !canSeek);
+  }
+
+  const prevBtn = $("#watchPrev");
+  if (prevBtn) prevBtn.disabled = isGuest || state.player.index <= 0;
+  const nextBtn = $("#watchNext");
+  if (nextBtn) nextBtn.disabled = isGuest || state.player.index >= state.player.queue.length - 1;
+  const shuffleBtn = $("#ctrlShuffle");
+  if (shuffleBtn) shuffleBtn.disabled = isGuest;
+  const repeatBtn = $("#ctrlRepeat");
+  if (repeatBtn) repeatBtn.disabled = isGuest;
+  const autoplayBtn = $("#ctrlAutoplay");
+  if (autoplayBtn) autoplayBtn.disabled = isGuest;
+}
 
 function _socialPendingCount() {
   const s = state.social || {};
@@ -4160,16 +4496,66 @@ function _updatePartyBadge() {
   }
 }
 
+function _partyUsersPopoverHtml(p) {
+  if (!p?.active || p.role !== "host" || !_partyUsersCardOpen) return "";
+  const guests = (p.participants || []).filter((u) => !u.isHost);
+  return `
+    <div class="party-users-popover" id="partyUsersPopover">
+      <div class="party-users-popover-hdr">
+        <span class="party-users-popover-title">Gestionar usuarios (${guests.length})</span>
+        <button class="icon-btn" type="button" data-party-action="close-users-card" title="Cerrar">×</button>
+      </div>
+      ${guests.length ? `
+        <div class="party-users-popover-list">
+          ${guests.map((u) => `
+            <div class="party-user-perm-card">
+              <div class="party-user-perm-name">
+                <span>${escapeHtml(u.displayName || u.userId)}</span>
+                <span class="party-pill">${escapeHtml(u.userId)}</span>
+              </div>
+              <div class="party-user-perm-toggles">
+                <label class="party-perm-toggle">
+                  <span>Adelantar / retroceder video</span>
+                  <input type="checkbox" data-party-perm-user="${escapeHtml(u.userId)}" data-party-perm-key="canSeek" ${u.canSeek ? "checked" : ""}>
+                </label>
+                <label class="party-perm-toggle">
+                  <span>Pausar / reproducir</span>
+                  <input type="checkbox" data-party-perm-user="${escapeHtml(u.userId)}" data-party-perm-key="canPlayPause" ${u.canPlayPause ? "checked" : ""}>
+                </label>
+                <label class="party-perm-toggle">
+                  <span>Quitar videos de la cola</span>
+                  <input type="checkbox" data-party-perm-user="${escapeHtml(u.userId)}" data-party-perm-key="canRemoveQueue" ${u.canRemoveQueue ? "checked" : ""}>
+                </label>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      ` : `<div class="party-users-popover-empty">No hay usuarios conectados todavía.</div>`}
+    </div>
+  `;
+}
+
 function _updateWatchPartyBar() {
   const bar = $("#watch-party-bar");
   if (!bar) return;
   const p = state.party;
   if (!p?.active) {
+    _partyUsersCardOpen = false;
     bar.innerHTML = "";
     return;
   }
   const roleLabel = p.role === "host" ? "Host" : `Invitado · Host: ${p.hostName || "Host"}`;
-  const permLabel = p.role === "host" || p.canSelfQueue ? "Puedes agregar a la cola" : "Solo lectura";
+  let permLabel = "Solo lectura";
+  if (p.role === "host") {
+    permLabel = "Control total";
+  } else {
+    const granted = [];
+    if (p.canSelfQueue) granted.push("agregar a cola");
+    if (p.canSelfPlayPause) granted.push("pausar/reproducir");
+    if (p.canSelfSeek) granted.push("adelantar/retroceder");
+    if (p.canSelfRemoveQueue) granted.push("quitar de cola");
+    permLabel = granted.length ? `Permisos: ${granted.join(", ")}` : "Solo ver";
+  }
   bar.innerHTML = `
     <div class="watch-party-bar">
       <div class="party-row">
@@ -4178,9 +4564,11 @@ function _updateWatchPartyBar() {
       </div>
       <div class="party-row">
         ${p.role === "guest" ? `<button class="btn btn-ghost" type="button" data-party-action="resync">Resincronizar</button>` : ""}
+        ${p.role === "host" ? `<button class="btn btn-ghost ${_partyUsersCardOpen ? "active" : ""}" type="button" data-party-action="toggle-users-card">Gestionar usuarios</button>` : ""}
         <button class="btn btn-ghost" type="button" data-party-action="open-view">Gestionar sesión</button>
       </div>
     </div>
+    ${_partyUsersPopoverHtml(p)}
   `;
 }
 
@@ -4244,13 +4632,62 @@ function _applyMediaSync(targetPlaying, targetPosSecs, targetRate = 1) {
   setTimeout(() => { _applyingPartySync = false; }, 250);
 }
 
-function _onLocalMediaEvent() {
+async function _pushGuestPlaybackSync(update) {
+  if (!_partyIsGuest()) return;
+  try {
+    await api.post("/api/party/playback", update);
+  } catch (err) {
+    if (err?.message) toast(err.message);
+  }
+}
+
+function _onLocalMediaEvent(kind = "sync") {
   if (_applyingPartySync) return;
-  if (!state.party?.active || state.party.role !== "host") return;
-  clearTimeout(_partySyncDebounce);
-  _partySyncDebounce = setTimeout(() => {
-    _pushHostPlaybackSync();
-  }, 150);
+  if (!state.party?.active) return;
+
+  if (state.party.role === "host") {
+    clearTimeout(_partySyncDebounce);
+    _partySyncDebounce = setTimeout(() => {
+      _pushHostPlaybackSync();
+    }, 150);
+    return;
+  }
+
+  if (state.party.role === "guest") {
+    const pb = state.party.playback || {};
+    const expectedPos = _partyExpectedPlaybackPos();
+    const expectedRate = Number(pb.playbackRate || 1);
+
+    if (kind === "play" || kind === "pause") {
+      if (!_partyCanPlayPause()) {
+        _applyMediaSync(Boolean(pb.isPlaying), expectedPos, expectedRate);
+        return;
+      }
+      clearTimeout(_partySyncDebounce);
+      _partySyncDebounce = setTimeout(() => {
+        const media = _getCurrentMediaState();
+        _pushGuestPlaybackSync({ isPlaying: media.isPlaying });
+      }, 100);
+      return;
+    }
+
+    if (kind === "seeked") {
+      if (!_partyCanSeek()) {
+        _applyMediaSync(Boolean(pb.isPlaying), expectedPos, expectedRate);
+        return;
+      }
+      clearTimeout(_partySyncDebounce);
+      _partySyncDebounce = setTimeout(() => {
+        const media = _getCurrentMediaState();
+        _pushGuestPlaybackSync({ positionSecs: media.positionSecs });
+      }, 120);
+      return;
+    }
+
+    if (kind === "ratechange") {
+      _applyMediaSync(Boolean(pb.isPlaying), expectedPos, expectedRate);
+    }
+  }
 }
 
 async function _pushHostPlaybackSync(override = {}) {
@@ -4296,10 +4733,13 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
   _updatePartyBadge();
   _ensurePartyHeartbeat();
   _updateWatchPartyBar();
+  _applyPartyPlayerRestrictions();
   if (state.view === "party") renderParty();
 
   if (!snapshot.active) {
     _partyLastSyncedUrl = "";
+    _partyUsersCardOpen = false;
+    _applyPartyPlayerRestrictions();
     return;
   }
 
@@ -4330,8 +4770,9 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
 
   const isGuest = snapshot.role === "guest";
   const hostNeedsFirstLoad = snapshot.role === "host" && !state.player.current;
+  const hostRemoteControl = snapshot.role === "host" && pb.updatedBy && pb.updatedBy !== snapshot.selfUserId;
 
-  if (isGuest || hostNeedsFirstLoad) {
+  if (isGuest || hostNeedsFirstLoad || hostRemoteControl) {
     const currentUrl = state.player.current?.url || "";
     if (currentUrl !== targetItem.url || state.player.index !== expectedIdx || _partyLastSyncedUrl !== targetItem.url) {
       _partyLastSyncedUrl = targetItem.url;
@@ -4343,7 +4784,7 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
         targetPlaying: Boolean(pb.isPlaying),
         targetRate: Number(pb.playbackRate || 1),
       });
-    } else if (isGuest) {
+    } else if (isGuest || hostRemoteControl) {
       _applyMediaSync(Boolean(pb.isPlaying), targetPos, Number(pb.playbackRate || 1));
     }
   }
@@ -4450,59 +4891,42 @@ function renderParty() {
       <div class="party-grid">
         <div class="party-card">
           <div class="party-card-hdr">
-            <div class="party-card-title">Hostear una sesión</div>
-            <span class="party-pill ${hubConnected ? "party-pill--ok" : ""}">${hubConnected ? "Relay Online listo" : "Local + Túnel"}</span>
+            <div class="party-card-title">Crear una sala</div>
+            <span class="party-pill ${hubConnected ? "party-pill--ok" : ""}">${hubConnected ? "Online listo" : "Automático"}</span>
           </div>
-          <p class="muted" style="font-size:.84rem">
-            ${hubConnected
-              ? "Abre una sala online automática vía Cloudflare Relay. Tus amigos podrán pedir unirse o recibir tu invitación directa."
-              : "Abre una sala sincronizada. Para jugar por internet sin configurar el Hub, activa el Túnel Cloudflare (instala cloudflared automáticamente)."}
-          </p>
+          <p class="muted" style="font-size:.84rem">Crea una sala en un clic para ver videos o escuchar música sincronizados con tus amigos.</p>
           <div class="party-form-grid">
-            <label class="party-field">Puerto local
-              <input class="form-input" id="partyHostPort" type="number" min="1024" max="65535" value="8766">
-            </label>
-            <label class="party-field">Permisos de cola
-              <select class="form-input" id="partyHostPolicy">
-                <option value="all" selected>Todos pueden agregar</option>
-                <option value="host_only">Solo el host</option>
-                <option value="selected">Solo usuarios seleccionados</option>
-              </select>
-            </label>
-            <label class="party-field">Acceso de amigos
+            <label class="party-field">¿Quién puede entrar?
               <select class="form-input" id="partyRoomAccess">
                 <option value="request" selected>Pedir permiso para unirse</option>
                 <option value="open">Abierta para amigos</option>
                 <option value="invite_only">Solo por invitación</option>
               </select>
             </label>
+            <label class="party-field">¿Quién puede agregar a la cola?
+              <select class="form-input" id="partyHostPolicy">
+                <option value="all" selected>Todos en la sala</option>
+                <option value="host_only">Solo yo</option>
+                <option value="selected">Solo usuarios seleccionados</option>
+              </select>
+            </label>
           </div>
-          <label class="party-field">Dirección pública opcional (IP pública, dominio o Tailscale)
-            <input class="form-input" id="partyPublicHost" placeholder="ej. mi-casa.duckdns.org:8766 o 100.x.x.x:8766">
-          </label>
-          <label class="party-check">
-            <input type="checkbox" id="partyStartTunnel" ${!hubConnected ? "checked" : ""}>
-            Exponer a internet con Cloudflare Tunnel (instala cloudflared automáticamente si falta)
-          </label>
           <div class="party-row">
-            <button class="btn btn-primary" type="button" data-party-action="start-host">Iniciar sesión (Host)</button>
+            <button class="btn btn-primary" type="button" data-party-action="start-host">Crear sala</button>
           </div>
         </div>
 
         <div class="party-card">
           <div class="party-card-hdr">
-            <div class="party-card-title">Unirse a una sesión</div>
+            <div class="party-card-title">Unirse a una sala</div>
             <span class="party-pill">Invitado</span>
           </div>
-          <p class="muted" style="font-size:.84rem">Pega el enlace de invitación del host o únete directo desde tu lista de amigos.</p>
-          <label class="party-field">Enlace de invitación o IP:puerto
-            <input class="form-input" id="partyJoinInvite" placeholder="wss://...workers.dev/ws?room=ABC123 o wss://...trycloudflare.com/ws?room=ABC123">
-          </label>
-          <label class="party-field">Código de sala (opcional si ya viene en el enlace)
-            <input class="form-input" id="partyJoinRoom" placeholder="ABC123" style="text-transform:uppercase">
+          <p class="muted" style="font-size:.84rem">Escribe el código de sala o pega el enlace que te compartió tu amigo, o únete directo desde tu lista de amigos.</p>
+          <label class="party-field">Código de sala o enlace
+            <input class="form-input" id="partyJoinInvite" placeholder="ej. 4ENUAH o enlace de invitación">
           </label>
           <div class="party-row">
-            <button class="btn btn-primary" type="button" data-party-action="join-session">Unirse a la sesión</button>
+            <button class="btn btn-primary" type="button" data-party-action="join-session">Unirse</button>
           </div>
         </div>
       </div>
@@ -4536,49 +4960,30 @@ function renderParty() {
       <div class="party-card party-card--wide">
         <div class="party-card-hdr">
           <div class="party-row">
-            <div class="party-card-title">Sesión activa (Host)</div>
+            <div class="party-card-title">Tu sala está activa</div>
             <span class="party-pill party-pill--live">Sala ${escapeHtml(p.roomCode)}</span>
             <span class="party-pill party-pill--ok">${p.participants?.length || 1} conectados</span>
-            ${p.relayConnected
-              ? `<span class="party-pill party-pill--ok">Relay Online activo</span>`
-              : p.tunnelRunning
-                ? `<span class="party-pill party-pill--ok">Túnel Cloudflare activo</span>`
-                : !hasPublicUrl
-                  ? `<span class="party-pill party-pill--warn">Solo LAN local (no accesible por internet)</span>`
-                  : `<span class="party-pill party-pill--ok">Dirección pública</span>`}
+            ${p.relayConnected || p.tunnelRunning || hasPublicUrl
+              ? `<span class="party-pill party-pill--ok">Online</span>`
+              : `<span class="party-pill party-pill--warn">Preparando conexión online...</span>`}
           </div>
           <div class="party-row">
-            <button class="btn btn-ghost" type="button" data-party-action="go-watch">Ir al reproductor</button>
-            <button class="btn btn-danger" type="button" data-party-action="leave">Cerrar sesión</button>
+            <button class="btn btn-party-watch" type="button" data-party-action="go-watch">Ir al reproductor</button>
+            <button class="btn btn-danger" type="button" data-party-action="leave">Cerrar sala</button>
           </div>
         </div>
 
-        <div class="party-field">${hasPublicUrl ? "Enlace público online para compartir" : "Enlace LAN local (para internet activa Túnel Cloudflare o configura Hub Online)"}
+        <div class="party-field">${hasPublicUrl ? "Enlace para compartir (o invita directo desde tu lista de amigos)" : "Preparando enlace online..."}
           <div class="party-code-box">
             <code id="partyInviteText">${escapeHtml(p.inviteUrl || p.localWsUrl)}</code>
-            <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.inviteUrl || p.localWsUrl)}">Copiar</button>
+            <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.inviteUrl || p.localWsUrl)}">Copiar enlace</button>
+            ${p.relayConnected ? `<button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(p.roomCode)}">Copiar código</button>` : ""}
           </div>
         </div>
-
-        ${p.publicWsUrl && p.localWsUrl && p.publicWsUrl !== p.localWsUrl ? `
-          <div class="party-field">Enlace LAN local
-            <div class="party-code-box">
-              <code>${escapeHtml(p.localWsUrl)}</code>
-              <button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(p.localWsUrl)}">Copiar</button>
-            </div>
-          </div>
-        ` : ""}
-
-        <div class="party-row">
-          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública (IP/dominio/Tailscale) para internet" value="${escapeHtml(p.publicWsUrl || "")}">
-          <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
-          <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Abrir túnel internet (Cloudflare)"}</button>
-        </div>
-        ${p.relayError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.relayError)}</div>` : ""}
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
 
         <div style="border-top:1px solid var(--br);padding-top:12px">
-          <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">Acceso de amigos a esta sala</div>
+          <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede entrar a tu sala?</div>
           <div class="party-policy-tabs">
             <button type="button" class="party-policy-btn ${(p.roomAccess || "request") === "request" ? "active" : ""}" data-party-access="request">${accessLabels.request}</button>
             <button type="button" class="party-policy-btn ${p.roomAccess === "open" ? "active" : ""}" data-party-access="open">${accessLabels.open}</button>
@@ -4589,7 +4994,7 @@ function renderParty() {
         <div style="border-top:1px solid var(--br);padding-top:12px">
           <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede agregar videos/canciones a la cola?</div>
           <div class="party-policy-tabs">
-            <button type="button" class="party-policy-btn ${p.queuePolicy === "host_only" ? "active" : ""}" data-party-policy="host_only">Solo el host</button>
+            <button type="button" class="party-policy-btn ${p.queuePolicy === "host_only" ? "active" : ""}" data-party-policy="host_only">Solo yo</button>
             <button type="button" class="party-policy-btn ${p.queuePolicy === "all" ? "active" : ""}" data-party-policy="all">Todos en la sala</button>
             <button type="button" class="party-policy-btn ${p.queuePolicy === "selected" ? "active" : ""}" data-party-policy="selected">Solo usuarios seleccionados</button>
           </div>
@@ -4607,7 +5012,7 @@ function renderParty() {
                     <div class="party-person-meta">${escapeHtml(u.userId)}</div>
                   </div>
                 </label>
-              `).join("") : `<div class="muted" style="font-size:.83rem">Aún no hay invitados conectados ni amigos guardados para seleccionar.</div>`}
+              `).join("") : `<div class="muted" style="font-size:.83rem">Aún no hay invitados conectados ni amigos para seleccionar.</div>`}
             </div>
           ` : ""}
         </div>
@@ -4618,17 +5023,17 @@ function renderParty() {
       <div class="party-card party-card--wide">
         <div class="party-card-hdr">
           <div class="party-row">
-            <div class="party-card-title">Conectado a la sesión de ${escapeHtml(p.hostName || "Host")}</div>
+            <div class="party-card-title">En la sala de ${escapeHtml(p.hostName || "Host")}</div>
             <span class="party-pill party-pill--live">Sala ${escapeHtml(p.roomCode)}</span>
             <span class="party-pill ${p.connected ? "party-pill--ok" : "party-pill--warn"}">${p.connected ? "Sincronizado" : "Desconectado"}</span>
-            <span class="party-pill ${p.canSelfQueue ? "party-pill--ok" : ""}">${p.canSelfQueue ? "Puedes agregar a la cola" : "Cola restringida por el host"}</span>
+            <span class="party-pill ${p.canSelfQueue ? "party-pill--ok" : ""}">${p.canSelfQueue ? "Puedes agregar a la cola" : "Solo ver"}</span>
           </div>
           <div class="party-row">
-            <button class="btn btn-ghost" type="button" data-party-action="go-watch">Ir al reproductor</button>
-            <button class="btn btn-danger" type="button" data-party-action="leave">Salir de la sesión</button>
+            <button class="btn btn-party-watch" type="button" data-party-action="go-watch">Ir al reproductor</button>
+            <button class="btn btn-danger" type="button" data-party-action="leave">Salir</button>
           </div>
         </div>
-        <div class="muted" style="font-size:.84rem">Política de cola actual: <strong>${escapeHtml(policyLabels[p.queuePolicy] || p.queuePolicy)}</strong> · En la cola: <strong>${p.queue?.length || 0}</strong> elementos.</div>
+        <div class="muted" style="font-size:.84rem">Cola: <strong>${p.queue?.length || 0}</strong> elementos · Permisos: <strong>${escapeHtml(policyLabels[p.queuePolicy] || p.queuePolicy)}</strong>.</div>
         ${p.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.lastError)}</div>` : ""}
       </div>
     `;
@@ -4637,7 +5042,7 @@ function renderParty() {
   const participantsHtml = p.active ? `
     <div class="party-card">
       <div class="party-card-hdr">
-        <div class="party-card-title">Participantes (${p.participants?.length || 0})</div>
+        <div class="party-card-title">En esta sala (${p.participants?.length || 0})</div>
       </div>
       <div class="party-list">
         ${(p.participants || []).map((part) => {
@@ -4656,7 +5061,7 @@ function renderParty() {
                 <div class="party-person-meta">${escapeHtml(part.userId)}</div>
               </div>
               <div class="party-row">
-                ${!isSelf && !isFriend ? `<button class="btn btn-ghost" type="button" data-party-save-friend="${escapeHtml(part.userId)}" data-party-save-name="${escapeHtml(part.displayName)}" data-party-save-google="${escapeHtml(part.googleAccountName || "")}">${hubConnected ? "+ Enviar solicitud" : "+ Amigo"}</button>` : ""}
+                ${!isSelf && !isFriend ? `<button class="btn btn-ghost" type="button" data-party-save-friend="${escapeHtml(part.userId)}" data-party-save-name="${escapeHtml(part.displayName)}" data-party-save-google="${escapeHtml(part.googleAccountName || "")}">+ Agregar amigo</button>` : ""}
                 ${isHost && !part.isHost ? `<button class="btn btn-ghost" type="button" data-party-kick="${escapeHtml(part.userId)}">Expulsar</button>` : ""}
               </div>
             </div>
@@ -4669,41 +5074,34 @@ function renderParty() {
   root.innerHTML = `
     <div class="section-head">
       <div>
-        <h2>Sesión compartida (Watch Party)</h2>
-        <p class="muted">Reproduce videos y canciones sincronizados con amigos, envía solicitudes de amistad e invítalos a tu sala.</p>
+        <h2>Sesión compartida</h2>
+        <p class="muted">Escucha música o mira videos con tus amigos en tiempo real.</p>
       </div>
     </div>
 
     <div class="party-card party-card--wide" style="margin-bottom:16px">
       <div class="party-card-hdr">
-        <div class="party-card-title">Tu identidad y Servidor Hub Online</div>
+        <div class="party-card-title">Tu perfil</div>
         <div class="party-row">
-          ${prof.googleAccountName ? `<span class="party-pill party-pill--ok">Google: ${escapeHtml(prof.googleAccountName)}</span>` : `<span class="party-pill">Sin cuenta Google vinculada</span>`}
-          <span class="party-pill ${hubConnected ? "party-pill--ok" : hubConfigured ? "party-pill--warn" : ""}">
-            ${hubConnected ? "Hub Online conectado" : hubConfigured ? "Hub desconectado" : "Hub sin configurar"}
+          ${prof.googleAccountName ? `<span class="party-pill party-pill--ok">Google: ${escapeHtml(prof.googleAccountName)}</span>` : ""}
+          <span class="party-pill ${hubConnected ? "party-pill--ok" : "party-pill--warn"}">
+            ${hubConnected ? "Conectado online" : hubConfigured ? "Reconectando..." : "Servicio online pendiente"}
           </span>
         </div>
       </div>
       <div class="party-form-grid">
-        <div class="party-field">Tu ID único de Playzi
+        <div class="party-field">Tu ID de Playzi (compártelo para que te agreguen)
           <div class="party-code-box">
             <code>${escapeHtml(prof.userId || "Generando...")}</code>
             <button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(prof.userId || "")}">Copiar ID</button>
           </div>
         </div>
-        <div class="party-field">Nombre visible en sesiones
+        <div class="party-field">Tu nombre
           <div class="party-row">
             <input class="form-input" id="partyDisplayName" style="flex:1" value="${escapeHtml(prof.displayName || "")}" placeholder="Tu nombre">
             <button class="btn btn-primary" type="button" data-party-action="save-profile">Guardar</button>
           </div>
         </div>
-      </div>
-      <div class="party-field">Servidor Hub Online (Cloudflare Workers URL para amigos, invitaciones y relay sin IP local)
-        <div class="party-row">
-          <input class="form-input" id="socialHubUrlInput" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="https://playzi-hub.tu-subdominio.workers.dev">
-          <button class="btn btn-ghost" type="button" data-party-action="save-hub-url">Conectar Hub</button>
-        </div>
-        ${social.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.8rem">${escapeHtml(social.lastError)}</div>` : ""}
       </div>
     </div>
 
@@ -4716,30 +5114,17 @@ function renderParty() {
       <div class="party-card">
         <div class="party-card-hdr">
           <div class="party-card-title">Amigos (${friends.length})</div>
-          ${hubConnected ? `<span class="party-pill party-pill--ok">Presencia en vivo</span>` : `<span class="party-pill">Modo local</span>`}
+          <span class="party-pill ${hubConnected ? "party-pill--ok" : ""}">${hubConnected ? "Online" : "Sin conexión"}</span>
         </div>
-        ${hubConnected ? `
-          <div class="party-row">
-            <input class="form-input" id="friendIdInput" style="flex:1" placeholder="ID de Playzi de tu amigo (ej. PZ-AB12-CD34)">
-            <button class="btn btn-primary" type="button" data-party-action="send-friend-request">Enviar solicitud</button>
-          </div>
-        ` : `
-          <div class="party-form-grid">
-            <input class="form-input" id="friendIdInput" placeholder="ID de Playzi (ej. PZ-AB12-CD34)">
-            <input class="form-input" id="friendNameInput" placeholder="Nombre del amigo">
-          </div>
-          <div class="party-row" style="justify-content:space-between">
-            <label class="party-check">
-              <input type="checkbox" id="friendDefaultQueue" checked>
-              Permitir cola por defecto
-            </label>
-            <button class="btn btn-primary" type="button" data-party-action="add-friend">Agregar local</button>
-          </div>
-        `}
+        <div class="party-row">
+          <input class="form-input" id="friendIdInput" style="flex:1" placeholder="ID de Playzi de tu amigo (ej. PZ-AB12-CD34)">
+          <button class="btn btn-primary" type="button" data-party-action="send-friend-request" ${hubConnected ? "" : "disabled"}>Enviar solicitud</button>
+        </div>
+        ${!hubConnected ? `<div class="muted" style="font-size:.8rem">Los amigos funcionan online. ${hubConfigured ? "Reconectando con el servidor..." : "Configura la URL del servidor en Opciones avanzadas."}</div>` : ""}
 
         ${outgoingFriendReqs.length ? `
           <div class="party-list" style="margin-top:4px">
-            <div class="muted" style="font-size:.78rem;font-weight:600">Solicitudes enviadas pendientes</div>
+            <div class="muted" style="font-size:.78rem;font-weight:600">Solicitudes enviadas</div>
             ${outgoingFriendReqs.map((or) => `
               <div class="party-person">
                 <div class="party-person-info">
@@ -4768,7 +5153,6 @@ function renderParty() {
                   <span>${escapeHtml(f.displayName)}</span>
                   ${hasRoom ? `<span class="party-pill party-pill--live">Sala ${escapeHtml(f.room.roomCode)} · ${f.room.participantsCount || 1}</span>` : ""}
                   ${f.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(f.googleAccountName)}</span>` : ""}
-                  <span class="party-pill ${f.defaultAllowQueue ? "party-pill--ok" : ""}">${f.defaultAllowQueue ? "Cola OK" : "Sin cola"}</span>
                 </div>
                 <div class="party-person-meta">
                   ${escapeHtml(f.userId)}${hasRoom && f.room.currentTitle ? ` · ${escapeHtml(f.room.currentTitle)}` : ""}
@@ -4782,10 +5166,28 @@ function renderParty() {
               </div>
             </div>
           `;
-          }).join("") : `<div class="muted" style="font-size:.84rem">Aún no tienes amigos. Comparte tu ID de Playzi o envía una solicitud arriba.</div>`}
+          }).join("") : `<div class="muted" style="font-size:.84rem">Aún no tienes amigos agregados. Pide el ID de Playzi de tu amigo y envíale una solicitud.</div>`}
         </div>
       </div>
     </div>
+
+    <details class="party-card party-card--wide" style="margin-top:8px">
+      <summary class="party-card-title" style="cursor:pointer;font-size:.9rem">Opciones avanzadas de red</summary>
+      <div class="party-field" style="margin-top:12px">Servidor Hub Online (Cloudflare Workers)
+        <div class="party-row">
+          <input class="form-input" id="socialHubUrlInput" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="https://playzi-hub.tu-subdominio.workers.dev">
+          <button class="btn btn-ghost" type="button" data-party-action="save-hub-url">Guardar servidor</button>
+        </div>
+        ${social.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.8rem">${escapeHtml(social.lastError)}</div>` : ""}
+      </div>
+      ${isHost ? `
+        <div class="party-row" style="margin-top:10px">
+          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública personalizada (opcional)" value="${escapeHtml(p.publicWsUrl || "")}">
+          <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
+          <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Forzar túnel Cloudflare"}</button>
+        </div>
+      ` : ""}
+    </details>
   `;
 }
 
@@ -4983,10 +5385,26 @@ document.addEventListener("click", async (ev) => {
   }
 
   const actionBtn = ev.target.closest("[data-party-action]");
-  if (!actionBtn) return;
+  if (!actionBtn) {
+    if (_partyUsersCardOpen && !ev.target.closest("#watch-party-bar")) {
+      _partyUsersCardOpen = false;
+      _updateWatchPartyBar();
+    }
+    return;
+  }
   const action = actionBtn.dataset.partyAction;
 
-  if (action === "open-view") { setView("party"); return; }
+  if (action === "toggle-users-card") {
+    _partyUsersCardOpen = !_partyUsersCardOpen;
+    _updateWatchPartyBar();
+    return;
+  }
+  if (action === "close-users-card") {
+    _partyUsersCardOpen = false;
+    _updateWatchPartyBar();
+    return;
+  }
+  if (action === "open-view") { _partyUsersCardOpen = false; setView("party"); return; }
   if (action === "go-watch") { setView("watch"); return; }
   if (action === "resync") {
     _partyLastSyncedUrl = "";
@@ -5035,11 +5453,8 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (action === "start-host") {
-    const port = Number($("#partyHostPort")?.value || 8766);
     const queuePolicy = $("#partyHostPolicy")?.value || "all";
     const roomAccess = $("#partyRoomAccess")?.value || "request";
-    const publicHost = ($("#partyPublicHost")?.value || "").trim();
-    const startTunnel = Boolean($("#partyStartTunnel")?.checked);
     const media = _getCurrentMediaState();
     const initialQueue = (state.player.queue || []).map((q) => ({
       url: q.url,
@@ -5051,11 +5466,8 @@ document.addEventListener("click", async (ev) => {
     }));
     try {
       const snap = await api.post("/api/party/host", {
-        port,
         queuePolicy,
         roomAccess,
-        publicHost: publicHost || null,
-        startTunnel,
         useRelay: true,
         initialQueue,
         initialIndex: state.player.index || 0,
@@ -5063,7 +5475,7 @@ document.addEventListener("click", async (ev) => {
         initialIsPlaying: media.isPlaying || false,
       });
       _onPartyStateUpdate(snap, { skipAutoLoad: true });
-      toast(`Sesión iniciada · Sala ${snap.roomCode}`);
+      toast(`Sala creada · ${snap.roomCode}`);
     } catch (err) { toast(err.message); }
     return;
   }
@@ -5105,6 +5517,25 @@ document.addEventListener("click", async (ev) => {
 });
 
 document.addEventListener("change", async (ev) => {
+  const permChk = ev.target.closest("[data-party-perm-user]");
+  if (permChk) {
+    if (!state.party?.active || state.party.role !== "host") return;
+    const userId = permChk.dataset.partyPermUser;
+    const permKey = permChk.dataset.partyPermKey;
+    if (!userId || !permKey) return;
+    try {
+      const snap = await api.post("/api/party/permissions", {
+        userId,
+        [permKey]: Boolean(permChk.checked),
+      });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+    } catch (err) {
+      permChk.checked = !permChk.checked;
+      toast(err.message);
+    }
+    return;
+  }
+
   const allowChk = ev.target.closest("[data-party-allow-uid]");
   if (!allowChk || !state.party?.active || state.party.role !== "host") return;
   const uid = allowChk.dataset.partyAllowUid;

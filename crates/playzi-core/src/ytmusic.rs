@@ -1,19 +1,36 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Local;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ORIGIN, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use crate::cookies::CookieJar;
 use crate::error::{CoreError, Result};
 use crate::state::StateStore;
-use crate::youtube::{MediaItem, last_thumbnail_url, parse_duration_text, text_from_node, walk_renderers};
+use crate::youtube::{
+    MediaItem, format_duration, last_thumbnail_url, parse_duration_text, text_from_node,
+    walk_renderers,
+};
 
 pub const DEFAULT_YTMUSIC_BASE_URL: &str = "https://music.youtube.com";
 const DEFAULT_MUSIC_CLIENT_VERSION: &str = "1.20240520.01.00";
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+
+#[derive(Debug, Clone)]
+struct CachedTrackMeta {
+    duration: u64,
+    channel_url: Option<String>,
+    author: Option<String>,
+}
+
+fn track_meta_cache() -> &'static Mutex<HashMap<String, CachedTrackMeta>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedTrackMeta>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -282,6 +299,7 @@ impl YtMusicClient {
         }
         let data = self.post_innertube("search", payload).await?;
         let mut items = parse_music_items(&data, limit.clamp(1, 50));
+        self.enrich_missing_durations(&mut items).await;
         if let Some(f) = filter {
             for item in &mut items {
                 if item.result_type.is_none() {
@@ -292,17 +310,77 @@ impl YtMusicClient {
         Ok(items)
     }
 
-    /// Fetches personalized YouTube Music home recommendations (`FEmusic_home`).
+    /// Fetches personalized YouTube Music home recommendations (`FEmusic_home`),
+    /// optionally following continuation pages to collect more songs, and enriches missing durations.
     pub async fn fetch_recommendations(
         &self,
         store: Option<&StateStore>,
     ) -> Result<Vec<MediaItem>> {
-        let data = self.browse("FEmusic_home").await?;
-        let playlists = parse_music_playlists(&data, 16);
-        let songs = parse_music_items(&data, 40);
+        self.fetch_recommendations_pages(store, 1, false).await
+    }
+
+    /// Fetches additional personalized YouTube Music recommendations via continuation tokens
+    /// and merges them into the persisted recommendation list.
+    pub async fn fetch_recommendations_more(
+        &self,
+        store: Option<&StateStore>,
+    ) -> Result<Vec<MediaItem>> {
+        self.fetch_recommendations_pages(store, 3, true).await
+    }
+
+    async fn fetch_recommendations_pages(
+        &self,
+        store: Option<&StateStore>,
+        max_pages: usize,
+        merge_existing: bool,
+    ) -> Result<Vec<MediaItem>> {
+        let mut data = self.browse("FEmusic_home").await?;
+        let mut playlists = parse_music_playlists(&data, 16);
+        let mut songs = parse_music_items(&data, 50);
+
+        let mut extra_pages = 0usize;
+        while extra_pages + 1 < max_pages {
+            let Some(token) = extract_music_continuation(&data) else {
+                break;
+            };
+            let Ok(next_data) = self
+                .post_innertube(
+                    "browse",
+                    json!({ "continuation": token }),
+                )
+                .await
+            else {
+                break;
+            };
+            playlists.extend(parse_music_playlists(&next_data, 12));
+            songs.extend(parse_music_items(&next_data, 40));
+            data = next_data;
+            extra_pages += 1;
+        }
+
+        // Enrich missing durations for YT Music home items (musicTwoRowItemRenderer / quick picks
+        // often omit duration in the browse payload).
+        self.enrich_missing_durations(&mut songs).await;
 
         let mut items: Vec<MediaItem> = Vec::new();
         let mut seen = HashSet::new();
+
+        if merge_existing {
+            if let Some(st) = store {
+                if let Ok(guard) = st.read() {
+                    for val in &guard.music_recommendations {
+                        if let Ok(mut existing) = serde_json::from_value::<MediaItem>(val.clone()) {
+                            // Clean legacy compound channel names on merge too
+                            existing.channel = clean_music_channel_text(&existing.channel);
+                            if seen.insert(existing.id.clone()) {
+                                items.push(existing);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for p in playlists {
             if seen.insert(p.id.clone()) {
                 let is_mix = p.id.starts_with("RD");
@@ -351,6 +429,116 @@ impl YtMusicClient {
         Ok(items)
     }
 
+    /// Concurrently enriches items missing duration (or channel_url) via `/youtubei/v1/player`.
+    pub async fn enrich_missing_durations(&self, items: &mut [MediaItem]) {
+        let mut missing_indices = Vec::new();
+        for (idx, item) in items.iter_mut().enumerate() {
+            let is_playable = !matches!(
+                item.result_type.as_deref(),
+                Some("mix" | "playlist" | "album" | "artist")
+            );
+            if !is_playable || item.id.is_empty() {
+                continue;
+            }
+            if item.duration.is_some() && item.duration_text != "--:--" {
+                continue;
+            }
+            if let Ok(cache) = track_meta_cache().lock() {
+                if let Some(cached) = cache.get(&item.id) {
+                    item.duration = Some(cached.duration);
+                    item.duration_text = format_duration(Some(cached.duration));
+                    if item.channel_url.is_none() {
+                        item.channel_url = cached.channel_url.clone();
+                    }
+                    if (item.channel.is_empty() || item.channel == "YouTube Music")
+                        && cached.author.is_some()
+                    {
+                        item.channel = cached.author.clone().unwrap_or_default();
+                    }
+                    continue;
+                }
+            }
+            missing_indices.push((idx, item.id.clone()));
+        }
+
+        if missing_indices.is_empty() {
+            return;
+        }
+
+        // Bound concurrency to 8 and cap enrichment to 36 tracks per call for responsiveness.
+        let sem = Arc::new(Semaphore::new(8));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (idx, video_id) in missing_indices.into_iter().take(36) {
+            let client = self.clone();
+            let sem_clone = sem.clone();
+            join_set.spawn(async move {
+                let _permit = sem_clone.acquire().await.ok()?;
+                let meta = tokio::time::timeout(
+                    Duration::from_secs(4),
+                    client.fetch_track_player_meta(&video_id),
+                )
+                .await
+                .ok()??;
+                Some((idx, video_id, meta))
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(Some((idx, video_id, meta))) = res {
+                if let Ok(mut cache) = track_meta_cache().lock() {
+                    if cache.len() > 1000 {
+                        cache.clear();
+                    }
+                    cache.insert(video_id, meta.clone());
+                }
+                if let Some(item) = items.get_mut(idx) {
+                    item.duration = Some(meta.duration);
+                    item.duration_text = format_duration(Some(meta.duration));
+                    if item.channel_url.is_none() {
+                        item.channel_url = meta.channel_url;
+                    }
+                    if (item.channel.is_empty() || item.channel == "YouTube Music")
+                        && meta.author.is_some()
+                    {
+                        item.channel = meta.author.unwrap_or_default();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fetch_track_player_meta(&self, video_id: &str) -> Option<CachedTrackMeta> {
+        let data = self
+            .post_innertube("player", json!({ "videoId": video_id }))
+            .await
+            .ok()?;
+        let details = data.get("videoDetails")?;
+        let duration = details
+            .get("lengthSeconds")
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| v.as_u64())
+            })
+            .filter(|&d| d > 0)?;
+        let channel_url = details
+            .get("channelId")
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with("UC"))
+            .map(|cid| format!("https://www.youtube.com/channel/{cid}"));
+        let author = details
+            .get("author")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some(CachedTrackMeta {
+            duration,
+            channel_url,
+            author,
+        })
+    }
+
     /// Fetches user playlists from YouTube Music (`FEmusic_liked_playlists`).
     pub async fn fetch_playlists(
         &self,
@@ -391,7 +579,9 @@ impl YtMusicClient {
             format!("VL{clean}")
         };
         let data = self.browse(&browse_id).await?;
-        Ok(parse_music_items(&data, 100))
+        let mut items = parse_music_items(&data, 100);
+        self.enrich_missing_durations(&mut items).await;
+        Ok(items)
     }
 
     /// Fetches artist profile, top songs, and releases for a YouTube Music artist browse ID.
@@ -416,7 +606,8 @@ impl YtMusicClient {
             .and_then(|t| first_nested_thumbnail(t))
             .unwrap_or_default();
 
-        let songs = parse_music_items(&data, 20);
+        let mut songs = parse_music_items(&data, 20);
+        self.enrich_missing_durations(&mut songs).await;
         let releases = parse_music_playlists(&data, 20);
 
         Ok(ArtistInfo {
@@ -473,8 +664,14 @@ pub fn parse_music_items(data: &Value, limit: usize) -> Vec<MediaItem> {
         let subtitle = flex_column_text(renderer, 1)
             .or_else(|| text_from_node(renderer.get("subtitle")))
             .unwrap_or_else(|| "YouTube Music".into());
+        let channel = extract_music_artist_name(renderer, &subtitle);
 
-        let duration_text_raw = fixed_column_text(renderer, 0).or_else(|| extract_duration_from_subtitle(&subtitle));
+        let duration_text_raw = fixed_column_text(renderer, 0)
+            .filter(|s| parse_duration_text(s).is_some())
+            .or_else(|| fixed_column_text(renderer, 1).filter(|s| parse_duration_text(s).is_some()))
+            .or_else(|| flex_column_text(renderer, 2).and_then(|s| extract_duration_from_subtitle(&s)))
+            .or_else(|| extract_duration_from_subtitle(&subtitle))
+            .or_else(|| extract_duration_from_renderer_fields(renderer));
         let duration = duration_text_raw.as_deref().and_then(parse_duration_text);
         let thumbnail = first_nested_thumbnail(renderer)
             .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"));
@@ -483,7 +680,7 @@ pub fn parse_music_items(data: &Value, limit: usize) -> Vec<MediaItem> {
             id: video_id.clone(),
             url: format!("https://music.youtube.com/watch?v={video_id}"),
             title,
-            channel: subtitle,
+            channel,
             channel_url: extract_music_channel_url(renderer),
             duration,
             duration_text: duration_text_raw.unwrap_or_else(|| "--:--".into()),
@@ -548,11 +745,143 @@ fn fixed_column_text(renderer: &Value, index: usize) -> Option<String> {
 
 fn extract_duration_from_subtitle(subtitle: &str) -> Option<String> {
     subtitle
-        .split('•')
+        .split(['•', '·'])
         .map(str::trim)
         .rev()
         .find(|part| parse_duration_text(part).is_some())
         .map(ToString::to_string)
+}
+
+fn extract_duration_from_renderer_fields(renderer: &Value) -> Option<String> {
+    if let Some(txt) = text_from_node(renderer.get("lengthText")) {
+        if parse_duration_text(&txt).is_some() {
+            return Some(txt);
+        }
+    }
+    if let Some(overlays) = renderer.get("thumbnailOverlays").and_then(Value::as_array) {
+        for ov in overlays {
+            if let Some(txt) = text_from_node(ov.pointer("/thumbnailOverlayTimeStatusRenderer/text"))
+            {
+                if parse_duration_text(&txt).is_some() {
+                    return Some(txt);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_music_artist_name(renderer: &Value, subtitle: &str) -> String {
+    // 1. Prefer runs that link directly to a UC... channel or artist page.
+    let runs_node = renderer
+        .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")
+        .or_else(|| renderer.pointer("/subtitle/runs"));
+    if let Some(runs) = runs_node.and_then(Value::as_array) {
+        let mut artists = Vec::new();
+        for run in runs {
+            let browse_id = run
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let page_type = run
+                .pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let is_artist = browse_id.starts_with("UC")
+                || page_type == "MUSIC_PAGE_TYPE_ARTIST"
+                || page_type == "MUSIC_PAGE_TYPE_USER_CHANNEL";
+            if is_artist {
+                if let Some(text) = run.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && !artists.iter().any(|a| a == trimmed) {
+                        artists.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        if !artists.is_empty() {
+            return artists.join(", ");
+        }
+    }
+    // 2. Fallback: strip media-type prefixes, view counts, durations, and years from subtitle.
+    clean_music_channel_text(subtitle)
+}
+
+pub fn clean_music_channel_text(subtitle: &str) -> String {
+    let parts: Vec<&str> = subtitle
+        .split(['•', '·'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() <= 1 {
+        return subtitle.trim().to_string();
+    }
+    let filtered: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|part| !is_non_channel_subtitle_part(part))
+        .collect();
+    if let Some(first) = filtered.first() {
+        (*first).to_string()
+    } else {
+        subtitle.trim().to_string()
+    }
+}
+
+fn is_non_channel_subtitle_part(part: &str) -> bool {
+    let lower = part.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "canción"
+            | "cancion"
+            | "song"
+            | "video"
+            | "vídeo"
+            | "episodio"
+            | "episode"
+            | "podcast"
+            | "álbum"
+            | "album"
+            | "sencillo"
+            | "single"
+            | "ep"
+    ) {
+        return true;
+    }
+    if parse_duration_text(part).is_some() {
+        return true;
+    }
+    if lower.contains("visualizaciones")
+        || lower.contains("visualización")
+        || lower.contains("vistas")
+        || lower.contains("views")
+        || lower.contains("reproducciones")
+        || lower.contains("plays")
+        || lower.contains("listeners")
+        || lower.contains("oyentes")
+    {
+        return true;
+    }
+    if part.len() == 4 && part.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    false
+}
+
+fn extract_music_continuation(data: &Value) -> Option<String> {
+    first_string_field(data, "continuation").or_else(|| {
+        for node in walk_renderers(data, "continuationCommand") {
+            if let Some(tok) = node.get("token").and_then(Value::as_str) {
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        }
+        None
+    })
 }
 
 fn extract_music_channel_url(node: &Value) -> Option<String> {
