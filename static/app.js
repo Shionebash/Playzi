@@ -5169,24 +5169,6 @@ function renderParty() {
         </div>
       </div>
     </div>
-
-    <details class="party-card party-card--wide" style="margin-top:8px">
-      <summary class="party-card-title" style="cursor:pointer;font-size:.9rem">Opciones avanzadas de red</summary>
-      <div class="party-field" style="margin-top:12px">Servidor Hub Online
-        <div class="party-row">
-          <input class="form-input" id="socialHubUrlInput" type="password" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="URL del Hub Online">
-          <button class="btn btn-ghost" type="button" data-party-action="save-hub-url">Guardar servidor</button>
-        </div>
-        ${social.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.8rem">${escapeHtml(social.lastError)}</div>` : ""}
-      </div>
-      ${isHost ? `
-        <div class="party-row" style="margin-top:10px">
-          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública personalizada (opcional)" value="${escapeHtml(p.relayConnected ? "" : (p.publicWsUrl || ""))}">
-          <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
-          <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Forzar túnel Cloudflare"}</button>
-        </div>
-      ` : ""}
-    </details>
   `;
 }
 
@@ -5420,15 +5402,6 @@ document.addEventListener("click", async (ev) => {
     } catch (err) { toast(err.message); }
     return;
   }
-  if (action === "save-hub-url") {
-    const socialHubUrl = ($("#socialHubUrlInput")?.value || "").trim();
-    try {
-      const snap = await api.post("/api/social/config", { socialHubUrl });
-      _onSocialStateUpdate(snap);
-      toast(socialHubUrl ? "Conectando al Hub Online..." : "Hub Online desactivado");
-    } catch (err) { toast(err.message); }
-    return;
-  }
   if (action === "send-friend-request") {
     const userId = ($("#friendIdInput")?.value || "").trim();
     try {
@@ -5475,23 +5448,6 @@ document.addEventListener("click", async (ev) => {
       });
       _onPartyStateUpdate(snap, { skipAutoLoad: true });
       toast(`Sala creada · ${snap.roomCode}`);
-    } catch (err) { toast(err.message); }
-    return;
-  }
-  if (action === "set-public-host") {
-    const publicHost = ($("#partyUpdatePublicHost")?.value || "").trim();
-    try {
-      const snap = await api.post("/api/party/public-host", { publicHost });
-      _onPartyStateUpdate(snap, { skipAutoLoad: true });
-      toast("Dirección pública actualizada");
-    } catch (err) { toast(err.message); }
-    return;
-  }
-  if (action === "start-tunnel") {
-    try {
-      toast("Iniciando túnel Cloudflare...");
-      const snap = await api.post("/api/party/tunnel", {});
-      _onPartyStateUpdate(snap, { skipAutoLoad: true });
     } catch (err) { toast(err.message); }
     return;
   }
