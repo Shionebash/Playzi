@@ -2,6 +2,7 @@ pub mod autosync;
 pub mod collections;
 pub mod config;
 pub mod cookies;
+pub mod discord;
 pub mod downloads;
 pub mod error;
 pub mod history;

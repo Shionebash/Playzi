@@ -67,6 +67,19 @@ const state = {
     incomingRoomInvites: [],
     incomingJoinRequests: [],
   },
+  discord: {
+    enabled: true,
+    configured: false,
+    connected: false,
+    showMedia: true,
+    showParty: true,
+    inviteActive: false,
+    userId: "",
+    username: "",
+    globalName: "",
+    lastError: "",
+    pendingJoinRequests: [],
+  },
   party: {
     active: false,
     role: "idle",
@@ -316,6 +329,7 @@ function _destroyPlayer() {
   state.player.loading = false;
   state.player.audioOnly = false;
   state.player.sourceContext = "search";
+  _syncDiscordMediaPresence(true);
 }
 
 function _isShort(item) {
@@ -1854,6 +1868,51 @@ function renderConfig() {
           <div class="config-toggle-sub">Por defecto los Shorts se ocultan y se separan de los videos normales. Activa esta opción para ver la sección de Shorts.</div>
         </div>
       </label>
+      <div style="border-top:1px solid var(--br);padding-top:14px;margin-top:6px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+          <div class="section-title" style="margin:0">Integración con Discord</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            ${(() => {
+              const d = state.discord || {};
+              if (!c.discordEnabled) return `<span class="party-pill">Desactivado</span>`;
+              if (d.connected) {
+                const label = d.globalName || d.username || "Conectado";
+                return `<span class="party-pill party-pill--ok">Conectado: ${escapeHtml(label)}</span>`;
+              }
+              if (!(c.discordClientId || "").trim()) return `<span class="party-pill party-pill--warn">Falta Client ID</span>`;
+              return `<span class="party-pill party-pill--warn">Desconectado</span>`;
+            })()}
+            <button class="btn btn-ghost" type="button" data-discord-reconnect="1" style="padding:4px 10px;font-size:.78rem">Reconectar</button>
+          </div>
+        </div>
+        ${state.discord?.lastError && c.discordEnabled && !state.discord?.connected ? `<div class="muted" style="font-size:.8rem;color:#fbbf24;margin-bottom:10px">${escapeHtml(state.discord.lastError)}</div>` : ""}
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <label class="config-toggle">
+            <input type="checkbox" name="discordEnabled" ${c.discordEnabled !== false ? "checked" : ""}>
+            <div>
+              <div class="config-toggle-title">Activar integración con Discord (Rich Presence)</div>
+              <div class="config-toggle-sub">Conecta Playzi con tu aplicación de escritorio de Discord para mostrar tu actividad y habilitar invitaciones.</div>
+            </div>
+          </label>
+          <label class="config-toggle">
+            <input type="checkbox" name="discordShowMedia" ${c.discordShowMedia !== false ? "checked" : ""}>
+            <div>
+              <div class="config-toggle-title">Mostrar en el perfil lo que estás viendo o escuchando</div>
+              <div class="config-toggle-sub">Muestra el título, canal/artista, miniatura y progreso de reproducción en tu perfil de Discord.</div>
+            </div>
+          </label>
+          <label class="config-toggle">
+            <input type="checkbox" name="discordShowParty" ${c.discordShowParty !== false ? "checked" : ""}>
+            <div>
+              <div class="config-toggle-title">Mostrar sala activa y permitir invitaciones / solicitudes de unión</div>
+              <div class="config-toggle-sub">Muestra que estás en una sala con tus amigos, habilita el botón de invitar (+) en Discord y permite recibir solicitudes de "Pedir unirse".</div>
+            </div>
+          </label>
+          <label>Discord Application Client ID
+            <input class="form-input" name="discordClientId" value="${escapeHtml(c.discordClientId || "")}" placeholder="Ej. 1234567890123456789 (desde Discord Developer Portal)">
+          </label>
+        </div>
+      </div>
       <button class="btn btn-primary" type="submit">Guardar configuración</button>
     </form>
   `;
@@ -2771,6 +2830,7 @@ function _updateMediaSession() {
     else if (vjs) vjs.currentTime(Math.min(vjs.duration() || Infinity, vjs.currentTime() + s));
   });
   navigator.mediaSession.playbackState = "playing";
+  _syncDiscordMediaPresence(true);
 }
 
 async function openWatchQueue(queue, index = 0, sourceContext = "search") {
@@ -4410,6 +4470,10 @@ function bindEvents() {
         cookiesBrowser: form.get("cookiesBrowser") || "",
         cookiesFile: form.get("cookiesFile") || "",
         showShorts: form.get("showShorts") === "on",
+        discordEnabled: form.get("discordEnabled") === "on",
+        discordShowMedia: form.get("discordShowMedia") === "on",
+        discordShowParty: form.get("discordShowParty") === "on",
+        discordClientId: String(form.get("discordClientId") || "").trim(),
       };
       try {
         const savedConfig = await api.post("/api/config", submittedConfig);
@@ -4417,6 +4481,8 @@ function bindEvents() {
         applyShortsVisibility();
         if (IS_TAURI) {
           await refreshNativePlayerStatus();
+          _refreshDiscordStatus().catch(() => {});
+          _syncDiscordMediaPresence(true);
         }
         toast("Configuración guardada");
         renderConfig();
@@ -5055,6 +5121,88 @@ async function bindTauriEvents() {
       if (state.view === "party") renderParty();
     }
   });
+  await listen("discord-state", (event) => {
+    if (event.payload) _onDiscordStateUpdate(event.payload);
+  });
+  await listen("discord-notice", (event) => {
+    const msg = event.payload?.message;
+    if (msg) toast(msg);
+  });
+}
+
+let _discordPresenceTimer = null;
+let _discordLastSentKey = "";
+
+function _onDiscordStateUpdate(snap) {
+  if (!snap) return;
+  state.discord = {
+    ...state.discord,
+    ...snap,
+    pendingJoinRequests: Array.isArray(snap.pendingJoinRequests) ? snap.pendingJoinRequests : [],
+  };
+  if (state.view === "config") renderConfig();
+  if (state.view === "party") renderParty();
+  if (state.view === "watch") _updateWatchPartyBar();
+}
+
+async function _refreshDiscordStatus() {
+  if (!IS_TAURI) return;
+  try {
+    const snap = await api.get("/api/discord/status");
+    _onDiscordStateUpdate(snap);
+  } catch (_) {}
+}
+
+function _getCurrentMediaDuration() {
+  const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+  if (isAudio) {
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      return Number(state.player.audioVjs.duration() || 0);
+    }
+    const audio = _getAudioEl();
+    if (audio) return Number(audio.duration || 0);
+  } else if (state.player.vjs && !state.player.vjs.isDisposed()) {
+    return Number(state.player.vjs.duration() || 0);
+  }
+  return 0;
+}
+
+function _syncDiscordMediaPresence(immediate = false) {
+  if (!IS_TAURI) return;
+  const send = () => {
+    const item = state.player.current;
+    if (!item || !item.title) {
+      if (_discordLastSentKey === "inactive" && !immediate) return;
+      _discordLastSentKey = "inactive";
+      api.post("/api/discord/presence", { active: false }).catch(() => {});
+      return;
+    }
+    const media = _getCurrentMediaState();
+    const duration = _getCurrentMediaDuration();
+    const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
+    const thumb = normalizeThumbUrl(item.thumbnail || "");
+    const payload = {
+      active: true,
+      title: String(item.title || ""),
+      channel: String(item.channel || ""),
+      thumbnail: /^https?:\/\//i.test(thumb) ? thumb : "",
+      url: String(item.url || ""),
+      isPlaying: Boolean(media.isPlaying),
+      isAudio: Boolean(isAudio),
+      positionSecs: Number.isFinite(media.positionSecs) ? Math.max(0, media.positionSecs) : 0,
+      durationSecs: Number.isFinite(duration) ? Math.max(0, duration) : 0,
+    };
+    const key = `${payload.url}|${payload.title}|${payload.isPlaying}|${payload.isAudio}|${Math.round(payload.positionSecs / 5)}|${Math.round(payload.durationSecs)}`;
+    if (!immediate && key === _discordLastSentKey) return;
+    _discordLastSentKey = key;
+    api.post("/api/discord/presence", payload).catch(() => {});
+  };
+  clearTimeout(_discordPresenceTimer);
+  if (immediate) {
+    send();
+  } else {
+    _discordPresenceTimer = setTimeout(send, 250);
+  }
 }
 
 // ── Watch Party / Sesión Compartida ──────────────────────────────────────────
@@ -5313,6 +5461,19 @@ function _updateWatchPartyBar() {
     if (p.canSelfRemoveQueue) granted.push("quitar de cola");
     permLabel = granted.length ? `Permisos: ${granted.join(", ")}` : "Solo ver";
   }
+  const discordReqs = (state.discord?.pendingJoinRequests || []);
+  const discordReqBarHtml = discordReqs.length ? `
+    <div class="watch-party-bar" style="margin-top:8px;border-color:var(--accent-glow)">
+      <div class="party-row">
+        <span class="party-pill party-pill--warn">Discord</span>
+        <span><strong>${escapeHtml(discordReqs[0].globalName || discordReqs[0].username)}</strong> pide unirse a tu sala${discordReqs.length > 1 ? ` (+${discordReqs.length - 1} más)` : ""}</span>
+      </div>
+      <div class="party-row">
+        <button class="btn btn-primary" type="button" data-discord-join-respond="${escapeHtml(discordReqs[0].userId)}" data-accept="1">Aceptar</button>
+        <button class="btn btn-ghost" type="button" data-discord-join-respond="${escapeHtml(discordReqs[0].userId)}" data-accept="0">Rechazar</button>
+      </div>
+    </div>
+  ` : "";
   bar.innerHTML = `
     <div class="watch-party-bar">
       <div class="party-row">
@@ -5325,6 +5486,7 @@ function _updateWatchPartyBar() {
         <button class="btn btn-ghost" type="button" data-party-action="open-view">Gestionar sesión</button>
       </div>
     </div>
+    ${discordReqBarHtml}
     ${_partyUsersPopoverHtml(p)}
   `;
 }
@@ -5410,6 +5572,7 @@ async function _pushGuestPlaybackSync(update) {
 }
 
 function _onLocalMediaEvent(kind = "sync") {
+  _syncDiscordMediaPresence(kind === "play" || kind === "pause" || kind === "seeked");
   if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
   if (!state.party?.active) return;
 
@@ -5625,7 +5788,8 @@ function renderParty() {
   const outgoingFriendReqs = social.outgoingFriendRequests || [];
   const incomingInvites = social.incomingRoomInvites || [];
   const incomingJoinReqs = isHost ? (social.incomingJoinRequests || []) : [];
-  const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length;
+  const discordJoinReqs = p.active ? (state.discord?.pendingJoinRequests || []) : [];
+  const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length + discordJoinReqs.length;
   const roomParticipantIds = new Set((p.participants || []).map((u) => String(u.userId || "").toUpperCase()));
   const myRoomCodeUpper = String(p.roomCode || "").toUpperCase();
   const activeFriendRooms = friends.filter((f) => {
@@ -5730,6 +5894,21 @@ function renderParty() {
             </div>
           </div>
         `).join("")}
+        ${discordJoinReqs.map((dr) => `
+          <div class="party-person">
+            <div class="party-person-info">
+              <div class="party-person-name">
+                <span class="party-pill party-pill--warn">Solicitud desde Discord</span>
+                <span><strong>${escapeHtml(dr.globalName || dr.username)}</strong> pide unirse a tu sala</span>
+              </div>
+              <div class="party-person-meta">@${escapeHtml(dr.username)} · Discord</div>
+            </div>
+            <div class="party-row">
+              <button class="btn btn-primary" type="button" data-discord-join-respond="${escapeHtml(dr.userId)}" data-accept="1">Aceptar</button>
+              <button class="btn btn-ghost" type="button" data-discord-join-respond="${escapeHtml(dr.userId)}" data-accept="0">Rechazar</button>
+            </div>
+          </div>
+        `).join("")}
         ${incomingFriendReqs.map((fr) => `
           <div class="party-person">
             <div class="party-person-info">
@@ -5831,6 +6010,9 @@ function renderParty() {
             ${p.relayConnected || p.tunnelRunning || hasPublicUrl
               ? `<span class="party-pill party-pill--ok">Online</span>`
               : `<span class="party-pill party-pill--warn">Preparando conexión online...</span>`}
+            ${state.discord?.connected && state.discord?.inviteActive
+              ? `<span class="party-pill party-pill--ok" title="Tus amigos pueden pedir unirse desde tu perfil de Discord o puedes invitarlos con el botón + en Discord.">Discord activo</span>`
+              : ""}
           </div>
           <div class="party-row">
             <button class="btn btn-party-watch" type="button" data-party-action="go-watch">Ir al reproductor</button>
@@ -5844,6 +6026,9 @@ function renderParty() {
             <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.roomCode)}">Copiar código</button>
           </div>
         </div>
+        ${state.discord?.connected && state.discord?.inviteActive
+          ? `<div class="muted" style="font-size:.82rem">Discord conectado: usa el botón <strong>+</strong> en cualquier chat de Discord para invitar a esta sala, o acepta solicitudes de <strong>Pedir unirse</strong> aquí.</div>`
+          : ""}
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
 
         <div style="border-top:1px solid var(--br);padding-top:12px">
@@ -6162,6 +6347,30 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
+  const discordJoinBtn = ev.target.closest("[data-discord-join-respond]");
+  if (discordJoinBtn) {
+    try {
+      const accept = discordJoinBtn.dataset.accept === "1";
+      const discordSnap = await api.post("/api/discord/join-respond", {
+        userId: discordJoinBtn.dataset.discordJoinRespond,
+        accept,
+      });
+      _onDiscordStateUpdate(discordSnap);
+      toast(accept ? "Invitación enviada por Discord." : "Solicitud de Discord rechazada.");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const discordReconnectBtn = ev.target.closest("[data-discord-reconnect]");
+  if (discordReconnectBtn) {
+    try {
+      const discordSnap = await api.post("/api/discord/reconnect", {});
+      _onDiscordStateUpdate(discordSnap);
+      toast("Intentando reconectar con Discord...");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
   const joinFriendBtn = ev.target.closest("[data-social-join-friend]");
   if (joinFriendBtn) {
     const uid = joinFriendBtn.dataset.socialJoinFriend || "";
@@ -6439,6 +6648,7 @@ async function main() {
     refreshNativePlayerStatus().catch(() => {});
     _refreshPartyStatus().catch(() => {});
     _refreshSocialStatus().catch(() => {});
+    _refreshDiscordStatus().catch(() => {});
     api.get("/api/update/status").then((st) => {
       state.updateStatus = st;
       if (state.view === "config") renderConfig();

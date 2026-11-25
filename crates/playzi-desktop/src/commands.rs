@@ -262,6 +262,7 @@ pub async fn dispatch_api_request(
             let patch: ConfigUpdate =
                 serde_json::from_value(body).map_err(|e| format!("Invalid config payload: {e}"))?;
             let updated = runtime.config.update(patch).map_err(|e| e.to_string())?;
+            runtime.discord.refresh_config().await;
             serde_json::to_value(updated).map_err(|e| e.to_string())
         }
         ("GET", "/api/search") => {
@@ -1211,6 +1212,35 @@ pub async fn dispatch_api_request(
         ("POST", "/api/social/room/invite/dismiss") => {
             let invite_id = body.get("inviteId").and_then(Value::as_str).unwrap_or("");
             let snap = runtime.social.dismiss_room_invite(invite_id).await;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("GET", "/api/discord/status") => {
+            let snap = runtime.discord.status().await;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/discord/presence") => {
+            let media: playzi_core::discord::DiscordMediaState = serde_json::from_value(body)
+                .map_err(|e| format!("Invalid Discord presence payload: {e}"))?;
+            if media.active && !media.title.trim().is_empty() {
+                runtime.discord.update_media(Some(media)).await;
+            } else {
+                runtime.discord.update_media(None).await;
+            }
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/discord/join-respond") => {
+            let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+            let accept = body.get("accept").and_then(Value::as_bool).unwrap_or(false);
+            let snap = runtime
+                .discord
+                .respond_join_request(user_id, accept)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/discord/reconnect") => {
+            runtime.discord.reconnect().await;
+            let snap = runtime.discord.status().await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         _ => dispatch_dynamic_routes(runtime, &method, &path, body).await,

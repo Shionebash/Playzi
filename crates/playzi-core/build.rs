@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-fn read_social_hub_from_dotenv(path: &Path) -> Option<String> {
+fn read_env_key_from_dotenv(path: &Path, key: &str) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     for line in content.lines() {
@@ -10,7 +10,7 @@ fn read_social_hub_from_dotenv(path: &Path) -> Option<String> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=')
-            && k.trim() == "SOCIAL_HUB_URL"
+            && k.trim() == key
         {
             let clean = v.trim().trim_matches('"').trim_matches('\'').trim();
             if !clean.is_empty() {
@@ -23,6 +23,7 @@ fn read_social_hub_from_dotenv(path: &Path) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SOCIAL_HUB_URL");
+    println!("cargo:rerun-if-env-changed=DISCORD_CLIENT_ID");
 
     let env_path = Path::new("../../.env");
     if env_path.exists() {
@@ -33,8 +34,16 @@ fn main() {
         .ok()
         .map(|v| v.trim().trim_matches('"').trim_matches('\'').trim().to_string())
         .filter(|v| !v.is_empty())
-        .or_else(|| read_social_hub_from_dotenv(env_path))
+        .or_else(|| read_env_key_from_dotenv(env_path, "SOCIAL_HUB_URL"))
+        .unwrap_or_default();
+
+    let discord_client_id = std::env::var("DISCORD_CLIENT_ID")
+        .ok()
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| read_env_key_from_dotenv(env_path, "DISCORD_CLIENT_ID"))
         .unwrap_or_default();
 
     println!("cargo:rustc-env=PLAYZI_BUILT_SOCIAL_HUB_URL={url}");
+    println!("cargo:rustc-env=PLAYZI_BUILT_DISCORD_CLIENT_ID={discord_client_id}");
 }

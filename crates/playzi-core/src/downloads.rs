@@ -14,6 +14,7 @@ use tokio::sync::{Semaphore, broadcast, watch};
 use uuid::Uuid;
 
 use crate::config::ConfigStore;
+use crate::cookies::CookieStore;
 use crate::error::{CoreError, Result};
 use crate::state::StateStore;
 
@@ -368,6 +369,17 @@ impl DownloadManager {
             ));
             args.push("--merge-output-format".to_string());
             args.push("mp4".to_string());
+        }
+
+        let store = CookieStore::new(&cfg.root, &cfg.data_dir);
+        let configured = if cfg.cookies_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.cookies_file.as_str())
+        };
+        if let Ok(cookie_file) = store.resolve_cookie_file(configured) {
+            args.push("--cookies".to_string());
+            args.push(cookie_file.to_string_lossy().to_string());
         }
 
         args.push(url.to_string());

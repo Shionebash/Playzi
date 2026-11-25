@@ -226,11 +226,13 @@ pub fn run() {
 
             let mut player_rx = runtime.player.subscribe();
             let app_player = app.handle().clone();
+            let discord_for_player = runtime.discord.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(ev) = player_rx.recv().await {
                     if let Some(mc) = os_media.as_mut() {
                         mc.sync_state(&ev.state);
                     }
+                    discord_for_player.update_native_player(&ev.state).await;
                     let _ = app_player.emit("player-state", &ev);
                 }
             });
@@ -241,16 +243,24 @@ pub fn run() {
                 social_bg.start_background();
             });
 
+            // Start Discord Rich Presence & IPC background client
+            let discord_bg = runtime.discord.clone();
+            tauri::async_runtime::spawn(async move {
+                discord_bg.start_background();
+            });
+
             // Bridge Watch Party events -> Tauri events "party-state" and "party-notice"
-            // Also sync host room presence to Social Hub automatically.
+            // Also sync host room presence to Social Hub and Discord automatically.
             let mut party_rx = runtime.party.subscribe();
             let app_party = app.handle().clone();
             let social_for_party = runtime.social.clone();
+            let discord_for_party = runtime.discord.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(ev) = party_rx.recv().await {
                     match ev {
                         playzi_core::party::PartyEvent::State { snapshot } => {
                             let _ = app_party.emit("party-state", &snapshot);
+                            discord_for_party.update_party(snapshot.clone()).await;
                             if snapshot.active
                                 && snapshot.role == playzi_core::party::PartyRole::Host
                             {
@@ -281,6 +291,54 @@ pub fn run() {
                                 "party-notice",
                                 serde_json::json!({ "level": level, "message": message }),
                             );
+                        }
+                    }
+                }
+            });
+
+            // Bridge Discord IPC events -> Tauri events + automatic room join on Discord invite
+            let mut discord_rx = runtime.discord.subscribe();
+            let app_discord = app.handle().clone();
+            let party_for_discord = runtime.party.clone();
+            let social_for_discord = runtime.social.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(ev) = discord_rx.recv().await {
+                    match ev {
+                        playzi_core::discord::DiscordEvent::State { snapshot } => {
+                            let _ = app_discord.emit("discord-state", &snapshot);
+                        }
+                        playzi_core::discord::DiscordEvent::Notice { level, message } => {
+                            let _ = app_discord.emit(
+                                "discord-notice",
+                                serde_json::json!({ "level": level, "message": message }),
+                            );
+                        }
+                        playzi_core::discord::DiscordEvent::JoinRoom {
+                            room_code,
+                            invite_url,
+                        } => {
+                            if let Some(win) = app_discord.get_webview_window("main") {
+                                let _ = win.unminimize();
+                                let _ = win.set_focus();
+                            }
+                            let req = playzi_core::party::JoinSessionRequest {
+                                invite: invite_url,
+                                room_code: Some(room_code),
+                            };
+                            match party_for_discord.join_session(req).await {
+                                Ok(_) => {
+                                    social_for_discord.force_clear_room_presence().await;
+                                }
+                                Err(err) => {
+                                    let _ = app_discord.emit(
+                                        "discord-notice",
+                                        serde_json::json!({
+                                            "level": "error",
+                                            "message": err.to_string(),
+                                        }),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -376,6 +434,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let runtime = app_handle.state::<AppRuntime>().inner().clone();
                         let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                            runtime.discord.shutdown().await;
                             runtime.party.leave_or_stop().await;
                             runtime.social.shutdown_notify().await;
                         })

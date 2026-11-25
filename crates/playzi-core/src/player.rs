@@ -666,35 +666,52 @@ impl PlayerManager {
         let cache_dir = cfg.data_dir.join("ytdlp_cache");
         let js_runtime = resolve_js_runtime();
 
-        let mut cmd = TokioCommand::new(&ytdlp);
-        cmd.arg("--dump-single-json")
-            .arg("--no-warnings")
-            .arg("--skip-download")
-            .arg("--cache-dir")
-            .arg(&cache_dir);
-
-        if let Some((rt_name, rt_path)) = js_runtime.as_ref() {
-            cmd.arg("--js-runtimes")
-                .arg(format!("{rt_name}:{rt_path}"))
-                .arg("--remote-components")
-                .arg("ejs:github");
-        }
-
         if flat_playlist {
-            cmd.arg("--flat-playlist").arg("--ignore-errors");
-            if let Some(end) = playlist_end {
-                cmd.arg("--playlist-end").arg(end.to_string());
-            }
-            if let Some(cookie_file) = self.resolve_cookie_file() {
-                cmd.arg("--cookies").arg(cookie_file);
-            }
-        } else {
-            cmd.arg("--no-playlist")
-                .arg("--extractor-args")
-                .arg("youtube:player_client=web_safari,default");
+            let cookie_file = self.resolve_cookie_file();
+            let args = build_ytdlp_json_args(
+                &cache_dir,
+                js_runtime.as_ref(),
+                cookie_file.as_deref(),
+                url,
+                true,
+                playlist_end,
+            );
+            return self.run_ytdlp_json_once(&ytdlp, &args).await;
         }
 
-        cmd.arg(url);
+        // Try unauthenticated web_safari/default first (avoids YouTube SABR/PO-token 403);
+        // fall back to cookies when YouTube requires sign-in (bot check, age-restricted, private).
+        let unauth_args = build_ytdlp_json_args(
+            &cache_dir,
+            js_runtime.as_ref(),
+            None,
+            url,
+            false,
+            None,
+        );
+        match self.run_ytdlp_json_once(&ytdlp, &unauth_args).await {
+            Ok(val) => Ok(val),
+            Err(first_err) => {
+                if let Some(cookie_file) = self.resolve_cookie_file() {
+                    let auth_args = build_ytdlp_json_args(
+                        &cache_dir,
+                        js_runtime.as_ref(),
+                        Some(cookie_file.as_path()),
+                        url,
+                        false,
+                        None,
+                    );
+                    self.run_ytdlp_json_once(&ytdlp, &auth_args).await
+                } else {
+                    Err(first_err)
+                }
+            }
+        }
+    }
+
+    async fn run_ytdlp_json_once(&self, ytdlp: &str, args: &[String]) -> Result<Value> {
+        let mut cmd = TokioCommand::new(ytdlp);
+        cmd.args(args);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -784,6 +801,52 @@ pub fn validate_play_target(target: &str, media_root: &Path) -> Result<String> {
         ));
     }
     Ok(canonical_target.to_string_lossy().to_string())
+}
+
+/// Builds `yt-dlp --dump-single-json` CLI arguments for stream or playlist resolution.
+fn build_ytdlp_json_args(
+    cache_dir: &Path,
+    js_runtime: Option<&(String, String)>,
+    cookie_file: Option<&Path>,
+    url: &str,
+    flat_playlist: bool,
+    playlist_end: Option<usize>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--dump-single-json".to_string(),
+        "--no-warnings".to_string(),
+        "--skip-download".to_string(),
+        "--cache-dir".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    ];
+
+    if let Some((rt_name, rt_path)) = js_runtime {
+        args.push("--js-runtimes".to_string());
+        args.push(format!("{rt_name}:{rt_path}"));
+        args.push("--remote-components".to_string());
+        args.push("ejs:github".to_string());
+    }
+
+    if flat_playlist {
+        args.push("--flat-playlist".to_string());
+        args.push("--ignore-errors".to_string());
+        if let Some(end) = playlist_end {
+            args.push("--playlist-end".to_string());
+            args.push(end.to_string());
+        }
+    } else {
+        args.push("--no-playlist".to_string());
+        args.push("--extractor-args".to_string());
+        args.push("youtube:player_client=web_safari,default".to_string());
+    }
+
+    if let Some(cf) = cookie_file {
+        args.push("--cookies".to_string());
+        args.push(cf.to_string_lossy().to_string());
+    }
+
+    args.push(url.to_string());
+    args
 }
 
 /// Builds a `yt-dlp` format selector matching `backend/player.py`.
@@ -2661,5 +2724,31 @@ mod tests {
         assert!(!stopped.active);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn build_ytdlp_json_args_supports_cookie_fallback_for_single_streams() {
+        let cache = PathBuf::from("data/ytdlp_cache");
+        let cookies = PathBuf::from("data/private/cookies_cache.txt");
+        let url = "https://www.youtube.com/watch?v=psRqvowrnkw";
+
+        let unauth = build_ytdlp_json_args(&cache, None, None, url, false, None);
+        assert!(unauth.contains(&"--no-playlist".to_string()));
+        assert!(unauth.contains(&"youtube:player_client=web_safari,default".to_string()));
+        assert!(!unauth.contains(&"--cookies".to_string()));
+        assert_eq!(unauth.last().map(String::as_str), Some(url));
+
+        let with_cookies = build_ytdlp_json_args(
+            &cache,
+            None,
+            Some(cookies.as_path()),
+            url,
+            false,
+            None,
+        );
+        assert!(with_cookies.contains(&"--no-playlist".to_string()));
+        assert!(with_cookies.contains(&"--cookies".to_string()));
+        assert!(with_cookies.contains(&cookies.to_string_lossy().to_string()));
+        assert_eq!(with_cookies.last().map(String::as_str), Some(url));
     }
 }

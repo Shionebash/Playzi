@@ -4,6 +4,7 @@ use playzi_core::autosync::AutoSyncManager;
 use playzi_core::collections::list_collections;
 use playzi_core::config::ConfigStore;
 use playzi_core::cookies::CookieStore;
+use playzi_core::discord::DiscordManager;
 use playzi_core::downloads::{DEFAULT_MAX_CONCURRENT_DOWNLOADS, DownloadManager};
 use playzi_core::error::Result;
 use playzi_core::history::list_history;
@@ -29,6 +30,7 @@ pub struct AppRuntime {
     pub player: PlayerManager,
     pub party: PartyManager,
     pub social: SocialManager,
+    pub discord: DiscordManager,
 }
 
 impl AppRuntime {
@@ -50,6 +52,7 @@ impl AppRuntime {
         let autosync = AutoSyncManager::new(state.clone(), config.clone(), youtube.clone());
         let party = PartyManager::with_config(state.clone(), config.clone());
         let social = SocialManager::new(state.clone(), config.clone());
+        let discord = DiscordManager::new(config.clone());
 
         Ok(Self {
             root_dir,
@@ -62,6 +65,7 @@ impl AppRuntime {
             player,
             party,
             social,
+            discord,
         })
     }
 

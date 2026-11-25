@@ -22,12 +22,22 @@ const ENV_KEY_ORDER: &[&str] = &[
     "PLAYBACK_QUALITY",
     "SHOW_SHORTS",
     "SOCIAL_HUB_URL",
+    "DISCORD_ENABLED",
+    "DISCORD_SHOW_MEDIA",
+    "DISCORD_SHOW_PARTY",
+    "DISCORD_CLIENT_ID",
 ];
 
 /// Built-in default Social Hub URL injected at compile time from `SOCIAL_HUB_URL`
 /// (environment variable or workspace `.env`) via `build.rs`, keeping the URL out of Git.
 pub const DEFAULT_SOCIAL_HUB_URL: &str = match option_env!("PLAYZI_BUILT_SOCIAL_HUB_URL") {
     Some(url) => url,
+    None => "",
+};
+
+/// Built-in default Discord Application Client ID injected at compile time from `DISCORD_CLIENT_ID`.
+pub const DEFAULT_DISCORD_CLIENT_ID: &str = match option_env!("PLAYZI_BUILT_DISCORD_CLIENT_ID") {
+    Some(id) => id,
     None => "",
 };
 
@@ -55,6 +65,10 @@ pub struct PublicConfig {
     pub cookies_file: String,
     pub show_shorts: bool,
     pub social_hub_url: String,
+    pub discord_enabled: bool,
+    pub discord_show_media: bool,
+    pub discord_show_party: bool,
+    pub discord_client_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -72,6 +86,10 @@ pub struct ConfigUpdate {
     pub cookies_file: Option<String>,
     pub show_shorts: Option<bool>,
     pub social_hub_url: Option<String>,
+    pub discord_enabled: Option<bool>,
+    pub discord_show_media: Option<bool>,
+    pub discord_show_party: Option<bool>,
+    pub discord_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +112,10 @@ pub struct AppConfig {
     pub cookies_file: String,
     pub show_shorts: bool,
     pub social_hub_url: String,
+    pub discord_enabled: bool,
+    pub discord_show_media: bool,
+    pub discord_show_party: bool,
+    pub discord_client_id: String,
 }
 
 impl AppConfig {
@@ -156,6 +178,29 @@ impl AppConfig {
             .map(|v| v.trim().trim_matches('"').to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_SOCIAL_HUB_URL.trim().to_string());
+        let discord_enabled = matches!(
+            get("DISCORD_ENABLED", "true").to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        let discord_show_media = matches!(
+            get("DISCORD_SHOW_MEDIA", "true")
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        let discord_show_party = matches!(
+            get("DISCORD_SHOW_PARTY", "true")
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        let discord_client_id = file_map
+            .get("DISCORD_CLIENT_ID")
+            .cloned()
+            .or_else(|| std::env::var("DISCORD_CLIENT_ID").ok())
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_DISCORD_CLIENT_ID.trim().to_string());
 
         Self {
             root,
@@ -176,6 +221,10 @@ impl AppConfig {
             cookies_file,
             show_shorts,
             social_hub_url,
+            discord_enabled,
+            discord_show_media,
+            discord_show_party,
+            discord_client_id,
         }
     }
 
@@ -204,6 +253,10 @@ impl AppConfig {
             cookies_file: self.cookies_file.clone(),
             show_shorts: self.show_shorts,
             social_hub_url: self.social_hub_url.clone(),
+            discord_enabled: self.discord_enabled,
+            discord_show_media: self.discord_show_media,
+            discord_show_party: self.discord_show_party,
+            discord_client_id: self.discord_client_id.clone(),
         }
     }
 }
@@ -267,6 +320,27 @@ impl ConfigStore {
         }
         if let Some(v) = patch.social_hub_url {
             env_map.insert("SOCIAL_HUB_URL".to_string(), v.trim().to_string());
+        }
+        if let Some(v) = patch.discord_enabled {
+            env_map.insert(
+                "DISCORD_ENABLED".to_string(),
+                if v { "true" } else { "false" }.to_string(),
+            );
+        }
+        if let Some(v) = patch.discord_show_media {
+            env_map.insert(
+                "DISCORD_SHOW_MEDIA".to_string(),
+                if v { "true" } else { "false" }.to_string(),
+            );
+        }
+        if let Some(v) = patch.discord_show_party {
+            env_map.insert(
+                "DISCORD_SHOW_PARTY".to_string(),
+                if v { "true" } else { "false" }.to_string(),
+            );
+        }
+        if let Some(v) = patch.discord_client_id {
+            env_map.insert("DISCORD_CLIENT_ID".to_string(), v.trim().to_string());
         }
 
         write_env_map(&cfg.env_file, &env_map)?;
