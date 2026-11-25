@@ -293,19 +293,30 @@ impl YouTubeClient {
         let thumbnail = last_thumbnail_url(details.get("thumbnail"))
             .or_else(|| Some(default_thumbnail(&id)));
 
+        let is_short = trimmed.to_ascii_lowercase().contains("/shorts/");
         let item = MediaItem {
-            url: format!("https://www.youtube.com/watch?v={id}"),
+            url: if is_short {
+                format!("https://www.youtube.com/shorts/{id}")
+            } else {
+                format!("https://www.youtube.com/watch?v={id}")
+            },
             id,
             title,
             channel,
             channel_url: channel_id.map(|cid| format!("https://www.youtube.com/channel/{cid}")),
             duration,
-            duration_text: format_duration(duration),
+            duration_text: if live {
+                "EN VIVO".into()
+            } else if is_short && duration.is_none() {
+                "Short".into()
+            } else {
+                format_duration(duration)
+            },
             thumbnail,
             view_count,
             live,
             members_only: is_members_only_playability(&data),
-            result_type: None,
+            result_type: if is_short { Some("short".into()) } else { None },
         };
 
         self.metadata_cache.set(trimmed.to_string(), item.clone());
@@ -811,11 +822,22 @@ impl YouTubeClient {
         let data = self.post_innertube("browse", payload).await?;
         let (name, handle, avatar, subscriber_count) = extract_channel_header(&data);
 
-        let all_items = if tab == "playlists" {
+        let mut all_items = if tab == "playlists" {
             parse_channel_playlists(&data)
         } else {
             parse_channel_videos(&data, &name, &channel_id)
         };
+        if tab == "shorts" {
+            for item in &mut all_items {
+                item.result_type = Some("short".into());
+                if !item.id.is_empty() {
+                    item.url = format!("https://www.youtube.com/shorts/{}", item.id);
+                }
+                if item.duration_text.is_empty() || item.duration_text == "--:--" {
+                    item.duration_text = "Short".into();
+                }
+            }
+        }
 
         let start = (page - 1) * page_size;
         let has_more = all_items.len() > start + page_size;
@@ -1231,7 +1253,7 @@ fn parse_search_items(data: &Value, limit: usize) -> Vec<MediaItem> {
     let mut seen = HashSet::new();
 
     for renderer in walk_renderers(data, "videoRenderer") {
-        if let Some(item) = parse_video_renderer(renderer, None, None) {
+        if let Some(item) = parse_video_renderer(renderer, None, None, false) {
             if seen.insert(item.id.clone()) {
                 items.push(item);
                 if items.len() >= limit {
@@ -1240,7 +1262,69 @@ fn parse_search_items(data: &Value, limit: usize) -> Vec<MediaItem> {
             }
         }
     }
+    for renderer in walk_renderers(data, "reelItemRenderer") {
+        if let Some(item) = parse_video_renderer(renderer, None, None, true) {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+                if items.len() >= limit {
+                    return items;
+                }
+            }
+        }
+    }
+    for shorts in walk_renderers(data, "shortsLockupViewModel") {
+        if let Some(item) = parse_shorts_lockup(shorts, None, None) {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+                if items.len() >= limit {
+                    return items;
+                }
+            }
+        }
+    }
+    for item in parse_lockup_videos(data) {
+        if seen.insert(item.id.clone()) {
+            items.push(item);
+            if items.len() >= limit {
+                return items;
+            }
+        }
+    }
     items
+}
+
+fn parse_shorts_lockup(
+    shorts: &Value,
+    fallback_channel: Option<&str>,
+    fallback_url: Option<&str>,
+) -> Option<MediaItem> {
+    let vid = shorts
+        .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if vid.len() != 11 {
+        return None;
+    }
+    let title = shorts
+        .pointer("/overlayMetadata/primaryText/content")
+        .and_then(Value::as_str)
+        .unwrap_or("Short")
+        .to_string();
+    let thumbnail = lockup_thumbnail(shorts).or_else(|| Some(default_thumbnail(vid)));
+    Some(MediaItem {
+        id: vid.to_string(),
+        url: format!("https://www.youtube.com/shorts/{vid}"),
+        title,
+        channel: fallback_channel.unwrap_or("YouTube").to_string(),
+        channel_url: fallback_url.map(ToString::to_string),
+        duration: None,
+        duration_text: "Short".into(),
+        thumbnail,
+        view_count: None,
+        live: false,
+        members_only: is_members_only_renderer(shorts),
+        result_type: Some("short".into()),
+    })
 }
 
 fn parse_channel_videos(data: &Value, channel_name: &str, channel_id: &str) -> Vec<MediaItem> {
@@ -1258,9 +1342,10 @@ fn parse_channel_videos(data: &Value, channel_name: &str, channel_id: &str) -> V
     };
 
     for key in ["videoRenderer", "gridVideoRenderer", "reelItemRenderer"] {
+        let force_short = key == "reelItemRenderer";
         for renderer in walk_renderers(data, key) {
             if let Some(item) =
-                parse_video_renderer(renderer, fallback_channel, fallback_url.as_deref())
+                parse_video_renderer(renderer, fallback_channel, fallback_url.as_deref(), force_short)
             {
                 if seen.insert(item.id.clone()) {
                     items.push(item);
@@ -1281,33 +1366,11 @@ fn parse_channel_videos(data: &Value, channel_name: &str, channel_id: &str) -> V
         }
     }
     for shorts in walk_renderers(data, "shortsLockupViewModel") {
-        let vid = shorts
-            .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if vid.len() != 11 || !seen.insert(vid.to_string()) {
-            continue;
+        if let Some(item) = parse_shorts_lockup(shorts, fallback_channel, fallback_url.as_deref()) {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
         }
-        let title = shorts
-            .pointer("/overlayMetadata/primaryText/content")
-            .and_then(Value::as_str)
-            .unwrap_or("Short")
-            .to_string();
-        let thumbnail = lockup_thumbnail(shorts).or_else(|| Some(default_thumbnail(vid)));
-        items.push(MediaItem {
-            id: vid.to_string(),
-            url: format!("https://www.youtube.com/shorts/{vid}"),
-            title,
-            channel: fallback_channel.unwrap_or("YouTube").to_string(),
-            channel_url: fallback_url.clone(),
-            duration: None,
-            duration_text: "Short".into(),
-            thumbnail,
-            view_count: None,
-            live: false,
-            members_only: is_members_only_renderer(shorts),
-            result_type: Some("short".into()),
-        });
     }
     items
 }
@@ -1344,12 +1407,17 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             .unwrap_or("YouTube")
             .to_string();
         let channel_url = extract_lockup_channel_url(lockup);
+        let is_short = is_short_renderer(lockup);
         let (duration, duration_text_raw, live) = extract_duration_and_live(lockup);
         let thumbnail = lockup_thumbnail(lockup).or_else(|| Some(default_thumbnail(video_id)));
 
         items.push(MediaItem {
             id: video_id.to_string(),
-            url: format!("https://www.youtube.com/watch?v={video_id}"),
+            url: if is_short {
+                format!("https://www.youtube.com/shorts/{video_id}")
+            } else {
+                format!("https://www.youtube.com/watch?v={video_id}")
+            },
             title,
             channel,
             channel_url,
@@ -1357,6 +1425,8 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             duration_text: duration_text_raw.unwrap_or_else(|| {
                 if live {
                     "EN VIVO".into()
+                } else if is_short && duration.is_none() {
+                    "Short".into()
                 } else {
                     format_duration(duration)
                 }
@@ -1365,7 +1435,7 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             view_count: None,
             live,
             members_only: is_members_only_renderer(lockup),
-            result_type: None,
+            result_type: if is_short { Some("short".into()) } else { None },
         });
     }
     items
@@ -1635,6 +1705,7 @@ fn parse_video_renderer(
     renderer: &Value,
     fallback_channel: Option<&str>,
     fallback_channel_url: Option<&str>,
+    force_short: bool,
 ) -> Option<MediaItem> {
     if is_ad_renderer(renderer) {
         return None;
@@ -1654,6 +1725,7 @@ fn parse_video_renderer(
     let channel_url = extract_browse_channel_url(renderer)
         .or_else(|| fallback_channel_url.map(ToString::to_string));
 
+    let is_short = force_short || is_short_renderer(renderer);
     let (duration, duration_raw, live) = extract_duration_and_live(renderer);
     let view_count = text_from_node(renderer.get("viewCountText"))
         .as_deref()
@@ -1664,7 +1736,11 @@ fn parse_video_renderer(
 
     Some(MediaItem {
         id: video_id.to_string(),
-        url: format!("https://www.youtube.com/watch?v={video_id}"),
+        url: if is_short {
+            format!("https://www.youtube.com/shorts/{video_id}")
+        } else {
+            format!("https://www.youtube.com/watch?v={video_id}")
+        },
         title,
         channel,
         channel_url,
@@ -1672,6 +1748,8 @@ fn parse_video_renderer(
         duration_text: duration_raw.unwrap_or_else(|| {
             if live {
                 "EN VIVO".into()
+            } else if is_short && duration.is_none() {
+                "Short".into()
             } else {
                 format_duration(duration)
             }
@@ -1680,8 +1758,58 @@ fn parse_video_renderer(
         view_count,
         live,
         members_only: is_members_only_renderer(renderer),
-        result_type: None,
+        result_type: if is_short { Some("short".into()) } else { None },
     })
+}
+
+fn is_short_renderer(node: &Value) -> bool {
+    for ptr in [
+        "/navigationEndpoint/reelWatchEndpoint",
+        "/onTap/innertubeCommand/reelWatchEndpoint",
+        "/rendererContext/commandContext/onTap/innertubeCommand/reelWatchEndpoint",
+    ] {
+        if node.pointer(ptr).is_some() {
+            return true;
+        }
+    }
+    for ptr in [
+        "/navigationEndpoint/commandMetadata/webCommandMetadata/url",
+        "/onTap/innertubeCommand/commandMetadata/webCommandMetadata/url",
+        "/rendererContext/commandContext/onTap/innertubeCommand/commandMetadata/webCommandMetadata/url",
+    ] {
+        if let Some(url) = node.pointer(ptr).and_then(Value::as_str) {
+            if url.to_ascii_lowercase().contains("/shorts/") {
+                return true;
+            }
+        }
+    }
+    for overlay in walk_renderers(node, "thumbnailOverlayTimeStatusRenderer") {
+        if let Some(style) = overlay.get("style").and_then(Value::as_str) {
+            if style.to_ascii_uppercase().contains("SHORT") {
+                return true;
+            }
+        }
+        if let Some(text) = text_from_node(overlay.get("text")) {
+            let up = text.trim().to_ascii_uppercase();
+            if up == "SHORT" || up == "SHORTS" {
+                return true;
+            }
+        }
+    }
+    for badge in walk_renderers(node, "thumbnailBadgeViewModel") {
+        if let Some(style) = badge.get("badgeStyle").and_then(Value::as_str) {
+            if style.to_ascii_uppercase().contains("SHORT") {
+                return true;
+            }
+        }
+        if let Some(text) = badge.get("text").and_then(Value::as_str) {
+            let up = text.trim().to_ascii_uppercase();
+            if up == "SHORT" || up == "SHORTS" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn extract_channel_header(data: &Value) -> (String, String, String, Option<u64>) {
@@ -2090,7 +2218,7 @@ mod tests {
                 }
             ]
         });
-        let item = parse_video_renderer(&members_renderer, Some("Channel"), None)
+        let item = parse_video_renderer(&members_renderer, Some("Channel"), None, false)
             .expect("should parse members video");
         assert!(item.members_only);
 
@@ -2099,7 +2227,7 @@ mod tests {
             "title": { "runs": [{ "text": "Members only reaction (public video)" }] },
             "badges": []
         });
-        let normal = parse_video_renderer(&normal_renderer, Some("Channel"), None)
+        let normal = parse_video_renderer(&normal_renderer, Some("Channel"), None, false)
             .expect("should parse normal video");
         assert!(!normal.members_only);
     }
@@ -2182,7 +2310,7 @@ mod tests {
                 }
             ]
         });
-        let item = parse_video_renderer(&overlay_only_renderer, None, None).unwrap();
+        let item = parse_video_renderer(&overlay_only_renderer, None, None, false).unwrap();
         assert_eq!(item.duration, Some(3725));
         assert_eq!(item.duration_text, "1:02:05");
     }

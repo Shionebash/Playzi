@@ -685,3 +685,103 @@ async fn autosync_due_checks_refresh_all_and_background_loop() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     autosync.stop_background();
 }
+
+#[tokio::test]
+async fn shorts_detection_and_config_default_disabled() {
+    let dir = TempDir::new().unwrap();
+    let cfg = ConfigStore::load_from_root(dir.path());
+    assert!(!cfg.public_config().show_shorts);
+
+    let updated = cfg
+        .update(playzi_core::config::ConfigUpdate {
+            show_shorts: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(updated.show_shorts);
+
+    let reloaded = ConfigStore::load_from_root(dir.path());
+    assert!(reloaded.public_config().show_shorts);
+
+    let disabled = cfg
+        .update(playzi_core::config::ConfigUpdate {
+            show_shorts: Some(false),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!disabled.show_shorts);
+
+    let base_url = spawn_mock_server(|path, _headers, _body| {
+        if path.starts_with("/youtubei/v1/search") {
+            let payload = json!({
+                "contents": {
+                    "twoColumnSearchResultsRenderer": {
+                        "primaryContents": {
+                            "sectionListRenderer": {
+                                "contents": [{
+                                    "itemSectionRenderer": {
+                                        "contents": [
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "NormalVid01",
+                                                    "title": {"runs": [{"text": "Normal Video"}]},
+                                                    "ownerText": {"runs": [{"text": "Creator A"}]},
+                                                    "lengthText": {"simpleText": "10:15"}
+                                                }
+                                            },
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "ShortVid002",
+                                                    "title": {"runs": [{"text": "Short via ReelEndpoint"}]},
+                                                    "ownerText": {"runs": [{"text": "Creator B"}]},
+                                                    "navigationEndpoint": {
+                                                        "reelWatchEndpoint": {"videoId": "ShortVid002"}
+                                                    }
+                                                }
+                                            },
+                                            {
+                                                "reelItemRenderer": {
+                                                    "videoId": "ShortVid003",
+                                                    "headline": {"simpleText": "Short via ReelItem"}
+                                                }
+                                            },
+                                            {
+                                                "shortsLockupViewModel": {
+                                                    "onTap": {
+                                                        "innertubeCommand": {
+                                                            "reelWatchEndpoint": {"videoId": "ShortVid004"}
+                                                        }
+                                                    },
+                                                    "overlayMetadata": {
+                                                        "primaryText": {"content": "Short via Lockup"}
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            });
+            return (200, "application/json", payload.to_string().into_bytes());
+        }
+        (404, "text/plain", b"not found".to_vec())
+    })
+    .await;
+
+    let yt = YouTubeClient::with_client(reqwest::Client::new(), base_url);
+    let results = yt.search("test shorts", 10).await.unwrap();
+    assert_eq!(results.len(), 4);
+
+    let normal = results.iter().find(|i| i.id == "NormalVid01").unwrap();
+    assert_eq!(normal.result_type, None);
+    assert!(normal.url.contains("/watch?v=NormalVid01"));
+
+    for sid in ["ShortVid002", "ShortVid003", "ShortVid004"] {
+        let short = results.iter().find(|i| i.id == sid).unwrap();
+        assert_eq!(short.result_type.as_deref(), Some("short"));
+        assert!(short.url.contains(&format!("/shorts/{sid}")));
+    }
+}

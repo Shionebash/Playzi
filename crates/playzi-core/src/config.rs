@@ -20,6 +20,7 @@ const ENV_KEY_ORDER: &[&str] = &[
     "AUDIO_FORMAT",
     "YTDLP_SEARCH_LIMIT",
     "PLAYBACK_QUALITY",
+    "SHOW_SHORTS",
     "SOCIAL_HUB_URL",
 ];
 
@@ -52,6 +53,7 @@ pub struct PublicConfig {
     pub playback_quality: String,
     pub cookies_browser: String,
     pub cookies_file: String,
+    pub show_shorts: bool,
     pub social_hub_url: String,
 }
 
@@ -68,6 +70,7 @@ pub struct ConfigUpdate {
     pub playback_quality: Option<String>,
     pub cookies_browser: Option<String>,
     pub cookies_file: Option<String>,
+    pub show_shorts: Option<bool>,
     pub social_hub_url: Option<String>,
 }
 
@@ -89,6 +92,7 @@ pub struct AppConfig {
     pub playback_quality: String,
     pub cookies_browser: String,
     pub cookies_file: String,
+    pub show_shorts: bool,
     pub social_hub_url: String,
 }
 
@@ -141,6 +145,10 @@ impl AppConfig {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let show_shorts = matches!(
+            get("SHOW_SHORTS", "false").to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
         let social_hub_url = file_map
             .get("SOCIAL_HUB_URL")
             .cloned()
@@ -166,6 +174,7 @@ impl AppConfig {
             playback_quality,
             cookies_browser,
             cookies_file,
+            show_shorts,
             social_hub_url,
         }
     }
@@ -193,6 +202,7 @@ impl AppConfig {
             playback_quality: self.playback_quality.clone(),
             cookies_browser: self.cookies_browser.clone(),
             cookies_file: self.cookies_file.clone(),
+            show_shorts: self.show_shorts,
             social_hub_url: self.social_hub_url.clone(),
         }
     }
@@ -251,6 +261,9 @@ impl ConfigStore {
         }
         if let Some(v) = patch.cookies_file {
             env_map.insert("COOKIES_FILE".to_string(), v.trim().to_string());
+        }
+        if let Some(v) = patch.show_shorts {
+            env_map.insert("SHOW_SHORTS".to_string(), if v { "true" } else { "false" }.to_string());
         }
         if let Some(v) = patch.social_hub_url {
             env_map.insert("SOCIAL_HUB_URL".to_string(), v.trim().to_string());

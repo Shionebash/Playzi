@@ -310,7 +310,33 @@ function _destroyPlayer() {
   state.player.sourceContext = "search";
 }
 
+function _isShort(item) {
+  if (!item) return false;
+  if (item.resultType === "short") return true;
+  const url = String(item.url || item.target || "");
+  if (/\/shorts\/[A-Za-z0-9_-]{11}/i.test(url)) return true;
+  const durText = String(item.durationText || "").trim().toLowerCase();
+  if (durText === "short" || durText === "shorts") return true;
+  return false;
+}
+
+function _shortsEnabled() {
+  return Boolean(state.config?.showShorts);
+}
+
+function applyShortsVisibility() {
+  const enabled = _shortsEnabled();
+  const navBtn = $("#navShorts");
+  if (navBtn) navBtn.classList.toggle("hidden", !enabled);
+  if (!enabled && state.view === "shorts") {
+    setView("home");
+  }
+}
+
 function setView(view) {
+  if (view === "shorts" && !_shortsEnabled()) {
+    view = "home";
+  }
   if (state.view === "watch" && view !== "watch") {
     if (state.player.current) {
       // keep player alive — show mini player
@@ -409,6 +435,7 @@ function applyBootstrap(data) {
   state.userProfile = data.userProfile || state.userProfile;
   state.friends = data.friends || state.friends;
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
+  applyShortsVisibility();
 }
 
 async function refreshLists() {
@@ -505,10 +532,12 @@ function playlistResultItem(pl) {
 function render() {
   $("#downloadBadge").textContent = state.downloads.filter((d) => !["done", "error"].includes(d.status)).length || "";
   _updatePartyBadge();
+  applyShortsVisibility();
   renderAuthStatus();
   if (state.view === "home") renderHome();
   if (state.view === "search") renderSearch();
   if (state.view === "recom") renderRecom();
+  if (state.view === "shorts") renderShorts();
   if (state.view === "channels") renderChannels();
   if (state.view === "library") renderLibrary();
   if (state.view === "music") renderMusic();
@@ -541,7 +570,7 @@ function syncNotice(section) {
 function renderHome() {
   const recent = state.history.filter((item) => item.url || item.target).slice(0, 8);
   const allMusic = _uniqueByUrl([...(state.musicLibrary?.liked || []), ...state.musicRecommendations]);
-  const allVideos = _uniqueByUrl([...state.recommendations, ...state.feed]);
+  const allVideos = _uniqueByUrl([...state.recommendations, ...state.feed]).filter((item) => !_isShort(item));
   const musicLimit = state.homeExpanded.music ? allMusic.length : 8;
   const videosLimit = state.homeExpanded.videos ? allVideos.length : 8;
   const music = allMusic.slice(0, musicLimit);
@@ -588,6 +617,9 @@ function renderSearch(loading = false) {
   const root = $("#view-search");
   const q = state.query.trim();
   const direct = isUrl(q);
+  const visibleResults = (_shortsEnabled() || direct)
+    ? state.results
+    : state.results.filter((item) => !_isShort(item));
   root.innerHTML = `
     ${direct ? `
       <div class="url-banner">
@@ -602,7 +634,7 @@ function renderSearch(loading = false) {
       </div>` : ""}
     <div class="section-hdr">
       <span class="section-title">${q ? `Resultados para "${escapeHtml(q)}"` : "Buscar"}</span>
-      <span class="meta">${loading ? "Buscando..." : `${state.results.length} resultados`}</span>
+      <span class="meta">${loading ? "Buscando..." : `${visibleResults.length} resultados`}</span>
     </div>
     <div class="search-scopes">
       ${[
@@ -626,27 +658,44 @@ function renderSearch(loading = false) {
     </div>` : ""}
     ${!q ? empty("Busca por texto o pega una URL", "También puedes agregar canales para mejorar tus recomendaciones locales.") : ""}
     ${q && loading ? empty("Consultando YouTube", "yt-dlp está obteniendo metadata.") : ""}
-    ${q && !loading && state.results.length === 0 ? empty("Sin resultados", "Prueba otra búsqueda o revisa la URL.") : ""}
-    ${state.results.length ? searchResultsHtml(state.results) : ""}
+    ${q && !loading && visibleResults.length === 0 ? empty("Sin resultados", "Prueba otra búsqueda o revisa la URL.") : ""}
+    ${visibleResults.length ? searchResultsHtml(visibleResults, direct) : ""}
   `;
 }
 
-function searchResultsHtml(items) {
-  const shouldGroup = items.some((item) => item.source === "music" && ["track", "video", "artist", "playlist", "album"].includes(item.resultType || ""));
-  if (!shouldGroup) return `<div class="grid">${items.map(videoCard).join("")}</div>`;
+function searchResultsHtml(items, allowDirectShort = false) {
+  const shorts = items.filter(_isShort);
+  const regular = items.filter((item) => !_isShort(item));
+  const showShortsGroup = (_shortsEnabled() || allowDirectShort) && shorts.length > 0;
+  const shouldGroup = regular.some((item) => item.source === "music" && ["track", "video", "artist", "playlist", "album"].includes(item.resultType || ""));
+  if (!shouldGroup) {
+    const regularHtml = regular.length ? `<div class="grid">${regular.map(videoCard).join("")}</div>` : "";
+    const shortsHtml = showShortsGroup ? `
+      <section class="search-result-group">
+        <div class="section-hdr"><span class="section-title">Shorts</span><span class="meta">${shorts.length}</span></div>
+        <div class="grid grid-shorts">${shorts.map(videoCard).join("")}</div>
+      </section>` : "";
+    return regularHtml + shortsHtml;
+  }
   const groups = [
-    ["Canciones", items.filter((item) => item.source === "music" && ["track", "video"].includes(item.resultType || ""))],
-    ["Artistas", items.filter((item) => item.source === "music" && item.resultType === "artist")],
-    ["Playlists", items.filter((item) => item.source === "music" && item.resultType === "playlist")],
-    ["Albumes", items.filter((item) => item.source === "music" && item.resultType === "album")],
-    ["YouTube", items.filter((item) => item.source !== "music")],
+    ["Canciones", regular.filter((item) => item.source === "music" && ["track", "video"].includes(item.resultType || ""))],
+    ["Artistas", regular.filter((item) => item.source === "music" && item.resultType === "artist")],
+    ["Playlists", regular.filter((item) => item.source === "music" && item.resultType === "playlist")],
+    ["Albumes", regular.filter((item) => item.source === "music" && item.resultType === "album")],
+    ["YouTube", regular.filter((item) => item.source !== "music")],
   ].filter(([, groupItems]) => groupItems.length);
-  return groups.map(([title, groupItems]) => `
+  const regularHtml = groups.map(([title, groupItems]) => `
     <section class="search-result-group">
       <div class="section-hdr"><span class="section-title">${escapeHtml(title)}</span><span class="meta">${groupItems.length}</span></div>
       <div class="grid">${groupItems.map(videoCard).join("")}</div>
     </section>
   `).join("");
+  const shortsHtml = showShortsGroup ? `
+    <section class="search-result-group">
+      <div class="section-hdr"><span class="section-title">Shorts</span><span class="meta">${shorts.length}</span></div>
+      <div class="grid grid-shorts">${shorts.map(videoCard).join("")}</div>
+    </section>` : "";
+  return regularHtml + shortsHtml;
 }
 
 function _isRecommendedMix(item) {
@@ -756,8 +805,8 @@ function renderRecom() {
   const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
   const songsAll = _uniqueByUrl(state.musicRecommendations.filter((item) => !_isRecommendedMix(item)));
   const videosAll = _uniqueByUrl([
-    ...state.recommendations.filter((item) => !_isRecommendedMix(item)),
-    ...state.feed,
+    ...state.recommendations.filter((item) => !_isRecommendedMix(item) && !_isShort(item)),
+    ...state.feed.filter((item) => !_isShort(item)),
   ]);
   const mixesAll = _uniqueByUrl([
     ...state.recommendations.filter(_isRecommendedMix),
@@ -820,6 +869,33 @@ function renderRecom() {
         ? empty("Sin feed cargado", "Actualiza recomendaciones o canales para llenar Para ti.")
         : empty("Configura cookies primero", "Necesitas seleccionar el navegador con tu sesión de YouTube."))
       : ""}
+  `;
+}
+
+function renderShorts() {
+  const root = $("#view-shorts");
+  if (!root) return;
+  if (!_shortsEnabled()) {
+    setView("home");
+    return;
+  }
+  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const shortsAll = _uniqueByUrl([
+    ...state.recommendations.filter(_isShort),
+    ...state.feed.filter(_isShort),
+  ]);
+  root.innerHTML = `
+    <div class="section-hdr">
+      <span class="section-title">YouTube Shorts <span class="meta" style="font-size:11px;margin-left:6px">${shortsAll.length}</span></span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-ghost" type="button" id="refreshAllChannels">Canales</button>
+        <button class="btn btn-primary" type="button" id="refreshRecom">Actualizar</button>
+      </div>
+    </div>
+    ${hasCookies ? syncNotice("recommendations") : ""}
+    ${shortsAll.length
+      ? `<div class="grid grid-shorts">${shortsAll.map(videoCard).join("")}</div>`
+      : empty("Sin Shorts cargados", "Actualiza tus recomendaciones o canales para ver YouTube Shorts aquí.")}
   `;
 }
 
@@ -981,6 +1057,10 @@ function renderChannelView() {
   const followBtn = meta ? (meta.alreadyFollowed
     ? `<button class="btn btn-ghost" type="button" data-unfollow-channel="${escapeHtml(meta.followedChannelId || "")}">Siguiendo ✓</button>`
     : `<button class="btn btn-primary" type="button" data-add-channel="${escapeHtml(meta.url || cv.url)}" data-add-channel-name="${escapeHtml(cv.name)}">＋ Seguir canal</button>`) : "";
+  const visibleTabs = CHANNEL_TABS.filter(([key]) => key !== "shorts" || _shortsEnabled());
+  const visibleItems = cv.tab === "videos"
+    ? cv.items.filter((item) => !_isShort(item))
+    : cv.items;
   root.innerHTML = `
     <div class="channel-header">
       ${avatar}
@@ -994,13 +1074,13 @@ function renderChannelView() {
       </div>
     </div>
     <div class="channel-tabs">
-      ${CHANNEL_TABS.map(([key, label]) => `<button class="channel-tab ${key === cv.tab ? "active" : ""}" type="button" data-channel-tab="${key}">${label}</button>`).join("")}
+      ${visibleTabs.map(([key, label]) => `<button class="channel-tab ${key === cv.tab ? "active" : ""}" type="button" data-channel-tab="${key}">${label}</button>`).join("")}
     </div>
-    <div id="channelGrid" class="grid">
-      ${cv.items.length ? cv.items.map(videoCard).join("") : (cv.loading ? _skeletonCards(8) : "")}
+    <div id="channelGrid" class="grid${cv.tab === "shorts" ? " grid-shorts" : ""}">
+      ${visibleItems.length ? visibleItems.map(videoCard).join("") : (cv.loading ? _skeletonCards(8) : "")}
     </div>
-    ${(!cv.loading && !cv.items.length) ? empty(cv.error ? "Sin contenido" : "Sin videos", cv.error || "Este canal no tiene contenido en esta pestaña.") : ""}
-    <div id="channelSentinel" class="channel-sentinel">${cv.loading && cv.items.length ? `<span class="spinner"></span>` : ""}</div>
+    ${(!cv.loading && !visibleItems.length) ? empty(cv.error ? "Sin contenido" : "Sin videos", cv.error || "Este canal no tiene contenido en esta pestaña.") : ""}
+    <div id="channelSentinel" class="channel-sentinel">${cv.loading && visibleItems.length ? `<span class="spinner"></span>` : ""}</div>
   `;
   const back = $("#backToChannels");
   if (back) back.onclick = () => setView("channels");
@@ -1026,7 +1106,8 @@ function _skeletonCards(n) {
 
 function _appendChannelItems(items) {
   const grid = $("#channelGrid");
-  if (grid && items.length) grid.insertAdjacentHTML("beforeend", items.map(videoCard).join(""));
+  const filtered = state.channelView.tab === "videos" ? items.filter((item) => !_isShort(item)) : items;
+  if (grid && filtered.length) grid.insertAdjacentHTML("beforeend", filtered.map(videoCard).join(""));
   _updateChannelSentinel();
 }
 
@@ -1693,6 +1774,13 @@ function renderConfig() {
       <label>Archivo cookies.txt (alternativo; también puedes dejarlo en D:\\ytlocal\\cookies)
         <input class="form-input" name="cookiesFile" value="${escapeHtml(c.cookiesFile || "")}" placeholder="C:\\ruta\\cookies.txt">
       </label>
+      <label class="config-toggle">
+        <input type="checkbox" name="showShorts" ${c.showShorts ? "checked" : ""}>
+        <div>
+          <div class="config-toggle-title">Mostrar sección de YouTube Shorts</div>
+          <div class="config-toggle-sub">Por defecto los Shorts se ocultan y se separan de los videos normales. Activa esta opción para ver la sección de Shorts.</div>
+        </div>
+      </label>
       <button class="btn btn-primary" type="submit">Guardar configuración</button>
     </form>
   `;
@@ -2080,9 +2168,10 @@ function _updateWatchRelated() {
   const hdr = $("#watch-related-hdr");
   if (!el) return;
   const ctx = state.player.sourceContext;
-  const items = ctx === "music"
+  const rawItems = ctx === "music"
     ? state.musicRecommendations
     : (state.recommendations.length ? state.recommendations : state.feed);
+  const items = ctx === "music" ? rawItems : rawItems.filter((item) => !_isShort(item));
   if (hdr) hdr.textContent = `Relacionados · ${items.length}`;
   el.innerHTML = items.slice(0, 30).map((item) => {
     const channelName = item.sourceChannelName
@@ -3146,16 +3235,17 @@ function videoCard(item) {
   const resolvedChannelUrl = _resolveItemChannelUrl(item);
   const channelNameHtml = _renderChannelMetaHtml(channelName, resolvedChannelUrl, !isPlaylist);
 
+  const isShort = _isShort(item);
   return `
-    <article class="card">
+    <article class="card${isShort ? " card--short" : ""}">
       <div class="thumb">
         ${item.thumbnail ? `<img ${thumbAttrs(item.thumbnail)}>` : ""}
         ${item.membersOnly ? `<span class="badge-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}
-        <span class="duration">${escapeHtml(item.durationText || "--:--")}</span>
+        <span class="duration">${escapeHtml(item.durationText || (isShort ? "Short" : "--:--"))}</span>
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(item.title)}</div>
-        <div class="meta"><span class="tag tag-muted">${escapeHtml(sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${item.membersOnly ? `<span class="tag tag-members" title="Requiere membresía activa del canal en YouTube">Solo miembros</span> ` : ""}${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
+        <div class="meta"><span class="tag ${isShort ? "tag-short" : "tag-muted"}">${escapeHtml(isShort ? "Short" : sourceLabel(item.source || (String(item.url || "").includes("music.youtube.com") ? "music" : "youtube")))}</span> ${item.membersOnly ? `<span class="tag tag-members" title="Requiere membresía activa del canal en YouTube">Solo miembros</span> ` : ""}${channelNameHtml}${item.viewCount ? ` · ${Number(item.viewCount).toLocaleString()} vistas` : ""}</div>
       </div>
       <div class="card-actions">
         ${(!isArtist && !isAlbum) ? `<button class="btn btn-primary" type="button" data-play-default data-id="${id}">▶ Reproducir</button>` : ""}
@@ -3771,10 +3861,12 @@ function bindEvents() {
         searchLimit: Number(form.get("searchLimit") || 12),
         cookiesBrowser: form.get("cookiesBrowser") || "",
         cookiesFile: form.get("cookiesFile") || "",
+        showShorts: form.get("showShorts") === "on",
       };
       try {
         const savedConfig = await api.post("/api/config", submittedConfig);
         state.config = { ...submittedConfig, ...savedConfig, playbackQuality: savedConfig.playbackQuality || submittedConfig.playbackQuality };
+        applyShortsVisibility();
         if (IS_TAURI) {
           await refreshNativePlayerStatus();
         }

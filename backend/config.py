@@ -35,6 +35,7 @@ YTDLP_SEARCH_LIMIT = int(_str_env("YTDLP_SEARCH_LIMIT", "12"))
 PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
 COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
 COOKIES_FILE = _str_env("COOKIES_FILE", "")
+SHOW_SHORTS = _str_env("SHOW_SHORTS", "false").lower() in ("1", "true", "yes", "on")
 
 # YouTube Music web client defaults (public values scraped from music.youtube.com)
 YTMUSIC_API_KEY = _str_env("YTMUSIC_API_KEY", "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw")
@@ -56,7 +57,7 @@ def update_config(values: dict) -> dict:
 
 
 def _update_config_locked(values: dict) -> dict:
-    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, COOKIES_BROWSER, COOKIES_FILE
+    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, COOKIES_BROWSER, COOKIES_FILE, SHOW_SHORTS
 
     env_values = _read_env_file()
     old_cookies_browser = COOKIES_BROWSER
@@ -72,6 +73,7 @@ def _update_config_locked(values: dict) -> dict:
         "playbackQuality": "PLAYBACK_QUALITY",
         "cookiesBrowser": "COOKIES_BROWSER",
         "cookiesFile": "COOKIES_FILE",
+        "showShorts": "SHOW_SHORTS",
     }
     # Fields where empty string is a valid value (means "disabled/none")
     _clearable = {"COOKIES_BROWSER", "COOKIES_FILE"}
@@ -79,7 +81,10 @@ def _update_config_locked(values: dict) -> dict:
         value = values.get(public_key)
         if value is None:
             continue
-        stripped = str(value).strip()
+        if isinstance(value, bool):
+            stripped = "true" if value else "false"
+        else:
+            stripped = str(value).strip()
         if stripped == "" and env_key not in _clearable:
             continue  # Don't wipe paths/settings accidentally
         env_values[env_key] = stripped
@@ -98,6 +103,7 @@ def _update_config_locked(values: dict) -> dict:
     PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
     COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
     COOKIES_FILE = _str_env("COOKIES_FILE", "")
+    SHOW_SHORTS = _str_env("SHOW_SHORTS", "false").lower() in ("1", "true", "yes", "on")
     ensure_dirs()
     if old_cookies_browser != COOKIES_BROWSER or old_cookies_file != COOKIES_FILE:
         cache = DATA_DIR / "private" / "cookies_cache.txt"
@@ -135,6 +141,7 @@ def _write_env_file(values: dict[str, str]) -> None:
         "AUDIO_FORMAT",
         "YTDLP_SEARCH_LIMIT",
         "PLAYBACK_QUALITY",
+        "SHOW_SHORTS",
     ]
     lines = [f"{key}={values[key]}" for key in order if key in values]
     for key, value in values.items():
@@ -162,4 +169,5 @@ def public_config() -> dict:
         "playbackQuality": PLAYBACK_QUALITY,
         "cookiesBrowser": COOKIES_BROWSER,
         "cookiesFile": COOKIES_FILE,
+        "showShorts": SHOW_SHORTS,
     }

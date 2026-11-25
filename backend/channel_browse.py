@@ -83,6 +83,12 @@ def browse_channel(url: str, tab: str = "videos", page: int = 1, page_size: int 
         for entry in entries:
             item = _entry_to_item(entry)
             if item.get("url"):
+                if tab == "shorts":
+                    item["resultType"] = "short"
+                    if item.get("id") and "/shorts/" not in str(item["url"]).lower():
+                        item["url"] = f"https://www.youtube.com/shorts/{item['id']}"
+                    if not item.get("durationText") or item.get("durationText") == "--:--":
+                        item["durationText"] = "Short"
                 items.append(item)
 
     channel_id = info.get("channel_id") or info.get("id") or ""

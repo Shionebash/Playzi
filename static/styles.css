@@ -330,6 +330,51 @@ body.sidebar-collapsed .color-picker-group { opacity: 0; pointer-events: none; }
   font-size: 10.5px; font-weight: 800;
 }
 .tag-muted { background: var(--bg3); color: var(--tx2); }
+.tag-short {
+  background: oklch(.62 .21 25 / .16);
+  color: oklch(.62 .21 25);
+  border: 1px solid oklch(.62 .21 25 / .3);
+}
+html[data-theme="dark"] .tag-short {
+  color: oklch(.76 .19 25);
+}
+.grid-shorts {
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+}
+.grid-shorts .card--short .thumb {
+  aspect-ratio: 9/16;
+}
+.config-toggle {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--bg3);
+  border: 1px solid var(--br);
+  cursor: pointer;
+}
+.config-toggle input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.config-toggle-title {
+  color: var(--tx);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+.config-toggle-sub {
+  color: var(--tx2);
+  font-size: 12px;
+  font-weight: 400;
+  margin-top: 2px;
+  line-height: 1.4;
+}
 .tag-members {
   background: oklch(.58 .17 155 / .16);
   color: oklch(.56 .17 155);

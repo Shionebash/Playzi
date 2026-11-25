@@ -30,18 +30,22 @@ def _entry_to_item(entry: dict[str, Any]) -> dict[str, Any]:
     duration = entry.get("duration")
     channel_url = _channel_url_for(entry)
     channel = _channel_name_for(entry)
-    return {
+    is_short = "/shorts/" in str(webpage_url or "").lower() or "/shorts/" in str(entry.get("url") or "").lower()
+    item = {
         "id": str(video_id or ""),
         "url": webpage_url,
         "title": entry.get("title") or "Sin titulo",
         "channel": channel,
         "channelUrl": channel_url,
         "duration": duration,
-        "durationText": _format_duration(duration),
+        "durationText": "Short" if (is_short and duration is None) else _format_duration(duration),
         "thumbnail": _thumbnail_for(entry, str(video_id or ""), webpage_url),
         "viewCount": entry.get("view_count"),
         "live": bool(entry.get("is_live")),
     }
+    if is_short:
+        item["resultType"] = "short"
+    return item
 
 
 def _channel_name_for(entry: dict[str, Any]) -> str:

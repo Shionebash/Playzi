@@ -143,6 +143,7 @@ class ConfigUpdate(BaseModel):
     playbackQuality: Literal["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"] | None = None
     cookiesBrowser: str | None = None
     cookiesFile: str | None = None
+    showShorts: bool | None = None
 
 
 class ChannelRequest(BaseModel):
