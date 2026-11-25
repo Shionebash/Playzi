@@ -276,6 +276,8 @@ export default async function handler(req, res) {
         notice = { level: "error", message: "Faltan datos para enviar la invitación." };
       } else if (!isOnline(st, targetId)) {
         notice = { level: "error", message: "Tu amigo no está conectado en este momento." };
+      } else if (st.rooms?.[targetId]?.roomCode && String(st.rooms[targetId].roomCode).toUpperCase() !== roomCode) {
+        notice = { level: "error", message: `${st.profiles[targetId]?.displayName || targetId} está en una sesión activa.` };
       } else {
         const id = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const invite = {

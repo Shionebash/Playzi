@@ -4904,7 +4904,6 @@ function renderParty() {
   const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length;
   const roomParticipantIds = new Set((p.participants || []).map((u) => String(u.userId || "").toUpperCase()));
   const activeFriendRooms = friends.filter((f) => f.room && f.room.roomCode);
-  const onlineFriends = friends.filter((f) => f.online);
 
   const activeFriendSessionsHtml = (activeFriendRooms.length > 0 || (hubConnected && friends.length > 0 && !p.active)) ? `
     <div class="party-card party-card--wide" style="margin-bottom:16px">
@@ -4927,6 +4926,8 @@ function renderParty() {
             let actionHtml = "";
             if (inSameRoom) {
               actionHtml = `<span class="party-pill party-pill--ok">Ya estás aquí</span>`;
+            } else if (p.active) {
+              actionHtml = `<span class="party-session-status" title="Cierra tu sesión actual si quieres unirte a esta sala.">En una sesión</span>`;
             } else if (room.roomAccess === "invite_only") {
               actionHtml = `<span class="party-pill">Solo invitación</span>`;
             } else if (room.roomAccess === "open") {
@@ -5113,41 +5114,6 @@ function renderParty() {
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
 
         <div style="border-top:1px solid var(--br);padding-top:12px">
-          <div class="party-card-hdr" style="margin-bottom:8px">
-            <div class="party-card-title" style="font-size:.92rem">Invitar amigos a tu sala (${onlineFriends.length} en línea)</div>
-            ${!hubConnected ? `<span class="party-pill party-pill--warn">Hub desconectado</span>` : ""}
-          </div>
-          ${onlineFriends.length ? `
-            <div class="party-list">
-              ${onlineFriends.map((f) => {
-                const uidUpper = String(f.userId || "").toUpperCase();
-                const inRoom = roomParticipantIds.has(uidUpper);
-                const inviteKey = `${String(p.roomCode || "").toUpperCase()}:${uidUpper}`;
-                const invited = _socialSentInvites.has(inviteKey);
-                const inviteReady = hubConnected && (hasPublicUrl || p.relayConnected);
-                return `
-                  <div class="party-person">
-                    <div class="party-person-info">
-                      <div class="party-person-name">
-                        <span class="party-dot party-dot--on" title="En línea"></span>
-                        <span>${escapeHtml(f.displayName)}</span>
-                        ${inRoom ? `<span class="party-pill party-pill--ok">En sala</span>` : ""}
-                      </div>
-                      <div class="party-person-meta">${escapeHtml(f.userId)}</div>
-                    </div>
-                    <div class="party-row">
-                      ${inRoom
-                        ? `<span class="party-pill party-pill--ok">Conectado</span>`
-                        : `<button class="btn ${invited ? "btn-ghost" : "btn-primary"}" type="button" data-social-invite-friend="${escapeHtml(f.userId)}" ${inviteReady ? "" : "disabled"}>${invited ? "Reenviar invitación" : "Invitar"}</button>`}
-                    </div>
-                  </div>
-                `;
-              }).join("")}
-            </div>
-          ` : `<div class="muted" style="font-size:.83rem">No hay amigos conectados en este momento. Comparte el código de sala o agrega amigos abajo.</div>`}
-        </div>
-
-        <div style="border-top:1px solid var(--br);padding-top:12px">
           <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede entrar a tu sala?</div>
           <div class="party-policy-tabs">
             <button type="button" class="party-policy-btn ${(p.roomAccess || "request") === "request" ? "active" : ""}" data-party-access="request">${accessLabels.request}</button>
@@ -5312,20 +5278,23 @@ function renderParty() {
             const uidUpper = String(f.userId || "").toUpperCase();
             const hasRoom = Boolean(f.room && f.room.roomCode);
             const rCodeUpper = hasRoom ? String(f.room.roomCode || "").toUpperCase() : "";
-            const inSameRoom = hasRoom && Boolean(p.active && String(p.roomCode || "").toUpperCase() === rCodeUpper);
-            const inMyRoom = isHost && roomParticipantIds.has(uidUpper);
-            const canRequestJoin = hasRoom && f.room.roomAccess !== "invite_only" && !inSameRoom;
+            const myActive = Boolean(p.active);
+            const inSameRoom = hasRoom && myActive && String(p.roomCode || "").toUpperCase() === rCodeUpper;
+            const inMyRoom = myActive && (roomParticipantIds.has(uidUpper) || inSameRoom);
+            const friendInOtherSession = hasRoom && !inMyRoom;
+            const bothActiveSessions = myActive && friendInOtherSession;
+            const canRequestJoin = !myActive && hasRoom && f.room.roomAccess !== "invite_only" && !inMyRoom;
             const reqSent = hasRoom && _socialSentJoinReqs.has(`${rCodeUpper}:${uidUpper}`);
             const canInvite = hubConnected && isHost && f.online && !inMyRoom;
             const invited = isHost && _socialSentInvites.has(`${String(p.roomCode || "").toUpperCase()}:${uidUpper}`);
             return `
             <div class="party-person">
+              <span class="party-dot ${f.online ? "party-dot--on" : "party-dot--off"}" title="${f.online ? "En línea" : "Desconectado"}"></span>
               <div class="party-person-info">
                 <div class="party-person-name">
-                  <span class="party-dot ${f.online ? "party-dot--on" : "party-dot--off"}" title="${f.online ? "En línea" : "Desconectado"}"></span>
                   <span>${escapeHtml(f.displayName)}</span>
-                  ${inMyRoom ? `<span class="party-pill party-pill--ok">En tu sala</span>` : ""}
-                  ${hasRoom ? `<span class="party-pill party-pill--live">Sala ${escapeHtml(f.room.roomCode)} · ${f.room.participantsCount || 1}</span>` : ""}
+                  ${inMyRoom ? `<span class="party-pill party-pill--ok">${isHost ? "En tu sala" : "En esta sala"}</span>` : ""}
+                  ${hasRoom && !bothActiveSessions && !inMyRoom ? `<span class="party-pill party-pill--live">Sala ${escapeHtml(f.room.roomCode)} · ${f.room.participantsCount || 1}</span>` : ""}
                   ${f.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(f.googleAccountName)}</span>` : ""}
                 </div>
                 <div class="party-person-meta">
@@ -5333,12 +5302,19 @@ function renderParty() {
                 </div>
               </div>
               <div class="party-row">
+                ${bothActiveSessions
+                  ? `<span class="party-session-status" title="Este amigo está en una sesión activa. Cierra tu sesión actual primero si quieres unirte.">En una sesión</span>`
+                  : ""}
                 ${canRequestJoin
                   ? (reqSent
                     ? `<button class="btn btn-ghost" type="button" disabled>Solicitud enviada</button>`
                     : `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(f.room.roomCode)}" data-social-join-access="${escapeHtml(f.room.roomAccess || "request")}">${f.room.roomAccess === "open" ? "Unirse" : "Pedir unirse"}</button>`)
+                  : (!myActive && friendInOtherSession && f.room.roomAccess === "invite_only"
+                    ? `<span class="party-session-status" title="Este amigo está en una sesión solo por invitación.">En una sesión</span>`
+                    : "")}
+                ${canInvite
+                  ? `<button class="btn ${invited && !bothActiveSessions ? "btn-ghost" : "btn-primary"}" type="button" data-social-invite-friend="${escapeHtml(f.userId)}" ${bothActiveSessions ? `data-friend-in-session="1" data-friend-name="${escapeHtml(f.displayName)}"` : ""}>${invited && !bothActiveSessions ? "Reenviar" : "Invitar"}</button>`
                   : ""}
-                ${canInvite ? `<button class="btn ${invited ? "btn-ghost" : "btn-primary"}" type="button" data-social-invite-friend="${escapeHtml(f.userId)}">${invited ? "Reenviar" : "Invitar"}</button>` : ""}
                 <button class="btn btn-ghost" type="button" data-friend-toggle="${escapeHtml(f.userId)}">${f.defaultAllowQueue ? "Quitar cola" : "Permitir cola"}</button>
                 <button class="btn btn-ghost" type="button" data-friend-remove="${escapeHtml(f.userId)}">Eliminar</button>
               </div>
@@ -5481,6 +5457,18 @@ document.addEventListener("click", async (ev) => {
   if (inviteFriendBtn) {
     const uid = inviteFriendBtn.dataset.socialInviteFriend || "";
     const roomCode = state.party?.roomCode || "";
+    const targetFriend = (state.social?.friends || []).find(
+      (x) => String(x.userId || "").toUpperCase() === uid.toUpperCase()
+    );
+    const targetRoomCode = String(targetFriend?.room?.roomCode || "").toUpperCase();
+    const inOtherSession =
+      inviteFriendBtn.dataset.friendInSession === "1" ||
+      (Boolean(targetRoomCode) && targetRoomCode !== String(roomCode || "").toUpperCase());
+    if (inOtherSession) {
+      const friendName = inviteFriendBtn.dataset.friendName || targetFriend?.displayName || "Este amigo";
+      toast(`${friendName} está en una sesión activa`);
+      return;
+    }
     const invKey = `${roomCode.toUpperCase()}:${uid.toUpperCase()}`;
     _socialSentInvites.add(invKey);
     renderParty();
