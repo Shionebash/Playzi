@@ -311,6 +311,88 @@ fn ps_single_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+#[cfg(target_os = "windows")]
+fn build_windows_update_script(
+    installer_path: &Path,
+    relaunch_exe: Option<&Path>,
+    parent_pid: u32,
+    log_path: &Path,
+) -> String {
+    let installer_str = installer_path.to_string_lossy().to_string();
+    let lower = installer_str.to_ascii_lowercase();
+    let relaunch_str = relaunch_exe
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let install_cmd = if lower.ends_with(".msi") {
+        format!(
+            "$proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{}\"', '/passive', '/norestart') -Wait -PassThru",
+            ps_single_quote(&installer_str)
+        )
+    } else {
+        format!(
+            "$proc = Start-Process -FilePath '{}' -ArgumentList @('/S', '/UPDATE') -Wait -PassThru",
+            ps_single_quote(&installer_str)
+        )
+    };
+
+    format!(
+        "$ErrorActionPreference = 'Continue'\n\
+         $logPath = '{log_path}'\n\
+         function Write-UpdateLog([string]$msg) {{\n\
+           try {{\n\
+             $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')\n\
+             Add-Content -LiteralPath $logPath -Value \"[$ts] $msg\" -Encoding UTF8\n\
+           }} catch {{}}\n\
+         }}\n\
+         Write-UpdateLog 'Starting update helper (parent PID {parent_pid})'\n\
+         $deadline = (Get-Date).AddSeconds(15)\n\
+         while ((Get-Date) -lt $deadline) {{\n\
+           if (-not (Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue)) {{ break }}\n\
+           Start-Sleep -Milliseconds 250\n\
+         }}\n\
+         if (Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue) {{\n\
+           Write-UpdateLog 'Parent process still running after 15s; forcing stop'\n\
+           Stop-Process -Id {parent_pid} -Force -ErrorAction SilentlyContinue\n\
+           Start-Sleep -Milliseconds 500\n\
+         }}\n\
+         Start-Sleep -Milliseconds 500\n\
+         Write-UpdateLog 'Running installer: {installer}'\n\
+         try {{\n\
+           {install_cmd}\n\
+           $exitCode = if ($proc) {{ $proc.ExitCode }} else {{ -1 }}\n\
+           Write-UpdateLog \"Installer finished with exit code $exitCode\"\n\
+         }} catch {{\n\
+           Write-UpdateLog \"Installer failed: $($_.Exception.Message)\"\n\
+         }}\n\
+         Start-Sleep -Seconds 1\n\
+         $regInstallDir = ''\n\
+         try {{\n\
+           $regInstallDir = (Get-ItemProperty -Path 'HKCU:\\Software\\playzi\\Playzi' -ErrorAction SilentlyContinue).'(default)'\n\
+         }} catch {{}}\n\
+         $candidates = @(\n\
+           '{relaunch}',\n\
+           $(if ($regInstallDir) {{ Join-Path $regInstallDir 'playzi-desktop.exe' }} else {{ '' }}),\n\
+           (Join-Path $env:LOCALAPPDATA 'Playzi\\playzi-desktop.exe'),\n\
+           (Join-Path $env:LOCALAPPDATA 'Programs\\Playzi\\playzi-desktop.exe'),\n\
+           (Join-Path $env:ProgramFiles 'Playzi\\playzi-desktop.exe')\n\
+         )\n\
+         foreach ($exe in $candidates) {{\n\
+           if ($exe -and (Test-Path -LiteralPath $exe)) {{\n\
+             Write-UpdateLog \"Relaunching $exe\"\n\
+             Start-Process -FilePath $exe\n\
+             break\n\
+           }}\n\
+         }}\n",
+        log_path = ps_single_quote(&log_str),
+        parent_pid = parent_pid,
+        installer = ps_single_quote(&installer_str),
+        install_cmd = install_cmd,
+        relaunch = ps_single_quote(&relaunch_str),
+    )
+}
+
 pub fn launch_installer_and_relaunch(
     installer_path: &Path,
     current_exe: Option<&Path>,
@@ -325,51 +407,23 @@ pub fn launch_installer_and_relaunch(
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        // Do NOT combine with DETACHED_PROCESS: Windows PowerShell aborts
+        // silently with exit code 0 before executing `-File` when launched
+        // with DETACHED_PROCESS. CREATE_NO_WINDOW provides a hidden console
+        // host while CREATE_NEW_PROCESS_GROUP detaches from parent signals.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-        let installer_str = installer_path.to_string_lossy().to_string();
-        let lower = installer_str.to_ascii_lowercase();
-        let relaunch_str = current_exe
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let parent_dir = installer_path.parent().unwrap_or_else(|| Path::new("."));
+        let script_path = parent_dir.join("apply-update.ps1");
+        let log_path = parent_dir.join("update.log");
 
-        let script_path = installer_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("apply-update.ps1");
-
-        let install_cmd = if lower.ends_with(".msi") {
-            format!(
-                "Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '{}', '/passive') -Wait",
-                ps_single_quote(&installer_str)
-            )
-        } else {
-            format!(
-                "Start-Process -FilePath '{}' -ArgumentList '/S' -Wait",
-                ps_single_quote(&installer_str)
-            )
-        };
-
-        let script = format!(
-            "$ErrorActionPreference = 'SilentlyContinue'\n\
-             Start-Sleep -Seconds 2\n\
-             {install_cmd}\n\
-             Start-Sleep -Seconds 1\n\
-             $candidates = @(\n\
-               '{relaunch}',\n\
-               (Join-Path $env:LOCALAPPDATA 'Playzi\\playzi-desktop.exe'),\n\
-               (Join-Path $env:LOCALAPPDATA 'Programs\\Playzi\\playzi-desktop.exe'),\n\
-               (Join-Path $env:ProgramFiles 'Playzi\\playzi-desktop.exe')\n\
-             )\n\
-             foreach ($exe in $candidates) {{\n\
-               if ($exe -and (Test-Path -LiteralPath $exe)) {{\n\
-                 Start-Process -FilePath $exe\n\
-                 break\n\
-               }}\n\
-             }}\n",
-            install_cmd = install_cmd,
-            relaunch = ps_single_quote(&relaunch_str),
+        let script = build_windows_update_script(
+            installer_path,
+            current_exe,
+            std::process::id(),
+            &log_path,
         );
 
         std::fs::write(&script_path, script)?;
@@ -385,7 +439,10 @@ pub fn launch_installer_and_relaunch(
                 "-File",
             ])
             .arg(&script_path)
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
             .spawn()?;
 
         return Ok(());
@@ -485,5 +542,36 @@ mod tests {
 
         let chosen = select_asset_for_platform(&assets, "linux", "x86_64").unwrap();
         assert_eq!(chosen.name, "Playzi_1.0.2_amd64.AppImage");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_update_script_waits_for_parent_and_passes_nsis_update_flags() {
+        let script = build_windows_update_script(
+            Path::new(r"C:\Temp\playzi-updates\Playzi_1.0.4_x64-setup.exe"),
+            Some(Path::new(r"C:\Users\Test\AppData\Local\Playzi\playzi-desktop.exe")),
+            4242,
+            Path::new(r"C:\Temp\playzi-updates\update.log"),
+        );
+
+        assert!(script.contains("Get-Process -Id 4242"));
+        assert!(script.contains("@('/S', '/UPDATE')"));
+        assert!(script.contains("update.log"));
+        assert!(script.contains(r"C:\Users\Test\AppData\Local\Playzi\playzi-desktop.exe"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_update_script_quotes_msi_installer_path() {
+        let script = build_windows_update_script(
+            Path::new(r"C:\Users\My User\AppData\Local\Temp\Playzi_1.0.4_x64.msi"),
+            None,
+            1234,
+            Path::new(r"C:\Users\My User\AppData\Local\Temp\update.log"),
+        );
+
+        assert!(script.contains("'msiexec.exe'"));
+        assert!(script.contains(r##"'"C:\Users\My User\AppData\Local\Temp\Playzi_1.0.4_x64.msi"'"##));
+        assert!(script.contains("'/norestart'"));
     }
 }
