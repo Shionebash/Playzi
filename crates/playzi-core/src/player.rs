@@ -1386,7 +1386,9 @@ pub fn parse_ytdlp_playlist_json(raw: &Value, fallback_url: &str) -> Vec<Playlis
                     String::new()
                 }
             });
-        let duration_secs = entry.get("duration").and_then(Value::as_u64);
+        let duration_secs = entry
+            .get("duration")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)));
         let duration_text = format_duration(duration_secs);
 
         items.push(PlaylistItem {

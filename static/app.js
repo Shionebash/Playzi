@@ -2118,6 +2118,7 @@ function _setupMusicListeners(sig) {
     const cur = $("#musicCurrent");
     if (fill && audio.duration) fill.style.width = `${(audio.currentTime / audio.duration) * 100}%`;
     if (cur) cur.textContent = _formatTime(audio.currentTime);
+    _maybePrefetchNextItem(audio.currentTime);
   }, sig);
 
   audio.addEventListener("loadedmetadata", () => {
@@ -2237,7 +2238,11 @@ function _itemToQueueEntry(item) {
     title: item.title || item.url,
     thumbnail: item.thumbnail || "",
     channel: item.channel || item.sourceChannelName || "",
+    channelUrl: item.channelUrl || "",
+    duration: item.duration || null,
     durationText: item.durationText || "--:--",
+    source: item.source || "",
+    resultType: item.resultType || "",
   };
 }
 
@@ -2339,21 +2344,63 @@ async function _onTrackEnded() {
   }
 }
 
+function _extractVideoIdFromUrl(url) {
+  const m = String(url || "").match(/[?&]v=([A-Za-z0-9_-]{11})/)
+    || String(url || "").match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : "";
+}
+
+function _isExpandablePlaylistOrMix(item) {
+  const url = String(item?.url || "");
+  if (!isUrl(url) || !/[?&]list=/.test(url)) return false;
+  return !url.includes("watch?v=")
+    || _isRecommendedMix(item)
+    || /[?&]list=RD/.test(url);
+}
+
+async function _resolvePlaylistOrMixItems(item) {
+  const data = await api.post("/api/player/playlist", {
+    url: item.url,
+    quality: state.config?.playbackQuality || "best",
+  });
+  if (data.requiresLogin || !data.items?.length) {
+    throw new Error(data.error || "No se pudo cargar la playlist o mix");
+  }
+  return data.items.map(_itemToQueueEntry);
+}
+
 async function addToQueue(item) {
-  const entry = _itemToQueueEntry(item);
+  const isPlaylistOrMix = _isExpandablePlaylistOrMix(item);
+  let entries;
+  if (isPlaylistOrMix) {
+    toast("Cargando cola de la playlist...");
+    try {
+      entries = await _resolvePlaylistOrMixItems(item);
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+  } else {
+    entries = [_itemToQueueEntry(item)];
+  }
+  if (!entries.length) return;
+
   if (state.party?.active) {
     if (state.party.role !== "host" && !state.party.canSelfQueue) {
       toast("El host no ha habilitado permisos de cola para tu usuario");
       return;
     }
     try {
-      const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
-      const snap = await api.post("/api/party/queue/add", {
-        item: { ...entry, sourceContext: ctx || "search" },
-        playNext: false,
-      });
-      _onPartyStateUpdate(snap);
-      toast("Añadido a la cola compartida");
+      let snap = null;
+      for (const entry of entries) {
+        const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
+        snap = await api.post("/api/party/queue/add", {
+          item: { ...entry, sourceContext: ctx || "search" },
+          playNext: false,
+        });
+      }
+      if (snap) _onPartyStateUpdate(snap);
+      toast(entries.length > 1 ? `Añadidas ${entries.length} pistas a la cola compartida` : "Añadido a la cola compartida");
     } catch (err) {
       toast(err.message);
     }
@@ -2361,30 +2408,48 @@ async function addToQueue(item) {
   }
   if (!state.player.current) {
     const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
-    openWatchQueue([entry], 0, ctx);
+    openWatchQueue(entries, 0, ctx);
     return;
   }
-  state.player.queue.push(entry);
-  if (state.player.shuffle) state.player._originalQueue.push(entry);
+  state.player.queue.push(...entries);
+  if (state.player.shuffle) state.player._originalQueue.push(...entries);
   _updateWatchQueue();
-  toast("Añadido a la cola");
+  toast(entries.length > 1 ? `Añadidas ${entries.length} pistas a la cola` : "Añadido a la cola");
 }
 
 async function playNext(item) {
-  const entry = _itemToQueueEntry(item);
+  const isPlaylistOrMix = _isExpandablePlaylistOrMix(item);
+  let entries;
+  if (isPlaylistOrMix) {
+    toast("Cargando cola de la playlist...");
+    try {
+      entries = await _resolvePlaylistOrMixItems(item);
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+  } else {
+    entries = [_itemToQueueEntry(item)];
+  }
+  if (!entries.length) return;
+
   if (state.party?.active) {
     if (state.party.role !== "host" && !state.party.canSelfQueue) {
       toast("El host no ha habilitado permisos de cola para tu usuario");
       return;
     }
     try {
-      const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
-      const snap = await api.post("/api/party/queue/add", {
-        item: { ...entry, sourceContext: ctx || "search" },
-        playNext: true,
-      });
-      _onPartyStateUpdate(snap);
-      toast("Se reproducirá a continuación en la sesión");
+      let snap = null;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const entry = entries[i];
+        const ctx = String(entry.url || "").includes("music.youtube.com") ? "music" : (state.view === "watch" ? state.player.sourceContext : state.view);
+        snap = await api.post("/api/party/queue/add", {
+          item: { ...entry, sourceContext: ctx || "search" },
+          playNext: true,
+        });
+      }
+      if (snap) _onPartyStateUpdate(snap);
+      toast(entries.length > 1 ? `Se reproducirán ${entries.length} pistas a continuación` : "Se reproducirá a continuación en la sesión");
     } catch (err) {
       toast(err.message);
     }
@@ -2392,13 +2457,13 @@ async function playNext(item) {
   }
   if (!state.player.current) {
     const ctx = String(item.url || "").includes("music.youtube.com") ? "music" : state.view;
-    openWatchQueue([entry], 0, ctx);
+    openWatchQueue(entries, 0, ctx);
     return;
   }
-  state.player.queue.splice(state.player.index + 1, 0, entry);
-  if (state.player.shuffle) state.player._originalQueue.push(entry);
+  state.player.queue.splice(state.player.index + 1, 0, ...entries);
+  if (state.player.shuffle) state.player._originalQueue.push(...entries);
   _updateWatchQueue();
-  toast("Se reproducirá a continuación");
+  toast(entries.length > 1 ? `Se reproducirán ${entries.length} pistas a continuación` : "Se reproducirá a continuación");
 }
 
 function _updateMediaSession() {
@@ -2446,8 +2511,28 @@ function _updateMediaSession() {
 }
 
 async function openWatchQueue(queue, index = 0, sourceContext = "search") {
+  const singleItem = queue.length === 1 ? queue[0] : null;
+  if (singleItem && _isExpandablePlaylistOrMix(singleItem)) {
+    toast("Cargando cola...");
+    try {
+      const seedVid = _extractVideoIdFromUrl(singleItem.url);
+      const resolved = await _resolvePlaylistOrMixItems(singleItem);
+      queue = resolved;
+      if (seedVid) {
+        const matchIdx = queue.findIndex((it) => _extractVideoIdFromUrl(it.url) === seedVid);
+        index = matchIdx >= 0 ? matchIdx : 0;
+      } else {
+        index = 0;
+      }
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+  }
+
   if (state.party?.active) {
-    const chosen = queue[index] || queue[0];
+    const chosenList = queue.length ? queue : [];
+    const chosen = chosenList[index] || chosenList[0];
     if (!chosen) return;
     if (state.party.role === "guest") {
       if (state.party.canSelfQueue) {
@@ -2460,47 +2545,35 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
     }
     // Host: enqueue and immediately play it synchronized for everyone
     try {
-      const snap = await api.post("/api/party/queue/add", {
-        item: { ..._itemToQueueEntry(chosen), sourceContext: sourceContext || "search" },
-        playNext: false,
-      });
-      const newIdx = Math.max(0, (snap.queue?.length || 1) - 1);
+      let snap = null;
+      let startIdx = 0;
+      for (let i = 0; i < chosenList.length; i++) {
+        const entry = chosenList[i];
+        snap = await api.post("/api/party/queue/add", {
+          item: { ..._itemToQueueEntry(entry), sourceContext: sourceContext || "search" },
+          playNext: false,
+        });
+        if (i === index) {
+          startIdx = Math.max(0, (snap.queue?.length || 1) - 1);
+        }
+      }
+      if (!snap) return;
       state.player.sourceContext = sourceContext;
       state.player.audioOnly = false;
       _onPartyStateUpdate(snap, { skipAutoLoad: true });
       setView("watch");
-      await loadWebPlayerItem(newIdx);
-      await _pushHostPlaybackSync({ currentIndex: newIdx, positionSecs: 0, isPlaying: true });
+      await loadWebPlayerItem(startIdx);
+      await _pushHostPlaybackSync({ currentIndex: startIdx, positionSecs: 0, isPlaying: true });
     } catch (err) {
       toast(err.message);
     }
     return;
   }
+
   state.player.audioOnly = false;
   state.player.sourceContext = sourceContext;
   state.player.shuffle = false;
   state.player._originalQueue = [];
-  const singleItem = queue.length === 1 ? queue[0] : null;
-  const shouldExpandPlaylist = Boolean(
-    singleItem
-    && isUrl(singleItem.url)
-    && singleItem.url.includes("list=")
-    && (!singleItem.url.includes("watch?v=") || _isRecommendedMix(singleItem) || /[?&]list=RD/.test(singleItem.url))
-  );
-  if (shouldExpandPlaylist) {
-    toast("Cargando cola...");
-    try {
-      const data = await api.post("/api/player/playlist", { url: queue[0].url, quality: state.config?.playbackQuality || "best" });
-      if (data.requiresLogin || !data.items?.length) {
-        toast(data.error || "No se pudo cargar la playlist");
-        return;
-      }
-      queue = data.items;
-    } catch (err) {
-      toast(err.message);
-      return;
-    }
-  }
   state.player.queue = queue;
   state.player.index = index;
   state.player.current = null;
@@ -2703,6 +2776,9 @@ async function _loadMusicItem(item, loadId) {
         const err = state.player.audioVjs?.error();
         _updateWatchMeta(err?.message || "Error al reproducir el audio.");
       });
+      state.player.audioVjs.on("timeupdate", () => {
+        _maybePrefetchNextItem(state.player.audioVjs?.currentTime() || 0);
+      });
     }
     state.player.audioVjs.src({ src: proxiedSrc, type: "application/x-mpegURL" });
     state.player.audioVjs.play().catch(() => {});
@@ -2742,24 +2818,53 @@ async function _loadMusicItem(item, loadId) {
   _updateWatchQueue();
   _updateWatchRelated();
   _updateMediaSession();
+}
+
+// Warm the backend stream cache for the next queue item after 30s of playback
+// so transitioning to the next track or video is smooth and near-instant.
+const PREFETCH_TRIGGER_SECONDS = 30;
+const PREFETCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const _prefetchedStreamMap = new Map();
+
+function _maybePrefetchNextItem(currentTime) {
+  if (!Number.isFinite(currentTime) || currentTime < PREFETCH_TRIGGER_SECONDS) return;
   _prefetchNextItem();
 }
 
-// Warm the backend cache for the next queue item so advancing has no gap.
-const _prefetchedUrls = new Set();
 function _prefetchNextItem() {
-  if (IS_TAURI) return;
   const next = state.player.queue[state.player.index + 1];
-  if (!next || !next.url || _prefetchedUrls.has(next.url)) return;
-  _prefetchedUrls.add(next.url);
+  if (!next || !next.url || !isUrl(next.url)) return;
   const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
-  const quality = encodeURIComponent(state.config?.playbackQuality || "best");
+  const rawQuality = state.config?.playbackQuality || "best";
+  const quality = encodeURIComponent(rawQuality);
+  const cacheKey = `${next.url}|${isAudio ? "audio" : rawQuality}`;
+  const now = Date.now();
+  const prevTs = _prefetchedStreamMap.get(cacheKey);
+  if (prevTs && (now - prevTs) < PREFETCH_CACHE_TTL_MS) return;
+  _prefetchedStreamMap.set(cacheKey, now);
+  if (_prefetchedStreamMap.size > 64) {
+    const oldestKey = _prefetchedStreamMap.keys().next().value;
+    if (oldestKey) _prefetchedStreamMap.delete(oldestKey);
+  }
+
+  if (IS_TAURI) {
+    const endpoint = isAudio
+      ? `/api/player/audio?url=${encodeURIComponent(next.url)}`
+      : `/api/player/info?url=${encodeURIComponent(next.url)}&quality=${quality}`;
+    api.get(endpoint).catch(() => {
+      _prefetchedStreamMap.delete(cacheKey);
+    });
+    return;
+  }
+
   const endpoint = isAudio
     ? `/api/player/audio?url=${encodeURIComponent(next.url)}`
     : next.manifestUrl
       ? next.manifestUrl
       : `/api/player/manifest.mpd?url=${encodeURIComponent(next.url)}&quality=${quality}`;
-  fetch(endpoint).catch(() => {});
+  fetch(endpoint).catch(() => {
+    _prefetchedStreamMap.delete(cacheKey);
+  });
 }
 
 async function _loadVideoItem(item, loadId) {
@@ -2825,7 +2930,6 @@ async function _loadVideoItem(item, loadId) {
   _updateWatchQueue();
   _updateWatchRelated();
   _updateMediaSession();
-  _prefetchNextItem();
 }
 
 async function ensureVideoPlayer() {
@@ -2867,6 +2971,7 @@ async function ensureVideoPlayer() {
     _updateWatchMeta(msg);
   });
   player.on("ended", () => { _onTrackEnded(); });
+  player.on("timeupdate", () => { _maybePrefetchNextItem(player.currentTime()); });
   player.on("play", () => { _onLocalMediaEvent("play"); });
   player.on("pause", () => { _onLocalMediaEvent("pause"); });
   player.on("seeked", () => { _onLocalMediaEvent("seeked"); });
@@ -3254,7 +3359,7 @@ function videoCard(item) {
         ${isPlaylist ? `<button class="btn btn-ghost" type="button" data-import-result-playlist="${escapeHtml(item.url || "")}">Importar</button>` : ""}
         ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-download="video" data-id="${id}">Descargar</button>` : ""}
         ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-download="audio" data-id="${id}">Audio</button>` : ""}
-        ${(!isPlaylist && !isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
+        ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button" data-add-to-queue data-id="${id}" title="Añadir al final de la cola">+ Cola</button>` : ""}
         ${(!isArtist && !isAlbum) ? `<button class="btn btn-ghost" type="button"
           data-add-to-playlist="${escapeHtml(item.url || item.feedId || '')}"
           data-playlist-title="${escapeHtml(item.title || '')}"

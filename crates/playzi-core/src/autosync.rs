@@ -96,11 +96,16 @@ pub struct AutoSyncManager {
 impl AutoSyncManager {
     pub fn new(state: StateStore, config: ConfigStore, youtube: YouTubeClient) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             state,
             config,
             youtube,
-            http: reqwest::Client::new(),
+            http,
             ytmusic_base_url: DEFAULT_YTMUSIC_BASE_URL.to_string(),
             refresh_lock: Arc::new(AsyncMutex::new(())),
             events,

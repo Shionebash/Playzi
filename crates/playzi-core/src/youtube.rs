@@ -678,7 +678,8 @@ impl YouTubeClient {
         let Some(playlist_id) = extract_playlist_id_from_url(url) else {
             return Ok(Vec::new());
         };
-        let video_id = extract_video_id(url);
+        let video_id = extract_video_id(url)
+            .or_else(|| extract_seed_video_from_playlist_id(&playlist_id));
         self.fetch_next_playlist_items(video_id.as_deref(), &playlist_id, limit, false, cookies)
             .await
     }
@@ -1534,6 +1535,22 @@ pub fn extract_playlist_id_from_url(url: &str) -> Option<String> {
     re.captures(url)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+pub fn extract_seed_video_from_playlist_id(playlist_id: &str) -> Option<String> {
+    let clean = playlist_id.trim();
+    if clean.len() == 13 && clean.starts_with("RD") {
+        let candidate = &clean[2..];
+        if candidate.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(candidate.to_string());
+        }
+    } else if clean.len() == 17 && clean.starts_with("RDAMVM") {
+        let candidate = &clean[6..];
+        if candidate.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 fn parse_recommended_mixes(data: &Value) -> Vec<MediaItem> {
