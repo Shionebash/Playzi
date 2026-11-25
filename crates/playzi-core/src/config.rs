@@ -20,6 +20,7 @@ const ENV_KEY_ORDER: &[&str] = &[
     "AUDIO_FORMAT",
     "YTDLP_SEARCH_LIMIT",
     "PLAYBACK_QUALITY",
+    "SOCIAL_HUB_URL",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub struct PublicConfig {
     pub playback_quality: String,
     pub cookies_browser: String,
     pub cookies_file: String,
+    pub social_hub_url: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -59,6 +61,7 @@ pub struct ConfigUpdate {
     pub playback_quality: Option<String>,
     pub cookies_browser: Option<String>,
     pub cookies_file: Option<String>,
+    pub social_hub_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +82,7 @@ pub struct AppConfig {
     pub playback_quality: String,
     pub cookies_browser: String,
     pub cookies_file: String,
+    pub social_hub_url: String,
 }
 
 impl AppConfig {
@@ -130,6 +134,14 @@ impl AppConfig {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let social_hub_url = file_map
+            .get("SOCIAL_HUB_URL")
+            .cloned()
+            .or_else(|| std::env::var("SOCIAL_HUB_URL").ok())
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_string();
 
         Self {
             root,
@@ -148,6 +160,7 @@ impl AppConfig {
             playback_quality,
             cookies_browser,
             cookies_file,
+            social_hub_url,
         }
     }
 
@@ -174,6 +187,7 @@ impl AppConfig {
             playback_quality: self.playback_quality.clone(),
             cookies_browser: self.cookies_browser.clone(),
             cookies_file: self.cookies_file.clone(),
+            social_hub_url: self.social_hub_url.clone(),
         }
     }
 }
@@ -231,6 +245,9 @@ impl ConfigStore {
         }
         if let Some(v) = patch.cookies_file {
             env_map.insert("COOKIES_FILE".to_string(), v.trim().to_string());
+        }
+        if let Some(v) = patch.social_hub_url {
+            env_map.insert("SOCIAL_HUB_URL".to_string(), v.trim().to_string());
         }
 
         write_env_map(&cfg.env_file, &env_map)?;

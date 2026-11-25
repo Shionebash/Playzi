@@ -91,6 +91,30 @@ function Find-Ffmpeg {
     return Find-WingetPackageExe "*FFmpeg*" "ffmpeg.exe"
 }
 
+function Find-Cloudflared {
+    $candidates = @(
+        (Join-Path $BinDir "cloudflared.exe"),
+        (Join-Path $InstallDir "cloudflared.exe"),
+        "C:\Program Files (x86)\cloudflared\cloudflared.exe",
+        "C:\Program Files\cloudflared\cloudflared.exe"
+    )
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Playzi\bin\cloudflared.exe")
+        $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\cloudflared.exe")
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE "scoop\shims\cloudflared.exe")
+    }
+    $candidates += "C:\ProgramData\chocolatey\bin\cloudflared.exe"
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    $cmd = Get-Command "cloudflared" -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    return Find-WingetPackageExe "*cloudflared*" "cloudflared.exe"
+}
+
 function Find-Mpv {
     $candidates = @(
         (Join-Path $BinDir "mpv.exe"),
@@ -223,6 +247,29 @@ function Install-Ffmpeg {
     return Invoke-WingetInstall -PackageId "Gyan.FFmpeg.Essentials" -DisplayName "ffmpeg"
 }
 
+function Install-Cloudflared {
+    $target = Join-Path $BinDir "cloudflared.exe"
+    $tmp = Join-Path $env:TEMP "playzi-cloudflared.exe"
+    $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+    Write-Log "Descargando cloudflared desde GitHub..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -TimeoutSec 120
+        if ((Test-Path -LiteralPath $tmp) -and ((Get-Item -LiteralPath $tmp).Length -gt 1000000)) {
+            Move-Item -LiteralPath $tmp -Destination $target -Force
+            Write-Log "cloudflared instalado en $target"
+            return $true
+        }
+    } catch {
+        Write-Log "Error descargando cloudflared directamente: $($_.Exception.Message)"
+    } finally {
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return Invoke-WingetInstall -PackageId "Cloudflare.cloudflared" -DisplayName "cloudflared"
+}
+
 function Show-DepsDialog(
     [bool]$HasYtDlp,
     [bool]$HasFfmpeg,
@@ -337,6 +384,7 @@ Write-Log "Iniciando verificacion de requisitos de Playzi (InstallDir=$InstallDi
 
 $existingYtDlp = Find-YtDlp
 $existingFfmpeg = Find-Ffmpeg
+$existingCloudflared = Find-Cloudflared
 $existingMpv = Find-Mpv
 $existingVlc = Find-Vlc
 $hasWinget = [bool](Get-WingetPath)
@@ -369,6 +417,12 @@ if ($existingFfmpeg) {
     Write-Log "ffmpeg detectado: $existingFfmpeg"
 } else {
     $null = Install-Ffmpeg
+}
+
+if ($existingCloudflared) {
+    Write-Log "cloudflared detectado: $existingCloudflared"
+} else {
+    $null = Install-Cloudflared
 }
 
 if ($doInstallMpv -and (-not $existingMpv)) {

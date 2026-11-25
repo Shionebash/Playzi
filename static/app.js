@@ -49,6 +49,17 @@ const state = {
   artistView: { channelId: "", name: "", data: null, loading: false, error: "" },
   userProfile: { userId: "", displayName: "", googleAccountName: "" },
   friends: [],
+  social: {
+    configured: false,
+    connected: false,
+    hubUrl: "",
+    lastError: "",
+    friends: [],
+    incomingFriendRequests: [],
+    outgoingFriendRequests: [],
+    incomingRoomInvites: [],
+    incomingJoinRequests: [],
+  },
   party: {
     active: false,
     role: "idle",
@@ -62,6 +73,9 @@ const state = {
     inviteUrl: "",
     tunnelRunning: false,
     tunnelError: "",
+    relayConnected: false,
+    relayError: "",
+    roomAccess: "request",
     queuePolicy: "all",
     allowedQueueUserIds: [],
     canSelfQueue: false,
@@ -4088,6 +4102,13 @@ async function bindTauriEvents() {
     const msg = event.payload?.message;
     if (msg) toast(msg);
   });
+  await listen("social-state", (event) => {
+    if (event.payload) _onSocialStateUpdate(event.payload);
+  });
+  await listen("social-notice", (event) => {
+    const msg = event.payload?.message;
+    if (msg) toast(msg);
+  });
 }
 
 // ── Watch Party / Sesión Compartida ──────────────────────────────────────────
@@ -4097,11 +4118,43 @@ let _partyHeartbeatTimer = null;
 let _partySyncDebounce = null;
 let _partyLastSyncedUrl = "";
 
+function _socialPendingCount() {
+  const s = state.social || {};
+  return (
+    (s.incomingFriendRequests?.length || 0) +
+    (s.incomingRoomInvites?.length || 0) +
+    (s.incomingJoinRequests?.length || 0)
+  );
+}
+
+function _onSocialStateUpdate(snapshot) {
+  if (!snapshot) return;
+  state.social = snapshot;
+  if (Array.isArray(snapshot.friends)) {
+    state.friends = snapshot.friends;
+  }
+  _updatePartyBadge();
+  if (state.view === "party") renderParty();
+}
+
+async function _refreshSocialStatus() {
+  if (!IS_TAURI) return;
+  try {
+    const snap = await api.get("/api/social/status");
+    _onSocialStateUpdate(snap);
+  } catch (_) {}
+}
+
 function _updatePartyBadge() {
   const badge = $("#partyBadge");
   if (!badge) return;
+  const pending = _socialPendingCount();
   if (state.party?.active) {
-    badge.textContent = String(state.party.participants?.length || 1);
+    badge.textContent = pending > 0
+      ? `${state.party.participants?.length || 1}·${pending}`
+      : String(state.party.participants?.length || 1);
+  } else if (pending > 0) {
+    badge.textContent = String(pending);
   } else {
     badge.textContent = "";
   }
@@ -4308,18 +4361,88 @@ function renderParty() {
   const root = $("#view-party");
   if (!root) return;
   const prof = state.userProfile || {};
-  const friends = state.friends || [];
+  const social = state.social || {};
+  const friends = (social.friends && social.friends.length) ? social.friends : (state.friends || []);
   const p = state.party || {};
   const isHost = p.active && p.role === "host";
   const isGuest = p.active && p.role === "guest";
   const friendIds = new Set(friends.map((f) => String(f.userId || "").toUpperCase()));
   const allowedSet = new Set(p.allowedQueueUserIds || []);
+  const hubConnected = Boolean(social.connected);
+  const hubConfigured = Boolean(social.configured || social.hubUrl);
 
   const policyLabels = {
     host_only: "Solo el host",
     all: "Todos",
     selected: "Solo seleccionados",
   };
+  const accessLabels = {
+    request: "Pedir permiso",
+    open: "Abierta a amigos",
+    invite_only: "Solo invitación",
+  };
+
+  const incomingFriendReqs = social.incomingFriendRequests || [];
+  const outgoingFriendReqs = social.outgoingFriendRequests || [];
+  const incomingInvites = social.incomingRoomInvites || [];
+  const incomingJoinReqs = social.incomingJoinRequests || [];
+  const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length;
+
+  const notificationsHtml = totalPending > 0 ? `
+    <div class="party-card party-card--wide" style="margin-bottom:16px;border-color:var(--accent-glow)">
+      <div class="party-card-hdr">
+        <div class="party-card-title">Notificaciones y solicitudes (${totalPending})</div>
+      </div>
+      <div class="party-list">
+        ${incomingInvites.map((inv) => `
+          <div class="party-person">
+            <div class="party-person-info">
+              <div class="party-person-name">
+                <span class="party-pill party-pill--live">Invitación a sala</span>
+                <span><strong>${escapeHtml(inv.fromDisplayName)}</strong> te invitó a la sala <strong>${escapeHtml(inv.roomCode)}</strong></span>
+              </div>
+              <div class="party-person-meta">${escapeHtml(inv.fromUserId)}</div>
+            </div>
+            <div class="party-row">
+              <button class="btn btn-primary" type="button" data-social-accept-invite="${escapeHtml(inv.id)}" data-social-invite-url="${escapeHtml(inv.inviteUrl)}" data-social-invite-room="${escapeHtml(inv.roomCode)}">Unirse</button>
+              <button class="btn btn-ghost" type="button" data-social-dismiss-invite="${escapeHtml(inv.id)}">Ignorar</button>
+            </div>
+          </div>
+        `).join("")}
+        ${incomingJoinReqs.map((jr) => `
+          <div class="party-person">
+            <div class="party-person-info">
+              <div class="party-person-name">
+                <span class="party-pill party-pill--warn">Solicitud de sala</span>
+                <span><strong>${escapeHtml(jr.fromDisplayName)}</strong> pide unirse a tu sala <strong>${escapeHtml(jr.roomCode)}</strong></span>
+              </div>
+              <div class="party-person-meta">${escapeHtml(jr.fromUserId)}</div>
+            </div>
+            <div class="party-row">
+              <button class="btn btn-primary" type="button" data-social-join-respond="${escapeHtml(jr.id)}" data-accept="1">Aceptar</button>
+              <button class="btn btn-ghost" type="button" data-social-join-respond="${escapeHtml(jr.id)}" data-accept="0">Rechazar</button>
+            </div>
+          </div>
+        `).join("")}
+        ${incomingFriendReqs.map((fr) => `
+          <div class="party-person">
+            <div class="party-person-info">
+              <div class="party-person-name">
+                <span class="party-pill party-pill--ok">Solicitud de amistad</span>
+                <span><strong>${escapeHtml(fr.fromDisplayName)}</strong> quiere agregarte como amigo</span>
+                ${fr.fromGoogleAccountName ? `<span class="party-pill">Google: ${escapeHtml(fr.fromGoogleAccountName)}</span>` : ""}
+              </div>
+              <div class="party-person-meta">${escapeHtml(fr.fromUserId)}</div>
+            </div>
+            <div class="party-row">
+              <button class="btn btn-primary" type="button" data-social-friend-respond="${escapeHtml(fr.id)}" data-accept="1">Aceptar</button>
+              <button class="btn btn-ghost" type="button" data-social-friend-respond="${escapeHtml(fr.id)}" data-accept="0">Rechazar</button>
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    </div>
+  ` : "";
 
   let sessionCardHtml = "";
   if (!p.active) {
@@ -4328,9 +4451,13 @@ function renderParty() {
         <div class="party-card">
           <div class="party-card-hdr">
             <div class="party-card-title">Hostear una sesión</div>
-            <span class="party-pill">Local + Internet</span>
+            <span class="party-pill ${hubConnected ? "party-pill--ok" : ""}">${hubConnected ? "Relay Online listo" : "Local + Túnel"}</span>
           </div>
-          <p class="muted" style="font-size:.84rem">Abre una sala sincronizada desde tu PC. Tus amigos se conectan desde su Playzi por LAN, IP pública/Tailscale o túnel de internet.</p>
+          <p class="muted" style="font-size:.84rem">
+            ${hubConnected
+              ? "Abre una sala online automática vía Cloudflare Relay. Tus amigos podrán pedir unirse o recibir tu invitación directa."
+              : "Abre una sala sincronizada. Para jugar por internet sin configurar el Hub, activa el Túnel Cloudflare (instala cloudflared automáticamente)."}
+          </p>
           <div class="party-form-grid">
             <label class="party-field">Puerto local
               <input class="form-input" id="partyHostPort" type="number" min="1024" max="65535" value="8766">
@@ -4342,13 +4469,20 @@ function renderParty() {
                 <option value="selected">Solo usuarios seleccionados</option>
               </select>
             </label>
+            <label class="party-field">Acceso de amigos
+              <select class="form-input" id="partyRoomAccess">
+                <option value="request" selected>Pedir permiso para unirse</option>
+                <option value="open">Abierta para amigos</option>
+                <option value="invite_only">Solo por invitación</option>
+              </select>
+            </label>
           </div>
           <label class="party-field">Dirección pública opcional (IP pública, dominio o Tailscale)
             <input class="form-input" id="partyPublicHost" placeholder="ej. mi-casa.duckdns.org:8766 o 100.x.x.x:8766">
           </label>
           <label class="party-check">
-            <input type="checkbox" id="partyStartTunnel">
-            Exponer automáticamente a internet con Cloudflare Tunnel (requiere cloudflared)
+            <input type="checkbox" id="partyStartTunnel" ${!hubConnected ? "checked" : ""}>
+            Exponer a internet con Cloudflare Tunnel (instala cloudflared automáticamente si falta)
           </label>
           <div class="party-row">
             <button class="btn btn-primary" type="button" data-party-action="start-host">Iniciar sesión (Host)</button>
@@ -4360,9 +4494,9 @@ function renderParty() {
             <div class="party-card-title">Unirse a una sesión</div>
             <span class="party-pill">Invitado</span>
           </div>
-          <p class="muted" style="font-size:.84rem">Pega el enlace de invitación que te compartió el host (ws://, wss:// o IP:puerto).</p>
+          <p class="muted" style="font-size:.84rem">Pega el enlace de invitación del host o únete directo desde tu lista de amigos.</p>
           <label class="party-field">Enlace de invitación o IP:puerto
-            <input class="form-input" id="partyJoinInvite" placeholder="ws://... o wss://...trycloudflare.com/ws?room=ABC123">
+            <input class="form-input" id="partyJoinInvite" placeholder="wss://...workers.dev/ws?room=ABC123 o wss://...trycloudflare.com/ws?room=ABC123">
           </label>
           <label class="party-field">Código de sala (opcional si ya viene en el enlace)
             <input class="form-input" id="partyJoinRoom" placeholder="ABC123" style="text-transform:uppercase">
@@ -4374,7 +4508,6 @@ function renderParty() {
       </div>
     `;
   } else if (isHost) {
-    // Combine connected guests and saved friends for the "selected" permission picker
     const selectableMap = new Map();
     for (const part of (p.participants || [])) {
       if (!part.isHost) {
@@ -4392,11 +4525,12 @@ function renderParty() {
           userId: f.userId,
           displayName: f.displayName,
           googleAccountName: f.googleAccountName,
-          online: false,
+          online: Boolean(f.online),
         });
       }
     }
     const selectableUsers = Array.from(selectableMap.values());
+    const hasPublicUrl = Boolean(p.publicWsUrl);
 
     sessionCardHtml = `
       <div class="party-card party-card--wide">
@@ -4405,6 +4539,13 @@ function renderParty() {
             <div class="party-card-title">Sesión activa (Host)</div>
             <span class="party-pill party-pill--live">Sala ${escapeHtml(p.roomCode)}</span>
             <span class="party-pill party-pill--ok">${p.participants?.length || 1} conectados</span>
+            ${p.relayConnected
+              ? `<span class="party-pill party-pill--ok">Relay Online activo</span>`
+              : p.tunnelRunning
+                ? `<span class="party-pill party-pill--ok">Túnel Cloudflare activo</span>`
+                : !hasPublicUrl
+                  ? `<span class="party-pill party-pill--warn">Solo LAN local (no accesible por internet)</span>`
+                  : `<span class="party-pill party-pill--ok">Dirección pública</span>`}
           </div>
           <div class="party-row">
             <button class="btn btn-ghost" type="button" data-party-action="go-watch">Ir al reproductor</button>
@@ -4412,7 +4553,7 @@ function renderParty() {
           </div>
         </div>
 
-        <div class="party-field">Invitación lista para compartir con tus amigos
+        <div class="party-field">${hasPublicUrl ? "Enlace público online para compartir" : "Enlace LAN local (para internet activa Túnel Cloudflare o configura Hub Online)"}
           <div class="party-code-box">
             <code id="partyInviteText">${escapeHtml(p.inviteUrl || p.localWsUrl)}</code>
             <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.inviteUrl || p.localWsUrl)}">Copiar</button>
@@ -4433,7 +4574,17 @@ function renderParty() {
           <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
           <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Abrir túnel internet (Cloudflare)"}</button>
         </div>
+        ${p.relayError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.relayError)}</div>` : ""}
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
+
+        <div style="border-top:1px solid var(--br);padding-top:12px">
+          <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">Acceso de amigos a esta sala</div>
+          <div class="party-policy-tabs">
+            <button type="button" class="party-policy-btn ${(p.roomAccess || "request") === "request" ? "active" : ""}" data-party-access="request">${accessLabels.request}</button>
+            <button type="button" class="party-policy-btn ${p.roomAccess === "open" ? "active" : ""}" data-party-access="open">${accessLabels.open}</button>
+            <button type="button" class="party-policy-btn ${p.roomAccess === "invite_only" ? "active" : ""}" data-party-access="invite_only">${accessLabels.invite_only}</button>
+          </div>
+        </div>
 
         <div style="border-top:1px solid var(--br);padding-top:12px">
           <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede agregar videos/canciones a la cola?</div>
@@ -4505,7 +4656,7 @@ function renderParty() {
                 <div class="party-person-meta">${escapeHtml(part.userId)}</div>
               </div>
               <div class="party-row">
-                ${!isSelf && !isFriend ? `<button class="btn btn-ghost" type="button" data-party-save-friend="${escapeHtml(part.userId)}" data-party-save-name="${escapeHtml(part.displayName)}" data-party-save-google="${escapeHtml(part.googleAccountName || "")}">+ Amigo</button>` : ""}
+                ${!isSelf && !isFriend ? `<button class="btn btn-ghost" type="button" data-party-save-friend="${escapeHtml(part.userId)}" data-party-save-name="${escapeHtml(part.displayName)}" data-party-save-google="${escapeHtml(part.googleAccountName || "")}">${hubConnected ? "+ Enviar solicitud" : "+ Amigo"}</button>` : ""}
                 ${isHost && !part.isHost ? `<button class="btn btn-ghost" type="button" data-party-kick="${escapeHtml(part.userId)}">Expulsar</button>` : ""}
               </div>
             </div>
@@ -4519,14 +4670,19 @@ function renderParty() {
     <div class="section-head">
       <div>
         <h2>Sesión compartida (Watch Party)</h2>
-        <p class="muted">Reproduce videos y canciones sincronizados con amigos y controla quién puede agregar a la cola.</p>
+        <p class="muted">Reproduce videos y canciones sincronizados con amigos, envía solicitudes de amistad e invítalos a tu sala.</p>
       </div>
     </div>
 
     <div class="party-card party-card--wide" style="margin-bottom:16px">
       <div class="party-card-hdr">
-        <div class="party-card-title">Tu identidad en Playzi</div>
-        ${prof.googleAccountName ? `<span class="party-pill party-pill--ok">Google: ${escapeHtml(prof.googleAccountName)}</span>` : `<span class="party-pill">Sin cuenta Google vinculada</span>`}
+        <div class="party-card-title">Tu identidad y Servidor Hub Online</div>
+        <div class="party-row">
+          ${prof.googleAccountName ? `<span class="party-pill party-pill--ok">Google: ${escapeHtml(prof.googleAccountName)}</span>` : `<span class="party-pill">Sin cuenta Google vinculada</span>`}
+          <span class="party-pill ${hubConnected ? "party-pill--ok" : hubConfigured ? "party-pill--warn" : ""}">
+            ${hubConnected ? "Hub Online conectado" : hubConfigured ? "Hub desconectado" : "Hub sin configurar"}
+          </span>
+        </div>
       </div>
       <div class="party-form-grid">
         <div class="party-field">Tu ID único de Playzi
@@ -4542,7 +4698,16 @@ function renderParty() {
           </div>
         </div>
       </div>
+      <div class="party-field">Servidor Hub Online (Cloudflare Workers URL para amigos, invitaciones y relay sin IP local)
+        <div class="party-row">
+          <input class="form-input" id="socialHubUrlInput" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="https://playzi-hub.tu-subdominio.workers.dev">
+          <button class="btn btn-ghost" type="button" data-party-action="save-hub-url">Conectar Hub</button>
+        </div>
+        ${social.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.8rem">${escapeHtml(social.lastError)}</div>` : ""}
+      </div>
     </div>
+
+    ${notificationsHtml}
 
     ${sessionCardHtml}
 
@@ -4550,36 +4715,74 @@ function renderParty() {
       ${participantsHtml}
       <div class="party-card">
         <div class="party-card-hdr">
-          <div class="party-card-title">Amigos guardados (${friends.length})</div>
+          <div class="party-card-title">Amigos (${friends.length})</div>
+          ${hubConnected ? `<span class="party-pill party-pill--ok">Presencia en vivo</span>` : `<span class="party-pill">Modo local</span>`}
         </div>
-        <div class="party-form-grid">
-          <input class="form-input" id="friendIdInput" placeholder="ID de Playzi (ej. PZ-AB12-CD34)">
-          <input class="form-input" id="friendNameInput" placeholder="Nombre del amigo">
-        </div>
-        <div class="party-row" style="justify-content:space-between">
-          <label class="party-check">
-            <input type="checkbox" id="friendDefaultQueue" checked>
-            Permitir cola por defecto
-          </label>
-          <button class="btn btn-primary" type="button" data-party-action="add-friend">Agregar amigo</button>
-        </div>
+        ${hubConnected ? `
+          <div class="party-row">
+            <input class="form-input" id="friendIdInput" style="flex:1" placeholder="ID de Playzi de tu amigo (ej. PZ-AB12-CD34)">
+            <button class="btn btn-primary" type="button" data-party-action="send-friend-request">Enviar solicitud</button>
+          </div>
+        ` : `
+          <div class="party-form-grid">
+            <input class="form-input" id="friendIdInput" placeholder="ID de Playzi (ej. PZ-AB12-CD34)">
+            <input class="form-input" id="friendNameInput" placeholder="Nombre del amigo">
+          </div>
+          <div class="party-row" style="justify-content:space-between">
+            <label class="party-check">
+              <input type="checkbox" id="friendDefaultQueue" checked>
+              Permitir cola por defecto
+            </label>
+            <button class="btn btn-primary" type="button" data-party-action="add-friend">Agregar local</button>
+          </div>
+        `}
+
+        ${outgoingFriendReqs.length ? `
+          <div class="party-list" style="margin-top:4px">
+            <div class="muted" style="font-size:.78rem;font-weight:600">Solicitudes enviadas pendientes</div>
+            ${outgoingFriendReqs.map((or) => `
+              <div class="party-person">
+                <div class="party-person-info">
+                  <div class="party-person-name">
+                    <span>${escapeHtml(or.toDisplayName || or.toUserId)}</span>
+                    <span class="party-pill party-pill--warn">Pendiente</span>
+                  </div>
+                  <div class="party-person-meta">${escapeHtml(or.toUserId)}</div>
+                </div>
+                <button class="btn btn-ghost" type="button" data-social-friend-cancel="${escapeHtml(or.id)}">Cancelar</button>
+              </div>
+            `).join("")}
+          </div>
+        ` : ""}
+
         <div class="party-list">
-          ${friends.length ? friends.map((f) => `
+          ${friends.length ? friends.map((f) => {
+            const hasRoom = Boolean(f.room && f.room.roomCode);
+            const canRequestJoin = hasRoom && f.room.roomAccess !== "invite_only" && (!p.active || p.roomCode !== f.room.roomCode);
+            const canInvite = hubConnected && isHost && f.online;
+            return `
             <div class="party-person">
               <div class="party-person-info">
                 <div class="party-person-name">
+                  <span class="party-dot ${f.online ? "party-dot--on" : "party-dot--off"}" title="${f.online ? "En línea" : "Desconectado"}"></span>
                   <span>${escapeHtml(f.displayName)}</span>
+                  ${hasRoom ? `<span class="party-pill party-pill--live">Sala ${escapeHtml(f.room.roomCode)} · ${f.room.participantsCount || 1}</span>` : ""}
                   ${f.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(f.googleAccountName)}</span>` : ""}
-                  <span class="party-pill ${f.defaultAllowQueue ? "party-pill--ok" : ""}">${f.defaultAllowQueue ? "Cola por defecto" : "Sin cola por defecto"}</span>
+                  <span class="party-pill ${f.defaultAllowQueue ? "party-pill--ok" : ""}">${f.defaultAllowQueue ? "Cola OK" : "Sin cola"}</span>
                 </div>
-                <div class="party-person-meta">${escapeHtml(f.userId)}</div>
+                <div class="party-person-meta">
+                  ${escapeHtml(f.userId)}${hasRoom && f.room.currentTitle ? ` · ${escapeHtml(f.room.currentTitle)}` : ""}
+                </div>
               </div>
               <div class="party-row">
-                <button class="btn btn-ghost" type="button" data-friend-toggle="${escapeHtml(f.userId)}">${f.defaultAllowQueue ? "Quitar permiso" : "Permitir cola"}</button>
+                ${canRequestJoin ? `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(f.room.roomCode)}">${f.room.roomAccess === "open" ? "Unirse" : "Pedir unirse"}</button>` : ""}
+                ${canInvite ? `<button class="btn btn-primary" type="button" data-social-invite-friend="${escapeHtml(f.userId)}">Invitar</button>` : ""}
+                <button class="btn btn-ghost" type="button" data-friend-toggle="${escapeHtml(f.userId)}">${f.defaultAllowQueue ? "Quitar cola" : "Permitir cola"}</button>
                 <button class="btn btn-ghost" type="button" data-friend-remove="${escapeHtml(f.userId)}">Eliminar</button>
               </div>
             </div>
-          `).join("") : `<div class="muted" style="font-size:.84rem">Aún no tienes amigos guardados. Puedes agregarlos por su ID o desde una sesión activa.</div>`}
+          `;
+          }).join("") : `<div class="muted" style="font-size:.84rem">Aún no tienes amigos. Comparte tu ID de Playzi o envía una solicitud arriba.</div>`}
         </div>
       </div>
     </div>
@@ -4601,6 +4804,18 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
+  const accessBtn = ev.target.closest("[data-party-access]");
+  if (accessBtn) {
+    try {
+      const snap = await api.post("/api/party/room-access", {
+        roomAccess: accessBtn.dataset.partyAccess,
+      });
+      _onPartyStateUpdate(snap, { skipAutoLoad: true });
+      toast("Acceso de sala actualizado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
   const policyBtn = ev.target.closest("[data-party-policy]");
   if (policyBtn) {
     const policy = policyBtn.dataset.partyPolicy;
@@ -4615,18 +4830,107 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
+  const acceptInviteBtn = ev.target.closest("[data-social-accept-invite]");
+  if (acceptInviteBtn) {
+    const inviteId = acceptInviteBtn.dataset.socialAcceptInvite;
+    const inviteUrl = acceptInviteBtn.dataset.socialInviteUrl || "";
+    const roomCode = acceptInviteBtn.dataset.socialInviteRoom || "";
+    try {
+      const socialSnap = await api.post("/api/social/room/invite/dismiss", { inviteId });
+      _onSocialStateUpdate(socialSnap);
+      toast(`Conectando a sala ${roomCode}...`);
+      const snap = await api.post("/api/party/join", { invite: inviteUrl, roomCode: roomCode || null });
+      _onPartyStateUpdate(snap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const dismissInviteBtn = ev.target.closest("[data-social-dismiss-invite]");
+  if (dismissInviteBtn) {
+    try {
+      const socialSnap = await api.post("/api/social/room/invite/dismiss", {
+        inviteId: dismissInviteBtn.dataset.socialDismissInvite,
+      });
+      _onSocialStateUpdate(socialSnap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const friendRespondBtn = ev.target.closest("[data-social-friend-respond]");
+  if (friendRespondBtn) {
+    try {
+      const socialSnap = await api.post("/api/social/friends/respond", {
+        requestId: friendRespondBtn.dataset.socialFriendRespond,
+        accept: friendRespondBtn.dataset.accept === "1",
+      });
+      _onSocialStateUpdate(socialSnap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const friendCancelBtn = ev.target.closest("[data-social-friend-cancel]");
+  if (friendCancelBtn) {
+    try {
+      const socialSnap = await api.post("/api/social/friends/cancel", {
+        requestId: friendCancelBtn.dataset.socialFriendCancel,
+      });
+      _onSocialStateUpdate(socialSnap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const joinRespondBtn = ev.target.closest("[data-social-join-respond]");
+  if (joinRespondBtn) {
+    try {
+      const socialSnap = await api.post("/api/social/room/join-respond", {
+        requestId: joinRespondBtn.dataset.socialJoinRespond,
+        accept: joinRespondBtn.dataset.accept === "1",
+      });
+      _onSocialStateUpdate(socialSnap);
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const joinFriendBtn = ev.target.closest("[data-social-join-friend]");
+  if (joinFriendBtn) {
+    try {
+      await api.post("/api/social/room/join-request", {
+        userId: joinFriendBtn.dataset.socialJoinFriend,
+        roomCode: joinFriendBtn.dataset.socialJoinRoom || "",
+      });
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
+  const inviteFriendBtn = ev.target.closest("[data-social-invite-friend]");
+  if (inviteFriendBtn) {
+    try {
+      await api.post("/api/social/room/invite", {
+        userId: inviteFriendBtn.dataset.socialInviteFriend,
+      });
+    } catch (err) { toast(err.message); }
+    return;
+  }
+
   const saveFriendBtn = ev.target.closest("[data-party-save-friend]");
   if (saveFriendBtn) {
     try {
-      const resp = await api.post("/api/friends", {
-        userId: saveFriendBtn.dataset.partySaveFriend,
-        displayName: saveFriendBtn.dataset.partySaveName || "",
-        googleAccountName: saveFriendBtn.dataset.partySaveGoogle || "",
-        defaultAllowQueue: true,
-      });
-      state.friends = resp.items || [];
-      renderParty();
-      toast("Amigo guardado");
+      if (state.social?.connected) {
+        const snap = await api.post("/api/social/friends/request", {
+          userId: saveFriendBtn.dataset.partySaveFriend,
+        });
+        _onSocialStateUpdate(snap);
+      } else {
+        const resp = await api.post("/api/friends", {
+          userId: saveFriendBtn.dataset.partySaveFriend,
+          displayName: saveFriendBtn.dataset.partySaveName || "",
+          googleAccountName: saveFriendBtn.dataset.partySaveGoogle || "",
+          defaultAllowQueue: true,
+        });
+        state.friends = resp.items || [];
+        renderParty();
+        toast("Amigo guardado");
+      }
     } catch (err) { toast(err.message); }
     return;
   }
@@ -4644,7 +4948,8 @@ document.addEventListener("click", async (ev) => {
   const friendToggle = ev.target.closest("[data-friend-toggle]");
   if (friendToggle) {
     const uid = friendToggle.dataset.friendToggle;
-    const f = (state.friends || []).find((x) => x.userId === uid);
+    const list = (state.social?.friends?.length ? state.social.friends : state.friends) || [];
+    const f = list.find((x) => x.userId === uid);
     if (!f) return;
     try {
       const resp = await api.post("/api/friends", {
@@ -4654,6 +4959,7 @@ document.addEventListener("click", async (ev) => {
         defaultAllowQueue: !f.defaultAllowQueue,
       });
       state.friends = resp.items || [];
+      await _refreshSocialStatus();
       renderParty();
     } catch (err) { toast(err.message); }
     return;
@@ -4662,10 +4968,16 @@ document.addEventListener("click", async (ev) => {
   const friendRemove = ev.target.closest("[data-friend-remove]");
   if (friendRemove) {
     try {
-      const resp = await api.del(`/api/friends/${encodeURIComponent(friendRemove.dataset.friendRemove)}`);
-      state.friends = resp.items || [];
-      renderParty();
-      toast("Amigo eliminado");
+      const uid = friendRemove.dataset.friendRemove;
+      if (state.social?.connected) {
+        const snap = await api.post("/api/social/friends/remove", { userId: uid });
+        _onSocialStateUpdate(snap);
+      } else {
+        const resp = await api.del(`/api/friends/${encodeURIComponent(uid)}`);
+        state.friends = resp.items || [];
+        renderParty();
+        toast("Amigo eliminado");
+      }
     } catch (err) { toast(err.message); }
     return;
   }
@@ -4691,6 +5003,25 @@ document.addEventListener("click", async (ev) => {
     } catch (err) { toast(err.message); }
     return;
   }
+  if (action === "save-hub-url") {
+    const socialHubUrl = ($("#socialHubUrlInput")?.value || "").trim();
+    try {
+      const snap = await api.post("/api/social/config", { socialHubUrl });
+      _onSocialStateUpdate(snap);
+      toast(socialHubUrl ? "Conectando al Hub Online..." : "Hub Online desactivado");
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (action === "send-friend-request") {
+    const userId = ($("#friendIdInput")?.value || "").trim();
+    try {
+      const snap = await api.post("/api/social/friends/request", { userId });
+      _onSocialStateUpdate(snap);
+      const inp = $("#friendIdInput");
+      if (inp) inp.value = "";
+    } catch (err) { toast(err.message); }
+    return;
+  }
   if (action === "add-friend") {
     const userId = ($("#friendIdInput")?.value || "").trim();
     const displayName = ($("#friendNameInput")?.value || "").trim();
@@ -4699,13 +5030,14 @@ document.addEventListener("click", async (ev) => {
       const resp = await api.post("/api/friends", { userId, displayName, defaultAllowQueue });
       state.friends = resp.items || [];
       renderParty();
-      toast("Amigo agregado");
+      toast("Amigo agregado localmente");
     } catch (err) { toast(err.message); }
     return;
   }
   if (action === "start-host") {
     const port = Number($("#partyHostPort")?.value || 8766);
     const queuePolicy = $("#partyHostPolicy")?.value || "all";
+    const roomAccess = $("#partyRoomAccess")?.value || "request";
     const publicHost = ($("#partyPublicHost")?.value || "").trim();
     const startTunnel = Boolean($("#partyStartTunnel")?.checked);
     const media = _getCurrentMediaState();
@@ -4721,8 +5053,10 @@ document.addEventListener("click", async (ev) => {
       const snap = await api.post("/api/party/host", {
         port,
         queuePolicy,
+        roomAccess,
         publicHost: publicHost || null,
         startTunnel,
+        useRelay: true,
         initialQueue,
         initialIndex: state.player.index || 0,
         initialPositionSecs: media.positionSecs || 0,
@@ -4744,7 +5078,7 @@ document.addEventListener("click", async (ev) => {
   }
   if (action === "start-tunnel") {
     try {
-      toast("Iniciando túnel de internet...");
+      toast("Iniciando túnel Cloudflare...");
       const snap = await api.post("/api/party/tunnel", {});
       _onPartyStateUpdate(snap, { skipAutoLoad: true });
     } catch (err) { toast(err.message); }
@@ -4793,6 +5127,7 @@ async function main() {
   if (IS_TAURI) {
     refreshNativePlayerStatus().catch(() => {});
     _refreshPartyStatus().catch(() => {});
+    _refreshSocialStatus().catch(() => {});
     api.get("/api/update/status").then((st) => {
       state.updateStatus = st;
       if (state.view === "config") renderConfig();

@@ -679,6 +679,10 @@ pub async fn dispatch_api_request(
             let req: ProfileUpdateRequest = serde_json::from_value(body)
                 .map_err(|e| format!("Invalid profile payload: {e}"))?;
             let prof = update_user_profile(&runtime.state, req).map_err(|e| e.to_string())?;
+            runtime
+                .social
+                .send_profile_update(&prof.display_name, &prof.google_account_name)
+                .await;
             serde_json::to_value(prof).map_err(|e| e.to_string())
         }
         ("GET", "/api/friends") => {
@@ -798,6 +802,136 @@ pub async fn dispatch_api_request(
                 .kick_participant(&user_id)
                 .await
                 .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/party/room-access") => {
+            let room_access = body
+                .get("roomAccess")
+                .and_then(Value::as_str)
+                .unwrap_or("request")
+                .to_string();
+            let snap = runtime
+                .party
+                .set_room_access(room_access)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("GET", "/api/social/status") => {
+            let snap = runtime.social.status().await;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/config") => {
+            let hub_url = body
+                .get("socialHubUrl")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let _ = runtime
+                .config
+                .update(ConfigUpdate {
+                    social_hub_url: Some(hub_url),
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())?;
+            runtime.social.reconnect();
+            let snap = runtime.social.status().await;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/friends/request") => {
+            let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+            let snap = runtime
+                .social
+                .send_friend_request(user_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/friends/respond") => {
+            let request_id = body.get("requestId").and_then(Value::as_str).unwrap_or("");
+            let accept = body.get("accept").and_then(Value::as_bool).unwrap_or(false);
+            let snap = runtime
+                .social
+                .respond_friend_request(request_id, accept)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/friends/cancel") => {
+            let request_id = body.get("requestId").and_then(Value::as_str).unwrap_or("");
+            let snap = runtime
+                .social
+                .cancel_friend_request(request_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/friends/remove") => {
+            let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+            let snap = runtime
+                .social
+                .remove_friend(user_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/room/invite") => {
+            let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+            let party_snap = runtime.party.status().await;
+            let room_code = body
+                .get("roomCode")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&party_snap.room_code);
+            let fallback_url = if !party_snap.public_ws_url.is_empty() {
+                &party_snap.public_ws_url
+            } else {
+                &party_snap.invite_url
+            };
+            let invite_url = body
+                .get("inviteUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(fallback_url);
+            runtime
+                .social
+                .invite_friend_to_room(user_id, room_code, invite_url)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/social/room/join-request") => {
+            let user_id = body.get("userId").and_then(Value::as_str).unwrap_or("");
+            let room_code = body.get("roomCode").and_then(Value::as_str);
+            runtime
+                .social
+                .request_join_friend_room(user_id, room_code)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "ok": true }))
+        }
+        ("POST", "/api/social/room/join-respond") => {
+            let request_id = body.get("requestId").and_then(Value::as_str).unwrap_or("");
+            let accept = body.get("accept").and_then(Value::as_bool).unwrap_or(false);
+            let party_snap = runtime.party.status().await;
+            let invite_url = if !party_snap.public_ws_url.is_empty() {
+                Some(party_snap.public_ws_url.as_str())
+            } else if !party_snap.invite_url.is_empty() {
+                Some(party_snap.invite_url.as_str())
+            } else {
+                None
+            };
+            let snap = runtime
+                .social
+                .respond_join_request(request_id, accept, invite_url)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/room/invite/dismiss") => {
+            let invite_id = body.get("inviteId").and_then(Value::as_str).unwrap_or("");
+            let snap = runtime.social.dismiss_room_invite(invite_id).await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         _ => dispatch_dynamic_routes(runtime, &method, &path, body).await,

@@ -10,6 +10,7 @@ use playzi_core::history::list_history;
 use playzi_core::party::{PartyManager, ensure_user_profile, list_friends};
 use playzi_core::player::PlayerManager;
 use playzi_core::playlists::list_playlists;
+use playzi_core::social::SocialManager;
 use playzi_core::state::StateStore;
 use playzi_core::thumbs::ThumbnailCache;
 use playzi_core::youtube::YouTubeClient;
@@ -27,6 +28,7 @@ pub struct AppRuntime {
     pub autosync: AutoSyncManager,
     pub player: PlayerManager,
     pub party: PartyManager,
+    pub social: SocialManager,
 }
 
 impl AppRuntime {
@@ -46,7 +48,8 @@ impl AppRuntime {
         )
         .with_ytdlp_bin(player.resolve_ytdlp_bin());
         let autosync = AutoSyncManager::new(state.clone(), config.clone(), youtube.clone());
-        let party = PartyManager::new(state.clone());
+        let party = PartyManager::with_config(state.clone(), config.clone());
+        let social = SocialManager::new(state.clone(), config.clone());
 
         Ok(Self {
             root_dir,
@@ -58,6 +61,7 @@ impl AppRuntime {
             autosync,
             player,
             party,
+            social,
         })
     }
 

@@ -235,20 +235,108 @@ pub fn run() {
                 }
             });
 
+            // Start Social Hub background WebSocket client
+            let social_bg = runtime.social.clone();
+            tauri::async_runtime::spawn(async move {
+                social_bg.start_background();
+            });
+
             // Bridge Watch Party events -> Tauri events "party-state" and "party-notice"
+            // Also sync host room presence to Social Hub automatically.
             let mut party_rx = runtime.party.subscribe();
             let app_party = app.handle().clone();
+            let social_for_party = runtime.social.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(ev) = party_rx.recv().await {
                     match ev {
                         playzi_core::party::PartyEvent::State { snapshot } => {
                             let _ = app_party.emit("party-state", &snapshot);
+                            if snapshot.active
+                                && snapshot.role == playzi_core::party::PartyRole::Host
+                            {
+                                let current_title = snapshot
+                                    .playback
+                                    .current_index
+                                    .and_then(|idx| snapshot.queue.get(idx))
+                                    .map(|q| q.title.clone())
+                                    .unwrap_or_default();
+                                let room_info = playzi_core::social::PublishedRoomInfo {
+                                    room_code: snapshot.room_code.clone(),
+                                    invite_url: if !snapshot.public_ws_url.is_empty() {
+                                        snapshot.public_ws_url.clone()
+                                    } else {
+                                        snapshot.invite_url.clone()
+                                    },
+                                    room_access: snapshot.room_access.clone(),
+                                    participants_count: snapshot.participants.len(),
+                                    current_title,
+                                };
+                                social_for_party.publish_room_presence(Some(room_info)).await;
+                            } else {
+                                social_for_party.publish_room_presence(None).await;
+                            }
                         }
                         playzi_core::party::PartyEvent::Notice { level, message } => {
                             let _ = app_party.emit(
                                 "party-notice",
                                 serde_json::json!({ "level": level, "message": message }),
                             );
+                        }
+                    }
+                }
+            });
+
+            // Bridge Social Hub events -> Tauri events + automatic room join on host approval
+            let mut social_rx = runtime.social.subscribe();
+            let app_social = app.handle().clone();
+            let party_for_social = runtime.party.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Ok(ev) = social_rx.recv().await {
+                    match ev {
+                        playzi_core::social::SocialEvent::State { snapshot } => {
+                            let _ = app_social.emit("social-state", &snapshot);
+                        }
+                        playzi_core::social::SocialEvent::Notice { level, message } => {
+                            let _ = app_social.emit(
+                                "social-notice",
+                                serde_json::json!({ "level": level, "message": message }),
+                            );
+                        }
+                        playzi_core::social::SocialEvent::JoinApproved {
+                            host_user_id,
+                            host_display_name,
+                            room_code,
+                            invite_url,
+                        } => {
+                            let _ = app_social.emit(
+                                "social-notice",
+                                serde_json::json!({
+                                    "level": "ok",
+                                    "message": format!("Acceso aprobado por {host_display_name}. Conectando a sala {room_code}...")
+                                }),
+                            );
+                            let _ = app_social.emit(
+                                "social-join-approved",
+                                serde_json::json!({
+                                    "hostUserId": host_user_id,
+                                    "hostDisplayName": host_display_name,
+                                    "roomCode": room_code,
+                                    "inviteUrl": invite_url,
+                                }),
+                            );
+                            let req = playzi_core::party::JoinSessionRequest {
+                                invite: invite_url,
+                                room_code: Some(room_code),
+                            };
+                            if let Err(err) = party_for_social.join_session(req).await {
+                                let _ = app_social.emit(
+                                    "social-notice",
+                                    serde_json::json!({
+                                        "level": "error",
+                                        "message": err.to_string(),
+                                    }),
+                                );
+                            }
                         }
                     }
                 }

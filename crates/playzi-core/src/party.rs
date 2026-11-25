@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
@@ -15,7 +18,9 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 use uuid::Uuid;
 
+use crate::config::ConfigStore;
 use crate::error::{CoreError, Result};
+use crate::social::build_relay_ws_url;
 use crate::state::{FriendRecord, StateStore, UserProfile};
 
 pub const DEFAULT_PARTY_PORT: u16 = 8766;
@@ -149,6 +154,9 @@ pub struct PartyRoomSnapshot {
     pub invite_url: String,
     pub tunnel_running: bool,
     pub tunnel_error: String,
+    pub relay_connected: bool,
+    pub relay_error: String,
+    pub room_access: String,
     pub queue_policy: QueuePolicy,
     pub allowed_queue_user_ids: Vec<String>,
     pub can_self_queue: bool,
@@ -175,6 +183,8 @@ pub struct StartHostRequest {
     pub queue_policy: Option<QueuePolicy>,
     pub allowed_queue_user_ids: Option<Vec<String>>,
     pub start_tunnel: Option<bool>,
+    pub use_relay: Option<bool>,
+    pub room_access: Option<String>,
     pub initial_queue: Option<Vec<AddQueueItemInput>>,
     pub initial_index: Option<usize>,
     pub initial_position_secs: Option<f64>,
@@ -284,6 +294,9 @@ struct HostSessionState {
     tunnel_child: Option<Child>,
     tunnel_running: bool,
     tunnel_error: String,
+    relay_connected: bool,
+    relay_error: String,
+    room_access: String,
 }
 
 struct GuestSessionState {
@@ -305,6 +318,7 @@ enum SessionMode {
 
 struct PartyManagerInner {
     state_store: StateStore,
+    config: Option<ConfigStore>,
     mode: RwLock<SessionMode>,
     events_tx: broadcast::Sender<PartyEvent>,
 }
@@ -447,6 +461,124 @@ pub fn detect_lan_ip() -> String {
         return local.ip().to_string();
     }
     "127.0.0.1".to_string()
+}
+
+pub fn is_private_lan_ws_url(ws_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(ws_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let trimmed = host.trim_matches(|c| c == '[' || c == ']');
+    let Ok(ip) = trimmed.parse::<IpAddr>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+fn normalize_room_access(raw: Option<&str>) -> String {
+    match raw.unwrap_or("request").trim().to_ascii_lowercase().as_str() {
+        "open" => "open".to_string(),
+        "invite_only" => "invite_only".to_string(),
+        _ => "request".to_string(),
+    }
+}
+
+pub fn resolve_cloudflared_bin(data_dir: Option<&Path>, root_dir: Option<&Path>) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    };
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(d) = data_dir {
+        candidates.push(d.join("bin").join(exe_name));
+    }
+    if let Some(r) = root_dir {
+        candidates.push(r.join("bin").join(exe_name));
+        candidates.push(r.join(exe_name));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("bin").join(exe_name));
+        candidates.push(dir.join(exe_name));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local_app);
+            candidates.push(base.join("Playzi").join("bin").join("cloudflared.exe"));
+            candidates.push(
+                base.join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("cloudflared.exe"),
+            );
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            candidates.push(
+                PathBuf::from(profile)
+                    .join("scoop")
+                    .join("shims")
+                    .join("cloudflared.exe"),
+            );
+        }
+        candidates.push(PathBuf::from(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\cloudflared\cloudflared.exe"));
+        candidates.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin\cloudflared.exe"));
+    }
+
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let p = dir.join(exe_name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
+    None
+}
+
+fn cloudflared_download_url() -> Option<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86"))]
+    {
+        Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-386.exe")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        Some("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64")
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64")
+    )))]
+    {
+        None
+    }
 }
 
 fn build_ws_url_from_host(raw_host: &str, default_port: u16, room_code: &str) -> String {
@@ -601,6 +733,9 @@ impl HostSessionState {
             invite_url,
             tunnel_running: self.tunnel_running,
             tunnel_error: self.tunnel_error.clone(),
+            relay_connected: self.relay_connected,
+            relay_error: self.relay_error.clone(),
+            room_access: self.room_access.clone(),
             queue_policy: wire.queue_policy,
             allowed_queue_user_ids: wire.allowed_queue_user_ids,
             can_self_queue: true,
@@ -711,6 +846,9 @@ impl GuestSessionState {
             invite_url: self.invite_url.clone(),
             tunnel_running: false,
             tunnel_error: String::new(),
+            relay_connected: false,
+            relay_error: String::new(),
+            room_access: String::new(),
             queue_policy: self.wire_state.queue_policy,
             allowed_queue_user_ids: self.wire_state.allowed_queue_user_ids.clone(),
             can_self_queue,
@@ -731,6 +869,19 @@ impl PartyManager {
         Self {
             inner: Arc::new(PartyManagerInner {
                 state_store,
+                config: None,
+                mode: RwLock::new(SessionMode::Idle),
+                events_tx,
+            }),
+        }
+    }
+
+    pub fn with_config(state_store: StateStore, config: ConfigStore) -> Self {
+        let (events_tx, _) = broadcast::channel(128);
+        Self {
+            inner: Arc::new(PartyManagerInner {
+                state_store,
+                config: Some(config),
                 mode: RwLock::new(SessionMode::Idle),
                 events_tx,
             }),
@@ -860,13 +1011,15 @@ impl PartyManager {
         };
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let relay_shutdown_rx = shutdown_tx.subscribe();
+        let room_access = normalize_room_access(req.room_access.as_deref());
 
         let host_state = HostSessionState {
             room_code: room_code.clone(),
             host_user,
             bind_port: actual_port,
             local_ws_url,
-            public_ws_url,
+            public_ws_url: public_ws_url.clone(),
             queue_policy: req.queue_policy.unwrap_or(QueuePolicy::All),
             allowed_queue_user_ids: allowed_set,
             queue,
@@ -876,6 +1029,9 @@ impl PartyManager {
             tunnel_child: None,
             tunnel_running: false,
             tunnel_error: String::new(),
+            relay_connected: false,
+            relay_error: String::new(),
+            room_access,
         };
 
         let snap = host_state.snapshot();
@@ -910,12 +1066,332 @@ impl PartyManager {
             }
         });
 
+        let configured_hub = self
+            .inner
+            .config
+            .as_ref()
+            .map(|c| c.snapshot().social_hub_url)
+            .unwrap_or_default();
+
+        if req.use_relay.unwrap_or(true) && !configured_hub.trim().is_empty() && public_ws_url.is_empty() {
+            self.spawn_host_relay(configured_hub, room_code, relay_shutdown_rx);
+        }
+
         if req.start_tunnel.unwrap_or(false) {
             let _ = self.start_cloudflare_tunnel().await;
             return Ok(self.status().await);
         }
 
+        Ok(self.status().await)
+    }
+
+    pub async fn set_room_access(&self, room_access: String) -> Result<PartyRoomSnapshot> {
+        let normalized = normalize_room_access(Some(&room_access));
+        let mut mode = self.inner.mode.write().await;
+        let SessionMode::Host(host) = &mut *mode else {
+            return Err(CoreError::Validation(
+                "Solo el host puede cambiar el acceso a la sala".to_string(),
+            ));
+        };
+        host.room_access = normalized;
+        let snap = host.snapshot();
+        drop(mode);
+        self.emit_snapshot(snap.clone());
         Ok(snap)
+    }
+
+    async fn ensure_cloudflared_installed(&self) -> Result<PathBuf> {
+        let (data_dir, root_dir) = self
+            .inner
+            .config
+            .as_ref()
+            .map(|c| {
+                let s = c.snapshot();
+                (Some(s.data_dir), Some(s.root))
+            })
+            .unwrap_or((None, None));
+
+        if let Some(existing) = resolve_cloudflared_bin(data_dir.as_deref(), root_dir.as_deref()) {
+            return Ok(existing);
+        }
+
+        let Some(url) = cloudflared_download_url() else {
+            return Err(CoreError::External(
+                "No se encontró 'cloudflared' y no hay descarga automática para esta arquitectura."
+                    .to_string(),
+            ));
+        };
+
+        let target_dir = data_dir
+            .unwrap_or_else(|| std::env::temp_dir().join("playzi"))
+            .join("bin");
+        tokio::fs::create_dir_all(&target_dir).await?;
+
+        let exe_name = if cfg!(windows) {
+            "cloudflared.exe"
+        } else {
+            "cloudflared"
+        };
+        let target_path = target_dir.join(exe_name);
+        let tmp_path = target_dir.join(format!("{exe_name}.downloading"));
+
+        self.emit_notice("info", "Descargando cloudflared automáticamente...");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .user_agent("Playzi/1.0")
+            .build()
+            .map_err(|e| CoreError::External(format!("Error HTTP descargando cloudflared: {e}")))?;
+
+        let resp = client.get(url).send().await.map_err(|e| {
+            CoreError::External(format!("No se pudo descargar cloudflared automáticamente: {e}"))
+        })?;
+        if !resp.status().is_success() {
+            return Err(CoreError::External(format!(
+                "Error descargando cloudflared (HTTP {})",
+                resp.status()
+            )));
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            CoreError::External(format!("Error leyendo descarga de cloudflared: {e}"))
+        })?;
+        if bytes.len() < 1_000_000 {
+            return Err(CoreError::External(
+                "La descarga de cloudflared resultó incompleta.".to_string(),
+            ));
+        }
+
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = tokio::fs::remove_file(&target_path).await;
+        tokio::fs::rename(&tmp_path, &target_path).await?;
+
+        self.emit_notice("ok", "cloudflared instalado automáticamente.");
+        Ok(target_path)
+    }
+
+    fn spawn_host_relay(
+        &self,
+        hub_url: String,
+        room_code: String,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let Some(host_relay_url) = build_relay_ws_url(&hub_url, &room_code, Some("host")) else {
+            return;
+        };
+        let Some(guest_relay_url) = build_relay_ws_url(&hub_url, &room_code, None) else {
+            return;
+        };
+        let manager = self.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+
+                let connect_res = tokio::time::timeout(
+                    Duration::from_secs(12),
+                    tokio_tungstenite::connect_async(&host_relay_url),
+                )
+                .await;
+
+                let ws_stream = match connect_res {
+                    Ok(Ok((stream, _))) => stream,
+                    Ok(Err(e)) => {
+                        let mut mode = manager.inner.mode.write().await;
+                        if let SessionMode::Host(host) = &mut *mode {
+                            host.relay_connected = false;
+                            host.relay_error = format!("Relay online desconectado: {e}");
+                            let snap = host.snapshot();
+                            drop(mode);
+                            manager.emit_snapshot(snap);
+                        } else {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() { break; }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        let mut mode = manager.inner.mode.write().await;
+                        if let SessionMode::Host(host) = &mut *mode {
+                            host.relay_connected = false;
+                            host.relay_error =
+                                "Tiempo de espera agotado conectando al Relay online.".to_string();
+                            let snap = host.snapshot();
+                            drop(mode);
+                            manager.emit_snapshot(snap);
+                        } else {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() { break; }
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                {
+                    let mut mode = manager.inner.mode.write().await;
+                    if let SessionMode::Host(host) = &mut *mode {
+                        host.relay_connected = true;
+                        host.relay_error.clear();
+                        if host.public_ws_url.is_empty() || host.public_ws_url == guest_relay_url {
+                            host.public_ws_url = guest_relay_url.clone();
+                        }
+                        let snap = host.snapshot();
+                        drop(mode);
+                        manager.emit_snapshot(snap);
+                    } else {
+                        break;
+                    }
+                }
+
+                let (mut ws_sink, mut ws_source) = ws_stream.split();
+                let (relay_out_tx, mut relay_out_rx) = mpsc::unbounded_channel::<String>();
+
+                let writer = tokio::spawn(async move {
+                    while let Some(txt) = relay_out_rx.recv().await {
+                        if ws_sink.send(Message::Text(txt.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = ws_sink.close().await;
+                });
+
+                // conn_id -> (ServerMessage tx, registered_user_id)
+                let mut relay_guests: HashMap<
+                    String,
+                    (mpsc::UnboundedSender<ServerMessage>, Option<String>),
+                > = HashMap::new();
+                let mut ping_interval = tokio::time::interval(Duration::from_secs(25));
+                ping_interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = ping_interval.tick() => {
+                            let _ = relay_out_tx.send(json!({ "relayPing": true }).to_string());
+                        }
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        frame = ws_source.next() => {
+                            match frame {
+                                Some(Ok(Message::Text(text))) => {
+                                    let Ok(val) = serde_json::from_str::<Value>(&text) else {
+                                        continue;
+                                    };
+                                    if let Some(conn_id) = val.get("relayOpen").and_then(Value::as_str) {
+                                        let cid = conn_id.to_string();
+                                        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                                        let rtx = relay_out_tx.clone();
+                                        let cid_clone = cid.clone();
+                                        tokio::spawn(async move {
+                                            while let Some(smsg) = guest_rx.recv().await {
+                                                if let Ok(payload) = serde_json::to_string(&smsg) {
+                                                    let envelope = json!({
+                                                        "relayTo": cid_clone,
+                                                        "payload": payload,
+                                                    }).to_string();
+                                                    if rtx.send(envelope).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        relay_guests.insert(cid, (guest_tx, None));
+                                    } else if let Some(conn_id) = val.get("relayFrom").and_then(Value::as_str)
+                                        && let Some(payload) = val.get("payload").and_then(Value::as_str)
+                                    {
+                                        if !relay_guests.contains_key(conn_id) {
+                                            let cid = conn_id.to_string();
+                                            let (guest_tx, mut guest_rx) = mpsc::unbounded_channel::<ServerMessage>();
+                                            let rtx = relay_out_tx.clone();
+                                            let cid_clone = cid.clone();
+                                            tokio::spawn(async move {
+                                                while let Some(smsg) = guest_rx.recv().await {
+                                                    if let Ok(p) = serde_json::to_string(&smsg) {
+                                                        let envelope = json!({
+                                                            "relayTo": cid_clone,
+                                                            "payload": p,
+                                                        }).to_string();
+                                                        if rtx.send(envelope).is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            relay_guests.insert(cid, (guest_tx, None));
+                                        }
+                                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(payload)
+                                            && let Some((guest_tx, reg_uid)) = relay_guests.get_mut(conn_id)
+                                        {
+                                            let keep_open = manager
+                                                .handle_client_message(client_msg, guest_tx, reg_uid)
+                                                .await;
+                                            if !keep_open {
+                                                let _ = relay_out_tx.send(json!({ "relayKick": conn_id }).to_string());
+                                            }
+                                        }
+                                    } else if let Some(conn_id) = val.get("relayClosed").and_then(Value::as_str)
+                                        && let Some((_, reg_uid)) = relay_guests.remove(conn_id)
+                                        && let Some(uid) = reg_uid
+                                    {
+                                        manager.unregister_client(&uid).await;
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None => break,
+                                Some(Err(_)) => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                writer.abort();
+                for (_, (_, reg_uid)) in relay_guests.drain() {
+                    if let Some(uid) = reg_uid {
+                        manager.unregister_client(&uid).await;
+                    }
+                }
+
+                {
+                    let mut mode = manager.inner.mode.write().await;
+                    if let SessionMode::Host(host) = &mut *mode {
+                        host.relay_connected = false;
+                        let snap = host.snapshot();
+                        drop(mode);
+                        manager.emit_snapshot(snap);
+                    } else {
+                        break;
+                    }
+                }
+
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { break; }
+                    }
+                }
+            }
+        });
     }
 
     pub async fn start_cloudflare_tunnel(&self) -> Result<PartyRoomSnapshot> {
@@ -933,7 +1409,22 @@ impl PartyManager {
             (host.bind_port, host.room_code.clone())
         };
 
-        let mut cmd = Command::new("cloudflared");
+        let cf_bin = match self.ensure_cloudflared_installed().await {
+            Ok(bin) => bin,
+            Err(e) => {
+                let msg = e.to_string();
+                let mut mode = self.inner.mode.write().await;
+                if let SessionMode::Host(host) = &mut *mode {
+                    host.tunnel_error = msg.clone();
+                    let snap = host.snapshot();
+                    drop(mode);
+                    self.emit_snapshot(snap);
+                }
+                return Err(CoreError::External(msg));
+            }
+        };
+
+        let mut cmd = Command::new(&cf_bin);
         cmd.args([
             "tunnel",
             "--url",
@@ -954,7 +1445,7 @@ impl PartyManager {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!(
-                    "No se encontró 'cloudflared' en el sistema ({e}). Instálalo o usa Dirección Pública (IP/dominio/Tailscale)."
+                    "No se pudo iniciar cloudflared ({e}). Usa el Hub Online (Cloudflare) o Dirección Pública."
                 );
                 let mut mode = self.inner.mode.write().await;
                 if let SessionMode::Host(host) = &mut *mode {
@@ -1027,6 +1518,140 @@ impl PartyManager {
         Ok(snap)
     }
 
+    async fn handle_client_message(
+        &self,
+        client_msg: ClientMessage,
+        out_tx: &mpsc::UnboundedSender<ServerMessage>,
+        registered_user_id: &mut Option<String>,
+    ) -> bool {
+        match client_msg {
+            ClientMessage::Hello { room_code, mut user } => {
+                let mut mode = self.inner.mode.write().await;
+                let SessionMode::Host(host) = &mut *mode else {
+                    let _ = out_tx.send(ServerMessage::RoomClosed {
+                        reason: "La sesión ya no está activa".to_string(),
+                    });
+                    return false;
+                };
+
+                if !host.room_code.eq_ignore_ascii_case(room_code.trim()) {
+                    let _ = out_tx.send(ServerMessage::RoomClosed {
+                        reason: "Código de sala incorrecto".to_string(),
+                    });
+                    return false;
+                }
+
+                if user.user_id.trim().is_empty() {
+                    user.user_id = generate_user_id();
+                }
+                if user.display_name.trim().is_empty() {
+                    user.display_name = if !user.google_account_name.is_empty() {
+                        user.google_account_name.clone()
+                    } else {
+                        user.user_id.clone()
+                    };
+                }
+
+                let uid = user.user_id.clone();
+                let uname = user.display_name.clone();
+                host.clients.insert(
+                    uid.clone(),
+                    ConnectedClient {
+                        user,
+                        joined_at: Utc::now().to_rfc3339(),
+                        tx: out_tx.clone(),
+                    },
+                );
+                *registered_user_id = Some(uid.clone());
+
+                let wire = host.wire_state();
+                let _ = out_tx.send(ServerMessage::Welcome {
+                    room_code: host.room_code.clone(),
+                    self_user_id: uid,
+                    state: wire,
+                });
+                host.broadcast_state();
+                let snap = host.snapshot();
+                drop(mode);
+                self.emit_snapshot(snap);
+                self.emit_notice("info", format!("{uname} se unió a la sesión"));
+                true
+            }
+            ClientMessage::AddQueue { item, play_next } => {
+                let Some(uid) = registered_user_id.clone() else {
+                    return true;
+                };
+                let mut mode = self.inner.mode.write().await;
+                let SessionMode::Host(host) = &mut *mode else {
+                    return false;
+                };
+                if !host.can_user_queue(&uid) {
+                    let _ = out_tx.send(ServerMessage::ActionResult {
+                        ok: false,
+                        action: "add_queue".to_string(),
+                        message: "El host no ha habilitado permisos de cola para tu usuario"
+                            .to_string(),
+                    });
+                    return true;
+                }
+                let Some(user_ref) = host.clients.get(&uid).map(|c| c.user.clone()) else {
+                    return true;
+                };
+                match host.enqueue_item(item, play_next, user_ref.clone()) {
+                    Ok(added) => {
+                        let _ = out_tx.send(ServerMessage::ActionResult {
+                            ok: true,
+                            action: "add_queue".to_string(),
+                            message: format!("Agregado a la cola: {}", added.title),
+                        });
+                        host.broadcast_state();
+                        let snap = host.snapshot();
+                        drop(mode);
+                        self.emit_snapshot(snap);
+                        self.emit_notice(
+                            "info",
+                            format!(
+                                "{} agregó \"{}\" a la cola",
+                                user_ref.display_name, added.title
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(ServerMessage::ActionResult {
+                            ok: false,
+                            action: "add_queue".to_string(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+                true
+            }
+            ClientMessage::Ping { sent_at_ms } => {
+                let _ = out_tx.send(ServerMessage::Pong {
+                    sent_at_ms,
+                    server_time_ms: Utc::now().timestamp_millis(),
+                });
+                true
+            }
+        }
+    }
+
+    async fn unregister_client(&self, uid: &str) {
+        let mut mode = self.inner.mode.write().await;
+        if let SessionMode::Host(host) = &mut *mode
+            && let Some(removed) = host.clients.remove(uid)
+        {
+            host.broadcast_state();
+            let snap = host.snapshot();
+            drop(mode);
+            self.emit_snapshot(snap);
+            self.emit_notice(
+                "info",
+                format!("{} salió de la sesión", removed.user.display_name),
+            );
+        }
+    }
+
     async fn handle_incoming_connection(
         &self,
         stream: tokio::net::TcpStream,
@@ -1063,129 +1688,16 @@ impl PartyManager {
                 continue;
             };
 
-            match client_msg {
-                ClientMessage::Hello { room_code, mut user } => {
-                    let mut mode = self.inner.mode.write().await;
-                    let SessionMode::Host(host) = &mut *mode else {
-                        let _ = out_tx.send(ServerMessage::RoomClosed {
-                            reason: "La sesión ya no está activa".to_string(),
-                        });
-                        break;
-                    };
-
-                    if !host.room_code.eq_ignore_ascii_case(room_code.trim()) {
-                        let _ = out_tx.send(ServerMessage::RoomClosed {
-                            reason: "Código de sala incorrecto".to_string(),
-                        });
-                        break;
-                    }
-
-                    if user.user_id.trim().is_empty() {
-                        user.user_id = generate_user_id();
-                    }
-                    if user.display_name.trim().is_empty() {
-                        user.display_name = if !user.google_account_name.is_empty() {
-                            user.google_account_name.clone()
-                        } else {
-                            user.user_id.clone()
-                        };
-                    }
-
-                    let uid = user.user_id.clone();
-                    let uname = user.display_name.clone();
-                    host.clients.insert(
-                        uid.clone(),
-                        ConnectedClient {
-                            user,
-                            joined_at: Utc::now().to_rfc3339(),
-                            tx: out_tx.clone(),
-                        },
-                    );
-                    registered_user_id = Some(uid.clone());
-
-                    let wire = host.wire_state();
-                    let _ = out_tx.send(ServerMessage::Welcome {
-                        room_code: host.room_code.clone(),
-                        self_user_id: uid,
-                        state: wire,
-                    });
-                    host.broadcast_state();
-                    let snap = host.snapshot();
-                    drop(mode);
-                    self.emit_snapshot(snap);
-                    self.emit_notice("info", format!("{uname} se unió a la sesión"));
-                }
-                ClientMessage::AddQueue { item, play_next } => {
-                    let Some(uid) = registered_user_id.clone() else {
-                        continue;
-                    };
-                    let mut mode = self.inner.mode.write().await;
-                    let SessionMode::Host(host) = &mut *mode else {
-                        break;
-                    };
-                    if !host.can_user_queue(&uid) {
-                        let _ = out_tx.send(ServerMessage::ActionResult {
-                            ok: false,
-                            action: "add_queue".to_string(),
-                            message: "El host no ha habilitado permisos de cola para tu usuario"
-                                .to_string(),
-                        });
-                        continue;
-                    }
-                    let Some(user_ref) = host.clients.get(&uid).map(|c| c.user.clone()) else {
-                        continue;
-                    };
-                    match host.enqueue_item(item, play_next, user_ref.clone()) {
-                        Ok(added) => {
-                            let _ = out_tx.send(ServerMessage::ActionResult {
-                                ok: true,
-                                action: "add_queue".to_string(),
-                                message: format!("Agregado a la cola: {}", added.title),
-                            });
-                            host.broadcast_state();
-                            let snap = host.snapshot();
-                            drop(mode);
-                            self.emit_snapshot(snap);
-                            self.emit_notice(
-                                "info",
-                                format!(
-                                    "{} agregó \"{}\" a la cola",
-                                    user_ref.display_name, added.title
-                                ),
-                            );
-                        }
-                        Err(e) => {
-                            let _ = out_tx.send(ServerMessage::ActionResult {
-                                ok: false,
-                                action: "add_queue".to_string(),
-                                message: e.to_string(),
-                            });
-                        }
-                    }
-                }
-                ClientMessage::Ping { sent_at_ms } => {
-                    let _ = out_tx.send(ServerMessage::Pong {
-                        sent_at_ms,
-                        server_time_ms: Utc::now().timestamp_millis(),
-                    });
-                }
+            if !self
+                .handle_client_message(client_msg, &out_tx, &mut registered_user_id)
+                .await
+            {
+                break;
             }
         }
 
         if let Some(uid) = registered_user_id {
-            let mut mode = self.inner.mode.write().await;
-            if let SessionMode::Host(host) = &mut *mode
-                && let Some(removed) = host.clients.remove(&uid)
-            {
-                host.broadcast_state();
-                let snap = host.snapshot();
-                drop(mode);
-                self.emit_snapshot(snap);
-                self.emit_notice(
-                    "info",
-                    format!("{} salió de la sesión", removed.user.display_name),
-                );
-            }
+            self.unregister_client(&uid).await;
         }
 
         writer_task.abort();
@@ -1198,11 +1710,35 @@ impl PartyManager {
         let profile = ensure_user_profile(&self.inner.state_store)?;
         let user_ref = PartyUserRef::from(&profile);
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .map_err(|e| {
-                CoreError::External(format!("No se pudo conectar a la sesión ({ws_url}): {e}"))
-            })?;
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(12),
+            tokio_tungstenite::connect_async(&ws_url),
+        )
+        .await;
+
+        let (ws_stream, _) = match connect_result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                if is_private_lan_ws_url(&ws_url) {
+                    return Err(CoreError::External(format!(
+                        "No se pudo conectar a la sesión ({ws_url}): esa dirección es una IP privada de red local (LAN) y no funciona por internet. Pide al host que use el Hub Online (Cloudflare) o active el Túnel Cloudflare. Detalle: {e}"
+                    )));
+                }
+                return Err(CoreError::External(format!(
+                    "No se pudo conectar a la sesión ({ws_url}): {e}"
+                )));
+            }
+            Err(_) => {
+                if is_private_lan_ws_url(&ws_url) {
+                    return Err(CoreError::External(format!(
+                        "Tiempo de espera agotado al conectar a {ws_url}: esa dirección es una IP privada de red local (LAN) y no es accesible desde otra red. Pide al host que active el Hub Online (Cloudflare) o el Túnel Cloudflare."
+                    )));
+                }
+                return Err(CoreError::External(format!(
+                    "Tiempo de espera agotado al conectar a la sesión ({ws_url}). Verifica que la sala siga abierta."
+                )));
+            }
+        };
 
         let (mut ws_sink, mut ws_source) = ws_stream.split();
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -1660,5 +2196,15 @@ mod tests {
         // Cleanup
         host_mgr.leave_or_stop().await;
         guest_mgr.leave_or_stop().await;
+    }
+
+    #[test]
+    fn detects_private_lan_ws_urls() {
+        assert!(is_private_lan_ws_url("ws://192.168.1.11:8766/ws?room=4ENUAH"));
+        assert!(is_private_lan_ws_url("ws://10.0.0.5:8766/ws?room=ABC123"));
+        assert!(is_private_lan_ws_url("ws://172.16.4.2:8766/ws?room=ABC123"));
+        assert!(!is_private_lan_ws_url("wss://playzi-hub.example.workers.dev/ws?room=4ENUAH"));
+        assert!(!is_private_lan_ws_url("wss://cool-name.trycloudflare.com/ws?room=4ENUAH"));
+        assert!(!is_private_lan_ws_url("ws://127.0.0.1:8766/ws?room=4ENUAH"));
     }
 }

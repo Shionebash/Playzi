@@ -8,6 +8,7 @@ pub mod history;
 pub mod party;
 pub mod player;
 pub mod playlists;
+pub mod social;
 pub mod state;
 pub mod thumbs;
 pub mod updater;

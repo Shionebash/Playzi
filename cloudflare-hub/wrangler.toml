@@ -1,0 +1,13 @@
+name = "playzi-hub"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[durable_objects]
+bindings = [
+  { name = "SOCIAL_HUB", class_name = "SocialHub" },
+  { name = "PARTY_ROOM", class_name = "PartyRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SocialHub", "PartyRoom"]
