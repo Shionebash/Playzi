@@ -1983,19 +1983,31 @@ impl PartyManager {
                     });
                     return true;
                 }
+                let now_ms = Utc::now().timestamp_millis();
                 let mut changed = false;
-                if let Some(playing) = is_playing {
-                    host.playback.is_playing = playing;
-                    changed = true;
-                }
                 if let Some(pos) = position_secs
                     && pos.is_finite()
                 {
                     host.playback.position_secs = pos.max(0.0);
                     changed = true;
+                } else if is_playing.is_some()
+                    && host.playback.is_playing
+                    && host.playback.updated_at_ms > 0
+                {
+                    let elapsed_secs = ((now_ms - host.playback.updated_at_ms).max(0) as f64
+                        / 1000.0)
+                        * host.playback.playback_rate.max(0.1);
+                    host.playback.position_secs =
+                        (host.playback.position_secs + elapsed_secs).max(0.0);
+                }
+                if let Some(playing) = is_playing
+                    && host.playback.is_playing != playing
+                {
+                    host.playback.is_playing = playing;
+                    changed = true;
                 }
                 if changed {
-                    host.playback.updated_at_ms = Utc::now().timestamp_millis();
+                    host.playback.updated_at_ms = now_ms;
                     host.playback.updated_by = uid;
                     host.playback.version += 1;
                     host.broadcast_state();

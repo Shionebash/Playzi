@@ -444,6 +444,9 @@ impl SocialManager {
     pub async fn publish_room_presence(&self, room: Option<PublishedRoomInfo>) {
         let outbound = {
             let mut rt = self.inner.runtime.write().await;
+            if rt.published_room == room {
+                return;
+            }
             rt.published_room = room.clone();
             if room.is_none() {
                 rt.incoming_join_requests.clear();
@@ -513,9 +516,18 @@ impl SocialManager {
     }
 
     pub async fn dismiss_room_invite(&self, invite_id: &str) -> SocialSnapshot {
+        let clean_id = invite_id.trim().to_string();
         {
             let mut rt = self.inner.runtime.write().await;
-            rt.incoming_room_invites.retain(|i| i.id != invite_id);
+            rt.incoming_room_invites.retain(|i| i.id != clean_id);
+        }
+        if !clean_id.is_empty() {
+            let _ = self
+                .send_hub_message(json!({
+                    "type": "room_invite_dismiss",
+                    "inviteId": clean_id,
+                }))
+                .await;
         }
         self.emit_snapshot().await;
         self.status().await
@@ -895,6 +907,9 @@ impl SocialManager {
                     .get("outgoingFriendRequests")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
+                let incoming_room_invites: Option<Vec<RoomInviteItem>> = val
+                    .get("incomingRoomInvites")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
                 let incoming_join_requests: Vec<RoomJoinRequestItem> = val
                     .get("incomingJoinRequests")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -931,6 +946,9 @@ impl SocialManager {
                     rt.remote_friends = remote_friends;
                     rt.incoming_friend_requests = incoming_friend_requests;
                     rt.outgoing_friend_requests = outgoing_friend_requests;
+                    if let Some(invites) = incoming_room_invites {
+                        rt.incoming_room_invites = invites;
+                    }
                     rt.incoming_join_requests = incoming_join_requests;
                 }
                 self.emit_snapshot().await;

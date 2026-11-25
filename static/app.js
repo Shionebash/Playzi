@@ -2534,6 +2534,10 @@ async function loadWebPlayerItem(index, opts = {}) {
   _updateWatchQueue();
   _updateWatchRelated();
 
+  if (opts?.fromPartySync) {
+    _partyMediaLoadingLock = true;
+    _lockPartySync(1500);
+  }
   try {
     _startYtWatchReporting(item);
     if (state.player.sourceContext === "music" || state.player.audioOnly) {
@@ -2541,15 +2545,22 @@ async function loadWebPlayerItem(index, opts = {}) {
     } else {
       await _loadVideoItem(item, loadId);
     }
-    if (state.player._loadingId !== loadId) return;
+    if (state.player._loadingId !== loadId) {
+      if (opts?.fromPartySync) _partyMediaLoadingLock = false;
+      return;
+    }
+    _partyLastSyncedUrl = item.url;
     if (opts?.fromPartySync) {
       setTimeout(() => {
+        _partyMediaLoadingLock = false;
+        if (state.player._loadingId !== loadId) return;
         _applyMediaSync(Boolean(opts.targetPlaying), Number(opts.targetPos || 0), Number(opts.targetRate || 1));
       }, 350);
     } else if (state.party?.active && state.party.role === "host") {
       _pushHostPlaybackSync({ currentIndex: index, positionSecs: 0, isPlaying: true });
     }
   } catch (err) {
+    if (opts?.fromPartySync) _partyMediaLoadingLock = false;
     if (state.player._loadingId !== loadId) return;
     state.player.loading = false;
     const msg = err?.message || String(err || "Error inesperado");
@@ -4381,15 +4392,37 @@ async function bindTauriEvents() {
     const msg = event.payload?.message;
     if (msg) toast(msg);
   });
+  await listen("social-join-approved", (event) => {
+    const ev = event.payload || {};
+    if (ev.roomCode && ev.hostUserId) {
+      _socialSentJoinReqs.delete(`${String(ev.roomCode).toUpperCase()}:${String(ev.hostUserId).toUpperCase()}`);
+      if (state.view === "party") renderParty();
+    }
+  });
 }
 
 // ── Watch Party / Sesión Compartida ──────────────────────────────────────────
 
 let _applyingPartySync = false;
+let _applyingPartySyncTimer = null;
+let _partyMediaLoadingLock = false;
 let _partyHeartbeatTimer = null;
 let _partySyncDebounce = null;
 let _partyLastSyncedUrl = "";
+let _partyLastAppliedVersion = -1;
+let _partyGuestControlHoldUntil = 0;
 let _partyUsersCardOpen = false;
+const _socialSentInvites = new Set();
+const _socialSentJoinReqs = new Set();
+
+function _lockPartySync(ms = 1000) {
+  _applyingPartySync = true;
+  clearTimeout(_applyingPartySyncTimer);
+  _applyingPartySyncTimer = setTimeout(() => {
+    _applyingPartySync = false;
+    _applyingPartySyncTimer = null;
+  }, ms);
+}
 
 function _partyIsGuest() {
   return Boolean(state.party?.active && state.party.role === "guest");
@@ -4601,7 +4634,7 @@ function _getCurrentMediaState() {
 }
 
 function _applyMediaSync(targetPlaying, targetPosSecs, targetRate = 1) {
-  _applyingPartySync = true;
+  _lockPartySync(1000);
   try {
     const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
     if (isAudio) {
@@ -4609,19 +4642,31 @@ function _applyMediaSync(targetPlaying, targetPosSecs, targetRate = 1) {
       const audio = !vjs ? _getAudioEl() : null;
       if (vjs) {
         const cur = Number(vjs.currentTime() || 0);
-        if (Math.abs(cur - targetPosSecs) > 1.8) vjs.currentTime(targetPosSecs);
+        if (Math.abs(cur - targetPosSecs) > 1.8) {
+          _lockPartySync(1500);
+          vjs.one("seeked", () => _lockPartySync(450));
+          vjs.currentTime(targetPosSecs);
+        }
         if (targetPlaying && vjs.paused()) vjs.play().catch(() => {});
         else if (!targetPlaying && !vjs.paused()) vjs.pause();
       } else if (audio) {
         const cur = Number(audio.currentTime || 0);
-        if (Math.abs(cur - targetPosSecs) > 1.8) audio.currentTime = targetPosSecs;
+        if (Math.abs(cur - targetPosSecs) > 1.8) {
+          _lockPartySync(1500);
+          audio.addEventListener("seeked", () => _lockPartySync(450), { once: true });
+          audio.currentTime = targetPosSecs;
+        }
         if (targetPlaying && audio.paused) audio.play().catch(() => {});
         else if (!targetPlaying && !audio.paused) audio.pause();
       }
     } else if (state.player.vjs && !state.player.vjs.isDisposed()) {
       const vjs = state.player.vjs;
       const cur = Number(vjs.currentTime() || 0);
-      if (Math.abs(cur - targetPosSecs) > 1.8) vjs.currentTime(targetPosSecs);
+      if (Math.abs(cur - targetPosSecs) > 1.8) {
+        _lockPartySync(1500);
+        vjs.one("seeked", () => _lockPartySync(450));
+        vjs.currentTime(targetPosSecs);
+      }
       if (targetRate && Math.abs((vjs.playbackRate() || 1) - targetRate) > 0.05) {
         vjs.playbackRate(targetRate);
       }
@@ -4629,7 +4674,6 @@ function _applyMediaSync(targetPlaying, targetPosSecs, targetRate = 1) {
       else if (!targetPlaying && !vjs.paused()) vjs.pause();
     }
   } catch (_) {}
-  setTimeout(() => { _applyingPartySync = false; }, 250);
 }
 
 async function _pushGuestPlaybackSync(update) {
@@ -4642,12 +4686,13 @@ async function _pushGuestPlaybackSync(update) {
 }
 
 function _onLocalMediaEvent(kind = "sync") {
-  if (_applyingPartySync) return;
+  if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
   if (!state.party?.active) return;
 
   if (state.party.role === "host") {
     clearTimeout(_partySyncDebounce);
     _partySyncDebounce = setTimeout(() => {
+      if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
       _pushHostPlaybackSync();
     }, 150);
     return;
@@ -4665,9 +4710,13 @@ function _onLocalMediaEvent(kind = "sync") {
       }
       clearTimeout(_partySyncDebounce);
       _partySyncDebounce = setTimeout(() => {
+        if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
         const media = _getCurrentMediaState();
+        const serverPlaying = Boolean(state.party?.playback?.isPlaying);
+        if (media.isPlaying === serverPlaying) return;
+        _partyGuestControlHoldUntil = Date.now() + 2400;
         _pushGuestPlaybackSync({ isPlaying: media.isPlaying });
-      }, 100);
+      }, 120);
       return;
     }
 
@@ -4678,9 +4727,12 @@ function _onLocalMediaEvent(kind = "sync") {
       }
       clearTimeout(_partySyncDebounce);
       _partySyncDebounce = setTimeout(() => {
+        if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
         const media = _getCurrentMediaState();
+        if (Math.abs(media.positionSecs - _partyExpectedPlaybackPos()) < 1.8) return;
+        _partyGuestControlHoldUntil = Date.now() + 2400;
         _pushGuestPlaybackSync({ positionSecs: media.positionSecs });
-      }, 120);
+      }, 160);
       return;
     }
 
@@ -4714,6 +4766,7 @@ function _ensurePartyHeartbeat() {
           _partyHeartbeatTimer = null;
           return;
         }
+        if (_applyingPartySync || _partyMediaLoadingLock || state.player.loading) return;
         const media = _getCurrentMediaState();
         if (media.isPlaying && state.player.current) {
           _pushHostPlaybackSync();
@@ -4729,6 +4782,7 @@ function _ensurePartyHeartbeat() {
 function _onPartyStateUpdate(snapshot, opts = {}) {
   if (!snapshot) return;
   const wasActive = Boolean(state.party?.active);
+  const prevRoomCode = state.party?.roomCode || "";
   state.party = snapshot;
   _updatePartyBadge();
   _ensurePartyHeartbeat();
@@ -4738,9 +4792,18 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
 
   if (!snapshot.active) {
     _partyLastSyncedUrl = "";
+    _partyLastAppliedVersion = -1;
+    _partyGuestControlHoldUntil = 0;
+    _partyMediaLoadingLock = false;
     _partyUsersCardOpen = false;
+    _socialSentInvites.clear();
     _applyPartyPlayerRestrictions();
     return;
+  }
+  if (prevRoomCode && prevRoomCode !== snapshot.roomCode) {
+    _partyLastAppliedVersion = -1;
+    _partyGuestControlHoldUntil = 0;
+    _socialSentInvites.clear();
   }
 
   // Sync shared queue into player state
@@ -4767,15 +4830,22 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
     ? Math.max(0, (Date.now() - Number(pb.updatedAtMs)) / 1000) * Number(pb.playbackRate || 1)
     : 0;
   const targetPos = Math.max(0, Number(pb.positionSecs || 0) + elapsedSecs);
+  const pbVersion = Number(pb.version || 0);
 
   const isGuest = snapshot.role === "guest";
   const hostNeedsFirstLoad = snapshot.role === "host" && !state.player.current;
   const hostRemoteControl = snapshot.role === "host" && pb.updatedBy && pb.updatedBy !== snapshot.selfUserId;
 
+  if (snapshot.role === "host" && state.player.current?.url === targetItem.url && state.player.index === expectedIdx) {
+    _partyLastSyncedUrl = targetItem.url;
+  }
+
   if (isGuest || hostNeedsFirstLoad || hostRemoteControl) {
     const currentUrl = state.player.current?.url || "";
-    if (currentUrl !== targetItem.url || state.player.index !== expectedIdx || _partyLastSyncedUrl !== targetItem.url) {
+    const needsTrackLoad = currentUrl !== targetItem.url || state.player.index !== expectedIdx || (isGuest && _partyLastSyncedUrl !== targetItem.url);
+    if (needsTrackLoad) {
       _partyLastSyncedUrl = targetItem.url;
+      _partyLastAppliedVersion = pbVersion;
       state.player.sourceContext = targetItem.sourceContext || "search";
       if (isGuest && !wasActive) setView("watch");
       loadWebPlayerItem(expectedIdx, {
@@ -4784,7 +4854,11 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
         targetPlaying: Boolean(pb.isPlaying),
         targetRate: Number(pb.playbackRate || 1),
       });
-    } else if (isGuest || hostRemoteControl) {
+    } else if (pbVersion !== _partyLastAppliedVersion) {
+      if (isGuest && Date.now() < _partyGuestControlHoldUntil && pb.updatedBy !== snapshot.selfUserId) {
+        return;
+      }
+      _partyLastAppliedVersion = pbVersion;
       _applyMediaSync(Boolean(pb.isPlaying), targetPos, Number(pb.playbackRate || 1));
     }
   }
@@ -4828,6 +4902,63 @@ function renderParty() {
   const incomingInvites = social.incomingRoomInvites || [];
   const incomingJoinReqs = social.incomingJoinRequests || [];
   const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length;
+  const roomParticipantIds = new Set((p.participants || []).map((u) => String(u.userId || "").toUpperCase()));
+  const activeFriendRooms = friends.filter((f) => f.room && f.room.roomCode);
+  const onlineFriends = friends.filter((f) => f.online);
+
+  const activeFriendSessionsHtml = (activeFriendRooms.length > 0 || (hubConnected && friends.length > 0 && !p.active)) ? `
+    <div class="party-card party-card--wide" style="margin-bottom:16px">
+      <div class="party-card-hdr">
+        <div class="party-row">
+          <div class="party-card-title">Sesiones activas de amigos (${activeFriendRooms.length})</div>
+          ${activeFriendRooms.length ? `<span class="party-pill party-pill--live">En vivo</span>` : ""}
+        </div>
+      </div>
+      ${activeFriendRooms.length ? `
+        <div class="party-list">
+          ${activeFriendRooms.map((f) => {
+            const room = f.room;
+            const uidUpper = String(f.userId || "").toUpperCase();
+            const rCodeUpper = String(room.roomCode || "").toUpperCase();
+            const inSameRoom = Boolean(p.active && String(p.roomCode || "").toUpperCase() === rCodeUpper);
+            const reqKey = `${rCodeUpper}:${uidUpper}`;
+            const reqSent = _socialSentJoinReqs.has(reqKey);
+            const accessLabel = accessLabels[room.roomAccess] || accessLabels.request;
+            let actionHtml = "";
+            if (inSameRoom) {
+              actionHtml = `<span class="party-pill party-pill--ok">Ya estás aquí</span>`;
+            } else if (room.roomAccess === "invite_only") {
+              actionHtml = `<span class="party-pill">Solo invitación</span>`;
+            } else if (room.roomAccess === "open") {
+              actionHtml = `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(room.roomCode)}" data-social-join-access="open">Unirse</button>`;
+            } else if (reqSent) {
+              actionHtml = `<button class="btn btn-ghost" type="button" disabled>Solicitud enviada</button>`;
+            } else {
+              actionHtml = `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(room.roomCode)}" data-social-join-access="request">Pedir unirse</button>`;
+            }
+            return `
+              <div class="party-person">
+                <div class="party-person-info">
+                  <div class="party-person-name">
+                    <span class="party-dot party-dot--on" title="En línea"></span>
+                    <span>${escapeHtml(f.displayName)}</span>
+                    <span class="party-pill party-pill--live">Sala ${escapeHtml(room.roomCode)} · ${room.participantsCount || 1}</span>
+                    <span class="party-pill">${escapeHtml(accessLabel)}</span>
+                  </div>
+                  <div class="party-person-meta">
+                    ${room.currentTitle ? `Reproduciendo: ${escapeHtml(room.currentTitle)}` : `ID: ${escapeHtml(f.userId)}`}
+                  </div>
+                </div>
+                <div class="party-row">
+                  ${actionHtml}
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      ` : `<div class="muted" style="font-size:.84rem">Ninguno de tus amigos tiene una sesión activa en este momento.</div>`}
+    </div>
+  ` : "";
 
   const notificationsHtml = totalPending > 0 ? `
     <div class="party-card party-card--wide" style="margin-bottom:16px;border-color:var(--accent-glow)">
@@ -4973,13 +5104,48 @@ function renderParty() {
           </div>
         </div>
 
-        <div class="party-field">${hasPublicUrl || p.relayConnected ? "Código de sala para compartir (o invita directo desde tu lista de amigos)" : "Preparando conexión online..."}
+        <div class="party-field">${hasPublicUrl || p.relayConnected ? "Código de sala para compartir (o invita directo a tus amigos abajo)" : "Preparando conexión online..."}
           <div class="party-code-box">
             <code id="partyInviteText">${escapeHtml(p.roomCode)}</code>
             <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.roomCode)}">Copiar código</button>
           </div>
         </div>
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
+
+        <div style="border-top:1px solid var(--br);padding-top:12px">
+          <div class="party-card-hdr" style="margin-bottom:8px">
+            <div class="party-card-title" style="font-size:.92rem">Invitar amigos a tu sala (${onlineFriends.length} en línea)</div>
+            ${!hubConnected ? `<span class="party-pill party-pill--warn">Hub desconectado</span>` : ""}
+          </div>
+          ${onlineFriends.length ? `
+            <div class="party-list">
+              ${onlineFriends.map((f) => {
+                const uidUpper = String(f.userId || "").toUpperCase();
+                const inRoom = roomParticipantIds.has(uidUpper);
+                const inviteKey = `${String(p.roomCode || "").toUpperCase()}:${uidUpper}`;
+                const invited = _socialSentInvites.has(inviteKey);
+                const inviteReady = hubConnected && (hasPublicUrl || p.relayConnected);
+                return `
+                  <div class="party-person">
+                    <div class="party-person-info">
+                      <div class="party-person-name">
+                        <span class="party-dot party-dot--on" title="En línea"></span>
+                        <span>${escapeHtml(f.displayName)}</span>
+                        ${inRoom ? `<span class="party-pill party-pill--ok">En sala</span>` : ""}
+                      </div>
+                      <div class="party-person-meta">${escapeHtml(f.userId)}</div>
+                    </div>
+                    <div class="party-row">
+                      ${inRoom
+                        ? `<span class="party-pill party-pill--ok">Conectado</span>`
+                        : `<button class="btn ${invited ? "btn-ghost" : "btn-primary"}" type="button" data-social-invite-friend="${escapeHtml(f.userId)}" ${inviteReady ? "" : "disabled"}>${invited ? "Reenviar invitación" : "Invitar"}</button>`}
+                    </div>
+                  </div>
+                `;
+              }).join("")}
+            </div>
+          ` : `<div class="muted" style="font-size:.83rem">No hay amigos conectados en este momento. Comparte el código de sala o agrega amigos abajo.</div>`}
+        </div>
 
         <div style="border-top:1px solid var(--br);padding-top:12px">
           <div class="party-card-title" style="font-size:.92rem;margin-bottom:8px">¿Quién puede entrar a tu sala?</div>
@@ -5106,6 +5272,8 @@ function renderParty() {
 
     ${notificationsHtml}
 
+    ${activeFriendSessionsHtml}
+
     ${sessionCardHtml}
 
     <div class="party-grid">
@@ -5141,15 +5309,22 @@ function renderParty() {
 
         <div class="party-list">
           ${friends.length ? friends.map((f) => {
+            const uidUpper = String(f.userId || "").toUpperCase();
             const hasRoom = Boolean(f.room && f.room.roomCode);
-            const canRequestJoin = hasRoom && f.room.roomAccess !== "invite_only" && (!p.active || p.roomCode !== f.room.roomCode);
-            const canInvite = hubConnected && isHost && f.online;
+            const rCodeUpper = hasRoom ? String(f.room.roomCode || "").toUpperCase() : "";
+            const inSameRoom = hasRoom && Boolean(p.active && String(p.roomCode || "").toUpperCase() === rCodeUpper);
+            const inMyRoom = isHost && roomParticipantIds.has(uidUpper);
+            const canRequestJoin = hasRoom && f.room.roomAccess !== "invite_only" && !inSameRoom;
+            const reqSent = hasRoom && _socialSentJoinReqs.has(`${rCodeUpper}:${uidUpper}`);
+            const canInvite = hubConnected && isHost && f.online && !inMyRoom;
+            const invited = isHost && _socialSentInvites.has(`${String(p.roomCode || "").toUpperCase()}:${uidUpper}`);
             return `
             <div class="party-person">
               <div class="party-person-info">
                 <div class="party-person-name">
                   <span class="party-dot ${f.online ? "party-dot--on" : "party-dot--off"}" title="${f.online ? "En línea" : "Desconectado"}"></span>
                   <span>${escapeHtml(f.displayName)}</span>
+                  ${inMyRoom ? `<span class="party-pill party-pill--ok">En tu sala</span>` : ""}
                   ${hasRoom ? `<span class="party-pill party-pill--live">Sala ${escapeHtml(f.room.roomCode)} · ${f.room.participantsCount || 1}</span>` : ""}
                   ${f.googleAccountName ? `<span class="party-pill">Google: ${escapeHtml(f.googleAccountName)}</span>` : ""}
                 </div>
@@ -5158,8 +5333,12 @@ function renderParty() {
                 </div>
               </div>
               <div class="party-row">
-                ${canRequestJoin ? `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(f.room.roomCode)}">${f.room.roomAccess === "open" ? "Unirse" : "Pedir unirse"}</button>` : ""}
-                ${canInvite ? `<button class="btn btn-primary" type="button" data-social-invite-friend="${escapeHtml(f.userId)}">Invitar</button>` : ""}
+                ${canRequestJoin
+                  ? (reqSent
+                    ? `<button class="btn btn-ghost" type="button" disabled>Solicitud enviada</button>`
+                    : `<button class="btn btn-primary" type="button" data-social-join-friend="${escapeHtml(f.userId)}" data-social-join-room="${escapeHtml(f.room.roomCode)}" data-social-join-access="${escapeHtml(f.room.roomAccess || "request")}">${f.room.roomAccess === "open" ? "Unirse" : "Pedir unirse"}</button>`)
+                  : ""}
+                ${canInvite ? `<button class="btn ${invited ? "btn-ghost" : "btn-primary"}" type="button" data-social-invite-friend="${escapeHtml(f.userId)}">${invited ? "Reenviar" : "Invitar"}</button>` : ""}
                 <button class="btn btn-ghost" type="button" data-friend-toggle="${escapeHtml(f.userId)}">${f.defaultAllowQueue ? "Quitar cola" : "Permitir cola"}</button>
                 <button class="btn btn-ghost" type="button" data-friend-remove="${escapeHtml(f.userId)}">Eliminar</button>
               </div>
@@ -5276,22 +5455,45 @@ document.addEventListener("click", async (ev) => {
 
   const joinFriendBtn = ev.target.closest("[data-social-join-friend]");
   if (joinFriendBtn) {
+    const uid = joinFriendBtn.dataset.socialJoinFriend || "";
+    const roomCode = joinFriendBtn.dataset.socialJoinRoom || "";
+    const access = joinFriendBtn.dataset.socialJoinAccess || "request";
+    const reqKey = `${roomCode.toUpperCase()}:${uid.toUpperCase()}`;
+    if (access !== "open") {
+      _socialSentJoinReqs.add(reqKey);
+      renderParty();
+    }
     try {
       await api.post("/api/social/room/join-request", {
-        userId: joinFriendBtn.dataset.socialJoinFriend,
-        roomCode: joinFriendBtn.dataset.socialJoinRoom || "",
+        userId: uid,
+        roomCode,
       });
-    } catch (err) { toast(err.message); }
+      toast(access === "open" ? `Uniéndote a la sala ${roomCode}...` : `Solicitud enviada para la sala ${roomCode}`);
+    } catch (err) {
+      _socialSentJoinReqs.delete(reqKey);
+      renderParty();
+      toast(err.message);
+    }
     return;
   }
 
   const inviteFriendBtn = ev.target.closest("[data-social-invite-friend]");
   if (inviteFriendBtn) {
+    const uid = inviteFriendBtn.dataset.socialInviteFriend || "";
+    const roomCode = state.party?.roomCode || "";
+    const invKey = `${roomCode.toUpperCase()}:${uid.toUpperCase()}`;
+    _socialSentInvites.add(invKey);
+    renderParty();
     try {
       await api.post("/api/social/room/invite", {
-        userId: inviteFriendBtn.dataset.socialInviteFriend,
+        userId: uid,
       });
-    } catch (err) { toast(err.message); }
+      toast("Invitación enviada");
+    } catch (err) {
+      _socialSentInvites.delete(invKey);
+      renderParty();
+      toast(err.message);
+    }
     return;
   }
 
@@ -5389,6 +5591,8 @@ document.addEventListener("click", async (ev) => {
   if (action === "go-watch") { setView("watch"); return; }
   if (action === "resync") {
     _partyLastSyncedUrl = "";
+    _partyLastAppliedVersion = -1;
+    _partyGuestControlHoldUntil = 0;
     _onPartyStateUpdate(state.party);
     toast("Sincronizando con el host...");
     return;
