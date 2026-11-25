@@ -1,7 +1,16 @@
 .env
+.env.*
+!.env.example
 .venv/
+.vercel/
+.dev.vars
+node_modules/
 data/
 media/
+ERR
+*.log
+cookies*.txt
+*.cookies
 __pycache__/
 *.pyc
 *.pyo

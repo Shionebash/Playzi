@@ -4921,9 +4921,9 @@ function renderParty() {
             <div class="party-card-title">Unirse a una sala</div>
             <span class="party-pill">Invitado</span>
           </div>
-          <p class="muted" style="font-size:.84rem">Escribe el código de sala o pega el enlace que te compartió tu amigo, o únete directo desde tu lista de amigos.</p>
-          <label class="party-field">Código de sala o enlace
-            <input class="form-input" id="partyJoinInvite" placeholder="ej. 4ENUAH o enlace de invitación">
+          <p class="muted" style="font-size:.84rem">Escribe el código de sala que te compartió tu amigo, o únete directo desde tu lista de amigos.</p>
+          <label class="party-field">Código de sala
+            <input class="form-input" id="partyJoinInvite" placeholder="ej. 4ENUAH">
           </label>
           <div class="party-row">
             <button class="btn btn-primary" type="button" data-party-action="join-session">Unirse</button>
@@ -4973,11 +4973,10 @@ function renderParty() {
           </div>
         </div>
 
-        <div class="party-field">${hasPublicUrl ? "Enlace para compartir (o invita directo desde tu lista de amigos)" : "Preparando enlace online..."}
+        <div class="party-field">${hasPublicUrl || p.relayConnected ? "Código de sala para compartir (o invita directo desde tu lista de amigos)" : "Preparando conexión online..."}
           <div class="party-code-box">
-            <code id="partyInviteText">${escapeHtml(p.inviteUrl || p.localWsUrl)}</code>
-            <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.inviteUrl || p.localWsUrl)}">Copiar enlace</button>
-            ${p.relayConnected ? `<button class="btn btn-ghost" type="button" data-party-copy="${escapeHtml(p.roomCode)}">Copiar código</button>` : ""}
+            <code id="partyInviteText">${escapeHtml(p.roomCode)}</code>
+            <button class="btn btn-primary" type="button" data-party-copy="${escapeHtml(p.roomCode)}">Copiar código</button>
           </div>
         </div>
         ${p.tunnelError ? `<div class="muted" style="color:#fbbf24;font-size:.82rem">${escapeHtml(p.tunnelError)}</div>` : ""}
@@ -5173,16 +5172,16 @@ function renderParty() {
 
     <details class="party-card party-card--wide" style="margin-top:8px">
       <summary class="party-card-title" style="cursor:pointer;font-size:.9rem">Opciones avanzadas de red</summary>
-      <div class="party-field" style="margin-top:12px">Servidor Hub Online (Cloudflare Workers)
+      <div class="party-field" style="margin-top:12px">Servidor Hub Online
         <div class="party-row">
-          <input class="form-input" id="socialHubUrlInput" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="https://playzi-hub.tu-subdominio.workers.dev">
+          <input class="form-input" id="socialHubUrlInput" type="password" style="flex:1" value="${escapeHtml(social.hubUrl || "")}" placeholder="URL del Hub Online">
           <button class="btn btn-ghost" type="button" data-party-action="save-hub-url">Guardar servidor</button>
         </div>
         ${social.lastError ? `<div class="muted" style="color:#fbbf24;font-size:.8rem">${escapeHtml(social.lastError)}</div>` : ""}
       </div>
       ${isHost ? `
         <div class="party-row" style="margin-top:10px">
-          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública personalizada (opcional)" value="${escapeHtml(p.publicWsUrl || "")}">
+          <input class="form-input" id="partyUpdatePublicHost" style="flex:1;min-width:220px" placeholder="Dirección pública personalizada (opcional)" value="${escapeHtml(p.relayConnected ? "" : (p.publicWsUrl || ""))}">
           <button class="btn btn-ghost" type="button" data-party-action="set-public-host">Aplicar dirección</button>
           <button class="btn btn-ghost" type="button" data-party-action="start-tunnel" ${p.tunnelRunning ? "disabled" : ""}>${p.tunnelRunning ? "Túnel activo" : "Forzar túnel Cloudflare"}</button>
         </div>
