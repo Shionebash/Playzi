@@ -23,10 +23,12 @@ const ENV_KEY_ORDER: &[&str] = &[
     "SOCIAL_HUB_URL",
 ];
 
-/// Built-in default Cloudflare Workers Relay + Social Hub URL.
-/// Set this to your deployed `https://playzi-hub.<subdomain>.workers.dev` URL
-/// so all Playzi users connect automatically without any manual configuration.
-pub const DEFAULT_SOCIAL_HUB_URL: &str = "";
+/// Built-in default Social Hub URL injected at compile time from `SOCIAL_HUB_URL`
+/// (environment variable or workspace `.env`) via `build.rs`, keeping the URL out of Git.
+pub const DEFAULT_SOCIAL_HUB_URL: &str = match option_env!("PLAYZI_BUILT_SOCIAL_HUB_URL") {
+    Some(url) => url,
+    None => "",
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -145,7 +147,7 @@ impl AppConfig {
             .or_else(|| std::env::var("SOCIAL_HUB_URL").ok())
             .map(|v| v.trim().trim_matches('"').to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_SOCIAL_HUB_URL.to_string());
+            .unwrap_or_else(|| DEFAULT_SOCIAL_HUB_URL.trim().to_string());
 
         Self {
             root,

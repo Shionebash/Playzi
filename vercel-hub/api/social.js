@@ -80,10 +80,11 @@ function buildSyncFor(st, uid) {
       room: room
         ? {
             roomCode: room.roomCode || "",
-            roomAccess: room.roomAccess || "request",
             inviteUrl: room.roomAccess === "open" ? (room.inviteUrl || "") : "",
-            trackTitle: room.trackTitle || "",
-            guestCount: Number(room.guestCount || 0),
+            roomAccess: room.roomAccess || "request",
+            participantsCount: Number(room.participantsCount ?? room.guestCount ?? 1),
+            currentTitle: String(room.currentTitle ?? room.trackTitle ?? ""),
+            updatedAt: String(room.updatedAt || ""),
           }
         : null,
     };
@@ -92,8 +93,18 @@ function buildSyncFor(st, uid) {
   const incomingFriendRequests = [];
   const outgoingFriendRequests = [];
   for (const req of Object.values(st.friendRequests || {})) {
-    if (req.toUserId === uid) incomingFriendRequests.push(req);
-    else if (req.fromUserId === uid) outgoingFriendRequests.push(req);
+    const item = {
+      id: req.id,
+      fromUserId: req.fromUserId,
+      fromDisplayName: req.fromDisplayName || st.profiles?.[req.fromUserId]?.displayName || req.fromUserId,
+      fromGoogleAccountName: req.fromGoogleAccountName ?? st.profiles?.[req.fromUserId]?.googleAccountName ?? "",
+      toUserId: req.toUserId,
+      toDisplayName: req.toDisplayName || st.profiles?.[req.toUserId]?.displayName || req.toUserId,
+      toGoogleAccountName: req.toGoogleAccountName ?? st.profiles?.[req.toUserId]?.googleAccountName ?? "",
+      createdAt: req.createdAt || "",
+    };
+    if (req.toUserId === uid) incomingFriendRequests.push(item);
+    else if (req.fromUserId === uid) outgoingFriendRequests.push(item);
   }
 
   const incomingRoomInvites = Object.values(st.roomInvites || {})
@@ -101,11 +112,19 @@ function buildSyncFor(st, uid) {
     .map(({ createdAtMs, ...rest }) => rest);
 
   const incomingJoinRequests = Object.values(st.joinRequests || {})
-    .filter((req) => req.hostUserId === uid)
-    .map(({ createdAtMs, ...rest }) => rest);
+    .filter((req) => (req.toUserId || req.hostUserId) === uid)
+    .map(({ createdAtMs, hostUserId, ...rest }) => ({
+      id: rest.id,
+      fromUserId: rest.fromUserId,
+      fromDisplayName: rest.fromDisplayName || st.profiles?.[rest.fromUserId]?.displayName || rest.fromUserId,
+      fromGoogleAccountName: rest.fromGoogleAccountName ?? st.profiles?.[rest.fromUserId]?.googleAccountName ?? "",
+      toUserId: rest.toUserId || hostUserId || uid,
+      roomCode: rest.roomCode || "",
+      createdAt: rest.createdAt || "",
+    }));
 
   return {
-    type: "sync",
+    type: "social_sync",
     friends,
     incomingFriendRequests,
     outgoingFriendRequests,
@@ -127,20 +146,28 @@ export default async function handler(req, res) {
     const st = (await kvGetJson(STATE_KEY, null)) || emptySocialState();
     pruneState(st);
 
+    const action = String(body.action || body.type || "sync").trim();
+    const msg = body.payload || body;
+
     const prevProf = st.profiles[uid] || {};
+    const nextDisplayName = action === "profile_update" && msg.displayName !== undefined
+      ? String(msg.displayName || "").trim()
+      : String(body.displayName || "").trim();
+    const nextGoogleName = action === "profile_update" && msg.googleAccountName !== undefined
+      ? String(msg.googleAccountName || "").trim()
+      : String(body.googleAccountName ?? prevProf.googleAccountName ?? "").trim();
+
     st.profiles[uid] = {
       userId: uid,
-      displayName: String(body.displayName || prevProf.displayName || uid).trim() || uid,
-      googleAccountName: String(body.googleAccountName ?? prevProf.googleAccountName ?? "").trim(),
+      displayName: nextDisplayName || prevProf.displayName || uid,
+      googleAccountName: nextGoogleName,
       lastSeenMs: Date.now(),
     };
 
-    const action = String(body.action || body.type || "sync").trim();
-    const msg = body.payload || body;
     let notice = null;
 
     if (action === "friend_request_send") {
-      const targetId = normalizeUserId(msg.targetUserId);
+      const targetId = normalizeUserId(msg.toUserId || msg.targetUserId);
       if (!targetId || targetId === uid) {
         notice = { level: "warn", message: "ID de amigo inválido." };
       } else if (areFriends(st, uid, targetId)) {
@@ -153,6 +180,11 @@ export default async function handler(req, res) {
           delete st.friendRequests[reverse.id];
           addMutualFriend(st, uid, targetId);
           notice = { level: "ok", message: `Ahora eres amigo de ${reverse.fromDisplayName || targetId}.` };
+          pushInbox(st, targetId, {
+            type: "notice",
+            level: "ok",
+            message: `${st.profiles[uid].displayName} aceptó tu solicitud de amistad.`,
+          });
         } else {
           const exists = Object.values(st.friendRequests).find(
             (r) => r.fromUserId === uid && r.toUserId === targetId,
@@ -163,56 +195,109 @@ export default async function handler(req, res) {
               id,
               fromUserId: uid,
               fromDisplayName: st.profiles[uid].displayName,
+              fromGoogleAccountName: st.profiles[uid].googleAccountName || "",
               toUserId: targetId,
               toDisplayName: st.profiles[targetId]?.displayName || targetId,
+              toGoogleAccountName: st.profiles[targetId]?.googleAccountName || "",
               createdAt: new Date().toISOString(),
             };
+            pushInbox(st, targetId, {
+              type: "notice",
+              level: "info",
+              message: `${st.profiles[uid].displayName} te envió una solicitud de amistad.`,
+            });
           }
-          notice = { level: "ok", message: `Solicitud de amistad enviada a ${targetId}.` };
+          notice = { level: "ok", message: `Solicitud de amistad enviada a ${st.profiles[targetId]?.displayName || targetId}.` };
         }
       }
-    } else if (action === "friend_request_accept") {
+    } else if (action === "friend_request_respond" || action === "friend_request_accept" || action === "friend_request_decline") {
       const reqItem = st.friendRequests[msg.requestId];
+      const accept = action === "friend_request_accept"
+        ? true
+        : action === "friend_request_decline"
+          ? false
+          : Boolean(msg.accept);
       if (reqItem && reqItem.toUserId === uid) {
         delete st.friendRequests[reqItem.id];
-        addMutualFriend(st, reqItem.fromUserId, uid);
-        notice = { level: "ok", message: `Aceptaste a ${reqItem.fromDisplayName || reqItem.fromUserId}.` };
+        if (accept) {
+          addMutualFriend(st, reqItem.fromUserId, uid);
+          notice = { level: "ok", message: `Ahora eres amigo de ${reqItem.fromDisplayName || reqItem.fromUserId}.` };
+          pushInbox(st, reqItem.fromUserId, {
+            type: "notice",
+            level: "ok",
+            message: `${st.profiles[uid].displayName} aceptó tu solicitud de amistad.`,
+          });
+        } else {
+          notice = { level: "info", message: "Solicitud de amistad rechazada." };
+          pushInbox(st, reqItem.fromUserId, {
+            type: "notice",
+            level: "info",
+            message: `${st.profiles[uid].displayName} rechazó tu solicitud de amistad.`,
+          });
+        }
       }
-    } else if (action === "friend_request_decline" || action === "friend_request_cancel") {
+    } else if (action === "friend_request_cancel") {
       const reqItem = st.friendRequests[msg.requestId];
       if (reqItem && (reqItem.toUserId === uid || reqItem.fromUserId === uid)) {
         delete st.friendRequests[reqItem.id];
+        notice = { level: "info", message: "Solicitud cancelada." };
       }
     } else if (action === "friend_remove") {
-      const targetId = normalizeUserId(msg.targetUserId);
-      if (targetId) removeMutualFriend(st, uid, targetId);
+      const targetId = normalizeUserId(msg.friendUserId || msg.targetUserId);
+      if (targetId) {
+        removeMutualFriend(st, uid, targetId);
+        notice = { level: "info", message: "Amigo eliminado." };
+      }
     } else if (action === "room_presence_update") {
       if (msg.room && msg.room.roomCode) {
+        const rawAccess = String(msg.room.roomAccess || "request").trim();
+        const roomAccess = rawAccess === "open" || rawAccess === "invite_only" ? rawAccess : "request";
         st.rooms[uid] = {
           roomCode: String(msg.room.roomCode).trim().toUpperCase(),
-          roomAccess: msg.room.roomAccess === "open" ? "open" : "request",
+          roomAccess,
           inviteUrl: String(msg.room.inviteUrl || "").trim(),
-          trackTitle: String(msg.room.trackTitle || "").trim(),
-          guestCount: Number(msg.room.guestCount || 0),
-          updatedAt: Date.now(),
+          currentTitle: String(msg.room.currentTitle ?? msg.room.trackTitle ?? "").trim().slice(0, 120),
+          participantsCount: Number(msg.room.participantsCount ?? msg.room.guestCount ?? 1),
+          updatedAt: new Date().toISOString(),
         };
       } else {
         delete st.rooms[uid];
+        for (const [reqId, jr] of Object.entries(st.joinRequests || {})) {
+          if ((jr.toUserId || jr.hostUserId) === uid) {
+            delete st.joinRequests[reqId];
+          }
+        }
       }
     } else if (action === "room_invite_send") {
-      const targetId = normalizeUserId(msg.targetUserId);
-      if (targetId && areFriends(st, uid, targetId)) {
+      const targetId = normalizeUserId(msg.toUserId || msg.targetUserId);
+      const roomCode = String(msg.roomCode || "").trim().toUpperCase();
+      const inviteUrl = String(msg.inviteUrl || "").trim();
+      if (!targetId || !roomCode || !inviteUrl) {
+        notice = { level: "error", message: "Faltan datos para enviar la invitación." };
+      } else if (!isOnline(st, targetId)) {
+        notice = { level: "error", message: "Tu amigo no está conectado en este momento." };
+      } else {
         const id = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        st.roomInvites[id] = {
+        const invite = {
           id,
           fromUserId: uid,
           fromDisplayName: st.profiles[uid].displayName,
+          fromGoogleAccountName: st.profiles[uid].googleAccountName || "",
+          roomCode,
+          inviteUrl,
+          createdAt: new Date().toISOString(),
+        };
+        st.roomInvites[id] = {
+          ...invite,
           toUserId: targetId,
-          roomCode: String(msg.roomCode || "").trim().toUpperCase(),
-          inviteUrl: String(msg.inviteUrl || "").trim(),
-          roomAccess: msg.roomAccess === "open" ? "open" : "request",
           createdAtMs: Date.now(),
         };
+        pushInbox(st, targetId, { type: "room_invite_received", invite });
+        pushInbox(st, targetId, {
+          type: "notice",
+          level: "info",
+          message: `${st.profiles[uid].displayName} te invitó a la sala ${roomCode}.`,
+        });
         notice = { level: "ok", message: `Invitación enviada a ${st.profiles[targetId]?.displayName || targetId}.` };
       }
     } else if (action === "room_invite_dismiss") {
@@ -220,11 +305,17 @@ export default async function handler(req, res) {
         delete st.roomInvites[msg.inviteId];
       }
     } else if (action === "room_join_request") {
-      const hostId = normalizeUserId(msg.hostUserId);
+      const hostId = normalizeUserId(msg.toUserId || msg.hostUserId);
       const room = st.rooms[hostId];
-      if (!hostId || !areFriends(st, uid, hostId) || !room || !isOnline(st, hostId)) {
-        notice = { level: "warn", message: "La sala de tu amigo no está disponible ahora mismo." };
-      } else if (room.roomAccess === "open" && room.inviteUrl) {
+      if (!hostId || !room || !isOnline(st, hostId)) {
+        notice = { level: "error", message: "Ese amigo no tiene una sala abierta en este momento." };
+      } else if (!areFriends(st, uid, hostId)) {
+        notice = { level: "error", message: "Deben ser amigos para solicitar acceso a la sala." };
+      } else if (!room.inviteUrl) {
+        notice = { level: "error", message: "La sala del amigo aún no tiene enlace público listo." };
+      } else if (room.roomAccess === "invite_only") {
+        notice = { level: "error", message: "Esta sala está configurada como solo por invitación." };
+      } else if (room.roomAccess === "open") {
         pushInbox(st, uid, {
           type: "room_join_approved",
           hostUserId: hostId,
@@ -233,37 +324,61 @@ export default async function handler(req, res) {
           inviteUrl: room.inviteUrl,
         });
       } else {
-        const id = `jr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        st.joinRequests[id] = {
-          id,
-          fromUserId: uid,
-          fromDisplayName: st.profiles[uid].displayName,
-          hostUserId: hostId,
-          roomCode: room.roomCode,
-          createdAtMs: Date.now(),
-        };
-        notice = { level: "info", message: "Solicitud enviada al host para unirte a la sala." };
+        const duplicate = Object.values(st.joinRequests || {}).find(
+          (r) => r.fromUserId === uid && (r.toUserId || r.hostUserId) === hostId,
+        );
+        if (duplicate) {
+          notice = { level: "info", message: "Ya enviaste una solicitud para unirte a esta sala." };
+        } else {
+          const id = `jr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const jrPublic = {
+            id,
+            fromUserId: uid,
+            fromDisplayName: st.profiles[uid].displayName,
+            fromGoogleAccountName: st.profiles[uid].googleAccountName || "",
+            toUserId: hostId,
+            roomCode: room.roomCode,
+            createdAt: new Date().toISOString(),
+          };
+          st.joinRequests[id] = {
+            ...jrPublic,
+            createdAtMs: Date.now(),
+          };
+          pushInbox(st, hostId, { type: "room_join_request_received", request: jrPublic });
+          pushInbox(st, hostId, {
+            type: "notice",
+            level: "info",
+            message: `${st.profiles[uid].displayName} pide unirse a tu sala ${room.roomCode}.`,
+          });
+          notice = {
+            level: "ok",
+            message: `Solicitud enviada a ${st.profiles[hostId]?.displayName || hostId}. Esperando aprobación...`,
+          };
+        }
       }
-    } else if (action === "room_join_response") {
+    } else if (action === "room_join_respond" || action === "room_join_response") {
       const jr = st.joinRequests[msg.requestId];
-      if (jr && jr.hostUserId === uid) {
+      const targetHost = jr ? (jr.toUserId || jr.hostUserId) : "";
+      if (jr && targetHost === uid) {
         delete st.joinRequests[jr.id];
-        if (msg.approved) {
-          const inviteUrl = String(msg.inviteUrl || st.rooms[uid]?.inviteUrl || "").trim();
+        const accept = msg.accept !== undefined ? Boolean(msg.accept) : Boolean(msg.approved);
+        const inviteUrl = String(msg.inviteUrl || st.rooms[uid]?.inviteUrl || "").trim();
+        if (accept && inviteUrl) {
           pushInbox(st, jr.fromUserId, {
             type: "room_join_approved",
             hostUserId: uid,
             hostDisplayName: st.profiles[uid].displayName,
-            roomCode: jr.roomCode,
+            roomCode: st.rooms[uid]?.roomCode || jr.roomCode,
             inviteUrl,
           });
+          notice = { level: "ok", message: `Aceptaste a ${jr.fromDisplayName || jr.fromUserId} en la sala.` };
         } else {
           pushInbox(st, jr.fromUserId, {
-            type: "room_join_rejected",
-            hostUserId: uid,
-            hostDisplayName: st.profiles[uid].displayName,
-            roomCode: jr.roomCode,
+            type: "notice",
+            level: "error",
+            message: `${st.profiles[uid].displayName} rechazó tu solicitud para unirte a la sala.`,
           });
+          notice = { level: "info", message: "Solicitud de ingreso rechazada." };
         }
       }
     }
