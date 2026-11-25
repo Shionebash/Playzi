@@ -442,13 +442,14 @@ impl SocialManager {
     }
 
     pub async fn publish_room_presence(&self, room: Option<PublishedRoomInfo>) {
+        let cleared = room.is_none();
         let outbound = {
             let mut rt = self.inner.runtime.write().await;
             if rt.published_room == room {
                 return;
             }
             rt.published_room = room.clone();
-            if room.is_none() {
+            if cleared {
                 rt.incoming_join_requests.clear();
             }
             rt.outbound_tx.clone()
@@ -458,6 +459,80 @@ impl SocialManager {
                 "type": "room_presence_update",
                 "room": room,
             }));
+        }
+        if cleared {
+            self.emit_snapshot().await;
+        }
+    }
+
+    pub async fn force_clear_room_presence(&self) {
+        let outbound = {
+            let mut rt = self.inner.runtime.write().await;
+            rt.published_room = None;
+            rt.incoming_join_requests.clear();
+            rt.outbound_tx.clone()
+        };
+        if let Some(tx) = outbound {
+            let _ = tx.send(json!({
+                "type": "room_presence_update",
+                "room": Value::Null,
+            }));
+        }
+        self.emit_snapshot().await;
+    }
+
+    pub async fn request_sync(&self) {
+        let outbound = {
+            let rt = self.inner.runtime.read().await;
+            rt.outbound_tx.clone()
+        };
+        if let Some(tx) = outbound {
+            let _ = tx.send(json!({ "type": "sync" }));
+        }
+    }
+
+    pub async fn shutdown_notify(&self) {
+        let outbound = {
+            let mut rt = self.inner.runtime.write().await;
+            rt.published_room = None;
+            rt.incoming_join_requests.clear();
+            rt.outbound_tx.clone()
+        };
+
+        let raw_hub = self.inner.config.snapshot().social_hub_url;
+        if let Some(http_base) = normalize_hub_http_base(&raw_hub)
+            && let Ok(profile) = ensure_user_profile(&self.inner.state_store)
+        {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(1800))
+                .build()
+                .unwrap_or_default();
+            if let Some(detected) = detect_http_hub(&client, &raw_hub).await {
+                let endpoint = format!("{detected}/api/social");
+                let _ = client
+                    .post(&endpoint)
+                    .json(&json!({
+                        "userId": profile.user_id,
+                        "displayName": profile.display_name,
+                        "googleAccountName": profile.google_account_name,
+                        "action": "disconnect",
+                    }))
+                    .send()
+                    .await;
+                return;
+            }
+            let _ = http_base;
+        }
+
+        if let Some(tx) = outbound {
+            let _ = tx.send(json!({
+                "type": "room_presence_update",
+                "room": Value::Null,
+            }));
+            let _ = tx.send(json!({
+                "type": "client_disconnect",
+            }));
+            tokio::time::sleep(Duration::from_millis(180)).await;
         }
     }
 
@@ -600,12 +675,10 @@ impl SocialManager {
                             } else {
                                 manager.emit_snapshot().await;
                             }
-                            if let Some(room) = published_room {
-                                let _ = outbound_tx.send(json!({
-                                    "type": "room_presence_update",
-                                    "room": room,
-                                }));
-                            }
+                            let _ = outbound_tx.send(json!({
+                                "type": "room_presence_update",
+                                "room": published_room,
+                            }));
                         }
                         Ok(resp) => {
                             {
@@ -678,6 +751,10 @@ impl SocialManager {
                                 }
                             }
                             _ = poll_interval.tick() => {
+                                let current_room = {
+                                    let rt = manager.inner.runtime.read().await;
+                                    rt.published_room.clone()
+                                };
                                 let resp = http_client
                                     .post(&social_endpoint)
                                     .json(&json!({
@@ -685,6 +762,8 @@ impl SocialManager {
                                         "displayName": profile.display_name,
                                         "googleAccountName": profile.google_account_name,
                                         "action": "sync",
+                                        "hasRoomState": true,
+                                        "room": current_room,
                                     }))
                                     .send()
                                     .await;
@@ -800,12 +879,10 @@ impl SocialManager {
                 };
                 manager.emit_snapshot().await;
 
-                if let Some(room) = published_room {
-                    let _ = outbound_tx.send(json!({
-                        "type": "room_presence_update",
-                        "room": room,
-                    }));
-                }
+                let _ = outbound_tx.send(json!({
+                    "type": "room_presence_update",
+                    "room": published_room,
+                }));
 
                 let writer = tokio::spawn(async move {
                     while let Some(val) = outbound_rx.recv().await {

@@ -418,6 +418,7 @@ impl YtMusicClient {
                     live: false,
                     members_only: false,
                     result_type: Some(if is_mix { "mix".into() } else { "playlist".into() }),
+                    watched_percent: None,
                 });
             }
         }
@@ -826,6 +827,7 @@ pub fn parse_music_next_items(data: &Value, limit: usize) -> Vec<MediaItem> {
             live: false,
             members_only: false,
             result_type: Some("song".into()),
+            watched_percent: None,
         });
         if items.len() >= limit.max(1) {
             break;
@@ -881,6 +883,7 @@ pub fn parse_music_items(data: &Value, limit: usize) -> Vec<MediaItem> {
             live: false,
             members_only: false,
             result_type: Some("song".into()),
+            watched_percent: None,
         });
 
         if items.len() >= limit {

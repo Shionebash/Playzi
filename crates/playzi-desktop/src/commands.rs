@@ -395,6 +395,7 @@ pub async fn dispatch_api_request(
                         live: false,
                         members_only: false,
                         result_type: Some("album".into()),
+                        watched_percent: None,
                     });
                 }
                 let followed_id = runtime
@@ -628,6 +629,7 @@ pub async fn dispatch_api_request(
                 .get("currentTime")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
+            let start_time = body.get("startTime").and_then(Value::as_f64);
             let duration = body.get("duration").and_then(Value::as_f64);
             let cpn = body.get("cpn").and_then(Value::as_str).unwrap_or("");
             let cfg = runtime.config.snapshot();
@@ -648,6 +650,7 @@ pub async fn dispatch_api_request(
                     video_ref,
                     event_type,
                     current_time,
+                    start_time,
                     duration,
                     cpn,
                     jar.as_ref(),
@@ -935,6 +938,24 @@ pub async fn dispatch_api_request(
                 .start_host(req)
                 .await
                 .map_err(|e| e.to_string())?;
+            let current_title = snap
+                .playback
+                .current_index
+                .and_then(|idx| snap.queue.get(idx))
+                .map(|q| q.title.clone())
+                .unwrap_or_default();
+            let room_info = playzi_core::social::PublishedRoomInfo {
+                room_code: snap.room_code.clone(),
+                invite_url: if !snap.public_ws_url.is_empty() {
+                    snap.public_ws_url.clone()
+                } else {
+                    snap.invite_url.clone()
+                },
+                room_access: snap.room_access.clone(),
+                participants_count: snap.participants.len(),
+                current_title,
+            };
+            runtime.social.publish_room_presence(Some(room_info)).await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         ("POST", "/api/party/tunnel") => {
@@ -966,10 +987,12 @@ pub async fn dispatch_api_request(
                 .join_session(req)
                 .await
                 .map_err(|e| e.to_string())?;
+            runtime.social.force_clear_room_presence().await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         ("POST", "/api/party/leave") => {
             let snap = runtime.party.leave_or_stop().await;
+            runtime.social.force_clear_room_presence().await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         ("POST", "/api/party/queue/add") => {
@@ -1056,6 +1079,11 @@ pub async fn dispatch_api_request(
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
         ("GET", "/api/social/status") => {
+            let snap = runtime.social.status().await;
+            serde_json::to_value(snap).map_err(|e| e.to_string())
+        }
+        ("POST", "/api/social/sync") => {
+            runtime.social.request_sync().await;
             let snap = runtime.social.status().await;
             serde_json::to_value(snap).map_err(|e| e.to_string())
         }
@@ -1153,13 +1181,26 @@ pub async fn dispatch_api_request(
             let request_id = body.get("requestId").and_then(Value::as_str).unwrap_or("");
             let accept = body.get("accept").and_then(Value::as_bool).unwrap_or(false);
             let party_snap = runtime.party.status().await;
-            let invite_url = if !party_snap.public_ws_url.is_empty() {
+            let is_active_host =
+                party_snap.active && party_snap.role == playzi_core::party::PartyRole::Host;
+            let invite_url = if !is_active_host {
+                None
+            } else if !party_snap.public_ws_url.is_empty() {
                 Some(party_snap.public_ws_url.as_str())
             } else if !party_snap.invite_url.is_empty() {
                 Some(party_snap.invite_url.as_str())
             } else {
                 None
             };
+            if accept && (!is_active_host || invite_url.is_none()) {
+                let _ = runtime
+                    .social
+                    .respond_join_request(request_id, false, None)
+                    .await;
+                return Err(
+                    "No tienes una sesión activa para aceptar esta solicitud.".to_string(),
+                );
+            }
             let snap = runtime
                 .social
                 .respond_join_request(request_id, accept, invite_url)

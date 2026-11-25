@@ -41,6 +41,9 @@ const state = {
     _loadingId: 0,
     audioTracks: null,
     audioLang: null,
+    availableQualities: null,
+    activeQuality: null,
+    currentHeight: null,
     native: null,
     capabilities: null,
   },
@@ -48,6 +51,7 @@ const state = {
   updateStatus: null,
   theme: localStorage.getItem("playzi-theme") || "dark",
   sidebarCollapsed: localStorage.getItem("playzi-sidebar-collapsed") === "1",
+  watchSidebarCollapsed: { users: false, queue: false, related: false },
   channelView: { url: "", name: "", tab: "videos", items: [], page: 1, hasMore: false, loading: false, meta: null, error: "" },
   artistView: { channelId: "", name: "", data: null, loading: false, error: "" },
   userProfile: { userId: "", displayName: "", googleAccountName: "" },
@@ -302,6 +306,10 @@ function _destroyPlayer() {
     state.player.vjs.dispose();
     state.player.vjs = null;
   }
+  if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+    state.player.audioVjs.dispose();
+    state.player.audioVjs = null;
+  }
   state.player.current = null;
   state.player.queue = [];
   state.player._originalQueue = [];
@@ -352,7 +360,12 @@ function setView(view) {
   $(`#view-${view}`).classList.remove("hidden");
   $$(".nav-item[data-view]").forEach((el) => el.classList.toggle("active", el.dataset.view === view));
   render();
+  _ensurePartyViewPolling();
+  if (view === "party") {
+    _syncPartyViewNow();
+  }
   if (view === "music") _autoTriggerMusicSync();
+  if (view === "recom" || view === "music") _enrichMusicRecomDurationsIfNeeded();
 }
 
 function applySidebarState() {
@@ -372,6 +385,34 @@ function toggleSidebar() {
 
 const MOON_SVG = `<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
 const SUN_SVG  = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`;
+
+// Modern mixed player icon set (filled rounded primary + crisp 2px stroke secondary)
+const PLAYER_ICONS = {
+  play: (s = 20) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7.5 4.86c0-.88.96-1.42 1.71-.96l11.2 6.86a1.12 1.12 0 0 1 0 1.92l-11.2 6.86c-.75.46-1.71-.08-1.71-.96V4.86Z"/></svg>`,
+  pause: (s = 20) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5.5" y="4.5" width="4.8" height="15" rx="1.6"/><rect x="13.7" y="4.5" width="4.8" height="15" rx="1.6"/></svg>`,
+  stop: (s = 15) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg>`,
+  prev: (s = 20) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4.5" y="5" width="2.6" height="14" rx="1.2"/><path d="M18.3 5.4c.74-.45 1.7.09 1.7.96v11.28c0 .87-.96 1.41-1.7.96l-8.95-5.64a1.12 1.12 0 0 1 0-1.92L18.3 5.4Z"/></svg>`,
+  next: (s = 20) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5.7 5.4c-.74-.45-1.7.09-1.7.96v11.28c0 .87.96 1.41 1.7.96l8.95-5.64a1.12 1.12 0 0 0 0-1.92L5.7 5.4Z"/><rect x="16.9" y="5" width="2.6" height="14" rx="1.2"/></svg>`,
+  shuffle: (s = 17) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>`,
+  repeat: (s = 17) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>`,
+  repeatOne: (s = 17) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/></svg>`,
+  volHigh: (s = 18) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.2a9.5 9.5 0 0 1 0 13.6"/></svg>`,
+  volLow: (s = 18) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>`,
+  volMute: (s = 18) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" fill="currentColor" stroke="none"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>`,
+  expand: (s = 16) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>`,
+  close: (s = 16) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
+  download: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>`,
+  headphones: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 14v-3a9 9 0 0 1 18 0v3"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3Z"/><path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3Z"/></svg>`,
+  external: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>`,
+  back: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>`,
+  musicNote: (s = 56) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3" fill="currentColor"/><circle cx="18" cy="16" r="3" fill="currentColor"/></svg>`,
+};
+
+function _volIconSvg(vol, muted = false, size = 18) {
+  if (muted || vol <= 0) return PLAYER_ICONS.volMute(size);
+  if (vol < 0.5) return PLAYER_ICONS.volLow(size);
+  return PLAYER_ICONS.volHigh(size);
+}
 
 function updateThemeBtn() {
   const el = $("#themeIcon");
@@ -436,6 +477,38 @@ function applyBootstrap(data) {
   state.friends = data.friends || state.friends;
   _lastSeenSyncSuccess = state.syncStatus.lastSuccess || _lastSeenSyncSuccess;
   applyShortsVisibility();
+  _enrichMusicRecomDurationsIfNeeded();
+}
+
+let _enrichingMusicDurations = false;
+let _lastMusicDurationEnrichAt = 0;
+
+function _hasMissingMusicRecomDurations() {
+  return (state.musicRecommendations || []).some((item) => (
+    !_isRecommendedMix(item)
+    && Boolean(item?.id)
+    && (!item.duration || !item.durationText || item.durationText === "--:--")
+  ));
+}
+
+async function _enrichMusicRecomDurationsIfNeeded() {
+  if (_enrichingMusicDurations || !_hasMissingMusicRecomDurations()) return;
+  const now = Date.now();
+  if (now - _lastMusicDurationEnrichAt < 15000) return;
+  _enrichingMusicDurations = true;
+  _lastMusicDurationEnrichAt = now;
+  try {
+    const res = await api.get("/api/music/recommendations");
+    if (Array.isArray(res?.items) && res.items.length) {
+      state.musicRecommendations = res.items;
+      if (res.lastSync) state.musicRecomLastSync = res.lastSync;
+      if (["recom", "music", "home"].includes(state.view)) render();
+    }
+  } catch (_) {
+    // Non-blocking background enrichment
+  } finally {
+    _enrichingMusicDurations = false;
+  }
 }
 
 async function refreshLists() {
@@ -807,7 +880,7 @@ function renderRecom() {
   const videosAll = _uniqueByUrl([
     ...state.recommendations.filter((item) => !_isRecommendedMix(item) && !_isShort(item)),
     ...state.feed.filter((item) => !_isShort(item)),
-  ]);
+  ]).filter((item) => !_isWatchedVideo(item));
   const mixesAll = _uniqueByUrl([
     ...state.recommendations.filter(_isRecommendedMix),
     ...state.musicRecommendations.filter(_isRecommendedMix),
@@ -1788,6 +1861,35 @@ function renderConfig() {
 
 // ── Watch view ────────────────────────────────────────────────────────────────
 
+function _watchSidebarHtml() {
+  const c = state.watchSidebarCollapsed || {};
+  const partyActive = Boolean(state.party?.active);
+  return `
+      <div class="watch-sidebar">
+        <div class="watch-sidebar-section watch-sidebar-section--users${c.users ? " is-collapsed" : ""}" id="watch-users-section"${partyActive ? "" : ' style="display:none"'}>
+          <button class="watch-queue-hdr" type="button" data-watch-section-toggle="users" aria-expanded="${c.users ? "false" : "true"}">
+            <span id="watch-users-hdr">Usuarios</span>
+            <span class="watch-section-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="watch-users" class="watch-queue-list watch-users-list"></div>
+        </div>
+        <div class="watch-sidebar-section watch-sidebar-section--queue${c.queue ? " is-collapsed" : ""}" id="watch-queue-section">
+          <button class="watch-queue-hdr" type="button" data-watch-section-toggle="queue" aria-expanded="${c.queue ? "false" : "true"}">
+            <span id="watch-queue-hdr">Cola</span>
+            <span class="watch-section-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="watch-queue" class="watch-queue-list"></div>
+        </div>
+        <div class="watch-sidebar-section watch-sidebar-section--related${c.related ? " is-collapsed" : ""}" id="watch-related-section">
+          <button class="watch-queue-hdr" type="button" data-watch-section-toggle="related" aria-expanded="${c.related ? "false" : "true"}">
+            <span id="watch-related-hdr">Relacionados</span>
+            <span class="watch-section-chevron" aria-hidden="true">▾</span>
+          </button>
+          <div id="watch-related" class="watch-queue-list"></div>
+        </div>
+      </div>`;
+}
+
 function _videoLayoutHtml() {
   return `
     <div id="watch-party-bar"></div>
@@ -1801,16 +1903,7 @@ function _videoLayoutHtml() {
         </div>
         <div id="watch-info"></div>
       </div>
-      <div class="watch-sidebar">
-        <div class="watch-sidebar-section">
-          <div id="watch-queue-hdr" class="watch-queue-hdr">Cola</div>
-          <div id="watch-queue" class="watch-queue-list"></div>
-        </div>
-        <div class="watch-sidebar-section">
-          <div class="watch-queue-hdr" id="watch-related-hdr">Relacionados</div>
-          <div id="watch-related" class="watch-queue-list"></div>
-        </div>
-      </div>
+      ${_watchSidebarHtml()}
     </div>
   `;
 }
@@ -1824,7 +1917,7 @@ function _musicLayoutHtml() {
           <div class="music-art-wrap">
             <img id="musicArt" class="music-art" src="" alt="" style="display:none"
               onerror="this.style.display='none';var f=document.getElementById('musicArtFallback');if(f)f.style.display=''">
-            <div class="music-art-fallback" id="musicArtFallback">♪</div>
+            <div class="music-art-fallback" id="musicArtFallback">${PLAYER_ICONS.musicNote(58)}</div>
           </div>
           <div id="musicTitle" class="music-title">...</div>
           <div id="musicArtist" class="music-artist"></div>
@@ -1836,40 +1929,31 @@ function _musicLayoutHtml() {
             <span id="musicDuration" class="music-time">0:00</span>
           </div>
           <div class="music-controls">
-            <button class="music-ctrl-sm" id="ctrlShuffle" type="button" title="Aleatorio">⇄</button>
-            <button class="music-btn" id="watchPrev" type="button" title="Anterior">⏮</button>
-            <button class="music-btn music-btn--play" id="musicPlayPause" type="button" title="Play/Pausa">▶</button>
-            <button class="music-btn" id="watchNext" type="button" title="Siguiente">⏭</button>
-            <button class="music-ctrl-sm" id="ctrlRepeat" type="button" title="Repetir">↻</button>
+            <button class="music-ctrl-sm ${state.player.shuffle ? "btn-player-ctrl-on" : ""}" id="ctrlShuffle" type="button" title="${state.player.shuffle ? "Aleatorio: activo" : "Aleatorio"}">${PLAYER_ICONS.shuffle(18)}</button>
+            <button class="music-btn" id="watchPrev" type="button" title="Anterior">${PLAYER_ICONS.prev(21)}</button>
+            <button class="music-btn music-btn--play" id="musicPlayPause" type="button" title="Play/Pausa">${PLAYER_ICONS.play(23)}</button>
+            <button class="music-btn" id="watchNext" type="button" title="Siguiente">${PLAYER_ICONS.next(21)}</button>
+            <button class="music-ctrl-sm ${state.player.repeat !== "none" ? "btn-player-ctrl-on" : ""}" id="ctrlRepeat" type="button" title="${state.player.repeat === "none" ? "Repetir" : state.player.repeat === "one" ? "Repetir: una" : "Repetir: todas"}">${state.player.repeat === "one" ? PLAYER_ICONS.repeatOne(18) : PLAYER_ICONS.repeat(18)}</button>
           </div>
           <div class="music-extra-ctrl">
-            <button class="btn btn-ghost btn-player-ctrl" type="button" id="ctrlAutoplay" title="Autoplay">∞</button>
+            <button class="btn btn-ghost btn-player-ctrl btn-player-ctrl--label ${state.player.autoplay ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlAutoplay" aria-pressed="${state.player.autoplay ? "true" : "false"}" title="${state.player.autoplay ? "Autoplay: activo" : "Autoplay: inactivo"}">Autoplay</button>
           </div>
           <div class="music-volume">
-            <span class="music-vol-icon" id="musicVolIcon">🔊</span>
-            <input type="range" id="musicVolume" class="volume-slider" min="0" max="1" step="0.05" value="1">
+            <button type="button" class="music-vol-icon" id="musicVolIcon" title="Silenciar">${PLAYER_ICONS.volHigh(18)}</button>
+            <input type="range" id="musicVolume" class="volume-slider" min="0" max="1" step="0.01" value="1">
           </div>
           <div class="music-actions">
             <span id="musicFollow"></span>
-            <button class="btn btn-ghost" type="button" data-watch-download="audio">Descargar</button>
-            <button class="btn btn-ghost" type="button" id="toggleAudioOnly">Solo audio</button>
-            <button class="btn btn-ghost" type="button" id="playerExternal">Abrir externo</button>
-            <button class="btn btn-ghost" type="button" id="watchBack">← Volver</button>
+            <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="audio">${PLAYER_ICONS.download(14)}<span>Descargar</span></button>
+            <button class="btn btn-ghost btn-with-ico" type="button" id="toggleAudioOnly">${PLAYER_ICONS.headphones(14)}<span>Solo audio</span></button>
+            <button class="btn btn-ghost btn-with-ico" type="button" id="playerExternal">${PLAYER_ICONS.external(14)}<span>Abrir externo</span></button>
+            <button class="btn btn-ghost btn-with-ico" type="button" id="watchBack">${PLAYER_ICONS.back(14)}<span>Volver</span></button>
           </div>
           <div id="musicStatus" class="player-status" style="display:none"></div>
           <audio id="webPlayerAudio" autoplay></audio>
         </div>
       </div>
-      <div class="watch-sidebar">
-        <div class="watch-sidebar-section">
-          <div id="watch-queue-hdr" class="watch-queue-hdr">Cola</div>
-          <div id="watch-queue" class="watch-queue-list"></div>
-        </div>
-        <div class="watch-sidebar-section">
-          <div class="watch-queue-hdr" id="watch-related-hdr">Relacionados</div>
-          <div id="watch-related" class="watch-queue-list"></div>
-        </div>
-      </div>
+      ${_watchSidebarHtml()}
     </div>
   `;
 }
@@ -1879,8 +1963,8 @@ function renderWatch() {
   const isMusicCtx = state.player.sourceContext === "music";
   const useMusicLayout = isMusicCtx || state.player.audioOnly;
   const hasCorrectLayout = useMusicLayout
-    ? !!root.querySelector(".watch-layout--music")
-    : !!root.querySelector(".watch-layout--video");
+    ? Boolean(root.querySelector(".watch-layout--music") && _getAudioEl())
+    : Boolean(root.querySelector(".watch-layout--video") && document.getElementById("webPlayerVideo"));
 
   if (!hasCorrectLayout) {
     // Abort any existing listeners before rebuilding DOM
@@ -1910,6 +1994,8 @@ function renderWatch() {
   }
 
   _updateWatchMeta();
+  _updatePlayerControls();
+  _updateWatchUsers();
   _updateWatchQueue();
   _updateWatchRelated();
   _updateWatchPartyBar();
@@ -1971,15 +2057,15 @@ function _updateVideoMeta(error = "") {
     <div class="watch-title">${escapeHtml(title)}</div>
     <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}${isMembers ? ` <span class="tag tag-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}</div>
     <div class="watch-actions">
-      <button class="btn btn-ghost" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>⏮ Anterior</button>
-      <button class="btn btn-ghost" type="button" id="watchNext" ${hasNext ? "" : "disabled"}>Siguiente ⏭</button>
+      <button class="btn btn-ghost btn-with-ico" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>${PLAYER_ICONS.prev(15)}<span>Anterior</span></button>
+      <button class="btn btn-ghost btn-with-ico" type="button" id="watchNext" ${hasNext ? "" : "disabled"}><span>Siguiente</span>${PLAYER_ICONS.next(15)}</button>
       ${_followButtonHtml(channelUrl, channel)}
       ${_playerCtrlsHtml()}
-      <button class="btn btn-ghost" type="button" data-watch-download="video">Descargar</button>
-      <button class="btn btn-ghost" type="button" data-watch-download="audio">Audio</button>
-      <button class="btn btn-ghost" type="button" id="toggleAudioOnly">Solo audio</button>
-      <button class="btn btn-ghost" type="button" id="playerExternal">Abrir externo</button>
-      <button class="btn btn-ghost" type="button" id="watchBack">← Volver</button>
+      <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="video">${PLAYER_ICONS.download(14)}<span>Descargar</span></button>
+      <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="audio">${PLAYER_ICONS.headphones(14)}<span>Audio</span></button>
+      <button class="btn btn-ghost btn-with-ico" type="button" id="toggleAudioOnly">${PLAYER_ICONS.headphones(14)}<span>Solo audio</span></button>
+      <button class="btn btn-ghost btn-with-ico" type="button" id="playerExternal">${PLAYER_ICONS.external(14)}<span>Abrir externo</span></button>
+      <button class="btn btn-ghost btn-with-ico" type="button" id="watchBack">${PLAYER_ICONS.back(14)}<span>Volver</span></button>
     </div>
     ${_nativePlayerBarHtml()}
     ${state.player.loading ? `<div class="player-status">Cargando...</div>` : ""}
@@ -1992,21 +2078,21 @@ function _nativePlayerBarHtml() {
   if (!IS_TAURI || !state.player.native?.active) return "";
   const st = state.player.native;
   const isMpv = (st.backend || "mpv") === "mpv";
-  const pauseLabel = st.paused ? "▶ Reanudar" : "⏸ Pausar";
-  const muteLabel = st.muted ? "🔇 Con sonido" : "🔊 Silenciar";
+  const pauseLabel = st.paused ? `${PLAYER_ICONS.play(14)}<span>Reanudar</span>` : `${PLAYER_ICONS.pause(14)}<span>Pausar</span>`;
+  const muteLabel = st.muted ? `${PLAYER_ICONS.volMute(15)}<span>Con sonido</span>` : `${PLAYER_ICONS.volHigh(15)}<span>Silenciar</span>`;
   const ipcBtns = isMpv
     ? `
-      <button class="btn btn-ghost" type="button" data-native-ctrl="toggle">${pauseLabel}</button>
+      <button class="btn btn-ghost btn-with-ico" type="button" data-native-ctrl="toggle">${pauseLabel}</button>
       <button class="btn btn-ghost" type="button" data-native-ctrl="seek-back">-10s</button>
       <button class="btn btn-ghost" type="button" data-native-ctrl="seek-fwd">+10s</button>
-      <button class="btn btn-ghost" type="button" data-native-ctrl="mute">${muteLabel}</button>
+      <button class="btn btn-ghost btn-with-ico" type="button" data-native-ctrl="mute">${muteLabel}</button>
     `
     : "";
   return `
     <div class="watch-actions" style="margin-top:8px;padding:8px 10px;border-radius:10px;background:var(--surface-2,rgba(255,255,255,0.04))">
       <span class="badge">${escapeHtml(st.backend || "mpv")} · ${escapeHtml(st.hwdec || "auto-safe")}</span>
       ${ipcBtns}
-      <button class="btn btn-ghost" type="button" data-native-ctrl="stop">⏹ Detener</button>
+      <button class="btn btn-ghost btn-with-ico" type="button" data-native-ctrl="stop">${PLAYER_ICONS.stop(13)}<span>Detener</span></button>
     </div>
   `;
 }
@@ -2094,22 +2180,121 @@ function _updateMusicMeta(error = "") {
   }
 }
 
+const _VOL_KEY = "playzi-volume";
+const _MUTE_KEY = "playzi-muted";
+let _suppressVolumeSaveUntil = 0;
+
+function _markProgrammaticVolumeApply(ms = 150) {
+  _suppressVolumeSaveUntil = Math.max(_suppressVolumeSaveUntil, performance.now() + ms);
+}
+
+function _clampVolume(v, fallback = 1) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
+
+// Perceptual quadratic curve for the music slider so low positions
+// match human logarithmic hearing instead of sounding disproportionately loud.
+function _sliderToLinearVolume(sliderVal) {
+  const s = _clampVolume(sliderVal, 1);
+  return Math.round(s * s * 10000) / 10000;
+}
+
+function _linearToSliderVolume(linearVal) {
+  const g = _clampVolume(linearVal, 1);
+  return Math.round(Math.sqrt(g) * 100) / 100;
+}
+
+function _getSavedVolumeState() {
+  const rawVol = localStorage.getItem(_VOL_KEY);
+  const volume = rawVol !== null ? _clampVolume(parseFloat(rawVol), 1) : 1;
+  const rawMuted = localStorage.getItem(_MUTE_KEY);
+  const muted = rawMuted === "1" || (rawMuted === null && volume === 0);
+  return { volume, muted };
+}
+
+function _saveVolumeState(volume, muted) {
+  const v = _clampVolume(volume, 1);
+  const m = Boolean(muted);
+  if (!m && v > 0) {
+    localStorage.setItem(_VOL_KEY, String(v));
+  } else if (localStorage.getItem(_VOL_KEY) === null) {
+    localStorage.setItem(_VOL_KEY, String(v > 0 ? v : 0.5));
+  }
+  localStorage.setItem(_MUTE_KEY, (m || v === 0) ? "1" : "0");
+}
+
+function _syncMusicVolumeUi(volume, muted) {
+  const sliderVal = muted ? 0 : _linearToSliderVolume(volume);
+  const volSlider = $("#musicVolume");
+  const volIcon = $("#musicVolIcon");
+  if (volSlider) {
+    volSlider.value = String(sliderVal);
+    volSlider.title = `Volumen: ${Math.round(sliderVal * 100)}%`;
+  }
+  if (volIcon) {
+    volIcon.innerHTML = _volIconSvg(sliderVal, muted || volume === 0, 18);
+    volIcon.title = (muted || volume === 0) ? "Activar sonido" : "Silenciar";
+  }
+}
+
+function _applySavedVolumeToMusic() {
+  const { volume, muted } = _getSavedVolumeState();
+  const effectiveVol = muted ? 0 : volume;
+  _markProgrammaticVolumeApply();
+  if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+    state.player.audioVjs.muted(muted);
+    state.player.audioVjs.volume(effectiveVol);
+  }
+  const audio = _getAudioEl();
+  if (audio) {
+    audio.muted = muted;
+    audio.volume = effectiveVol;
+  }
+  _syncMusicVolumeUi(volume, muted);
+}
+
+function _applySavedVolumeToVideo(player, videoEl = null) {
+  const { volume, muted } = _getSavedVolumeState();
+  _markProgrammaticVolumeApply();
+  if (videoEl) {
+    videoEl.muted = muted;
+    videoEl.volume = volume;
+  }
+  if (player && !player.isDisposed()) {
+    player.muted(muted);
+    player.volume(volume);
+  }
+}
+
 function _setupMusicListeners(sig) {
   const audio = $("#webPlayerAudio");
   if (!audio) return;
 
-  // Restore saved volume
-  const savedVol = localStorage.getItem("playzi-volume");
-  if (savedVol !== null) audio.volume = parseFloat(savedVol);
+  _applySavedVolumeToMusic();
 
   const volSlider = $("#musicVolume");
+  const volIcon = $("#musicVolIcon");
+
   if (volSlider) {
-    volSlider.value = audio.volume;
     volSlider.addEventListener("input", () => {
-      audio.volume = parseFloat(volSlider.value);
-      localStorage.setItem("playzi-volume", volSlider.value);
-      const icon = $("#musicVolIcon");
-      if (icon) icon.textContent = parseFloat(volSlider.value) === 0 ? "🔇" : "🔊";
+      const s = _clampVolume(parseFloat(volSlider.value), 0);
+      const linear = _sliderToLinearVolume(s);
+      _saveVolumeState(linear, s === 0);
+      _applySavedVolumeToMusic();
+    }, sig);
+  }
+  if (volIcon) {
+    volIcon.addEventListener("click", () => {
+      const { volume, muted } = _getSavedVolumeState();
+      if (muted || volume === 0) {
+        const restoreVol = volume > 0 ? volume : _sliderToLinearVolume(0.7);
+        _saveVolumeState(restoreVol, false);
+      } else {
+        _saveVolumeState(volume, true);
+      }
+      _applySavedVolumeToMusic();
     }, sig);
   }
 
@@ -2121,21 +2306,26 @@ function _setupMusicListeners(sig) {
     _maybePrefetchNextItem(audio.currentTime);
   }, sig);
 
+  audio.addEventListener("loadstart", () => {
+    _applySavedVolumeToMusic();
+  }, sig);
+
   audio.addEventListener("loadedmetadata", () => {
+    _applySavedVolumeToMusic();
     const dur = $("#musicDuration");
     if (dur) dur.textContent = _formatTime(audio.duration);
   }, sig);
 
   audio.addEventListener("play", () => {
     const btn = $("#musicPlayPause");
-    if (btn) btn.textContent = "⏸";
+    if (btn) btn.innerHTML = PLAYER_ICONS.pause(23);
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
     _onLocalMediaEvent("play");
   }, sig);
 
   audio.addEventListener("pause", () => {
     const btn = $("#musicPlayPause");
-    if (btn) btn.textContent = "▶";
+    if (btn) btn.innerHTML = PLAYER_ICONS.play(23);
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
     _onLocalMediaEvent("pause");
   }, sig);
@@ -2230,6 +2420,75 @@ function _updateWatchQueue() {
   if (activeEl) activeEl.scrollIntoView({ block: "nearest" });
 }
 
+function _updateWatchUsers() {
+  const section = $("#watch-users-section");
+  const el = $("#watch-users");
+  const hdr = $("#watch-users-hdr");
+  if (!section || !el) return;
+  const p = state.party;
+  if (!p?.active) {
+    section.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  section.style.display = "";
+  const participants = p.participants || [];
+  const prof = state.userProfile || {};
+  if (hdr) hdr.textContent = `Usuarios · ${participants.length}`;
+  if (!participants.length) {
+    el.innerHTML = `<div class="watch-users-empty">Sin usuarios conectados</div>`;
+    return;
+  }
+  el.innerHTML = participants.map((part) => {
+    const displayName = part.displayName || part.userId || "Usuario";
+    const initial = displayName.trim().charAt(0).toUpperCase() || "?";
+    const isSelf = part.userId === prof.userId || part.userId === p.selfUserId;
+    let roleMeta = "";
+    if (part.isHost) {
+      roleMeta = "Control total";
+    } else {
+      const perms = [];
+      if (part.canQueue) perms.push("Cola");
+      if (part.canPlayPause) perms.push("Play/Pausa");
+      if (part.canSeek) perms.push("Buscar");
+      if (part.canRemoveQueue) perms.push("Quitar");
+      roleMeta = perms.length ? perms.join(" · ") : "Solo ver";
+    }
+    const tooltip = part.googleAccountName
+      ? `${displayName} (Google: ${part.googleAccountName} · ${part.userId || ""})`
+      : `${displayName}${part.userId ? ` (${part.userId})` : ""}`;
+    return `
+      <div class="watch-user-item" title="${escapeHtml(tooltip)}">
+        <div class="watch-user-avatar${part.isHost ? " is-host" : ""}">
+          <span>${escapeHtml(initial)}</span>
+          <span class="watch-user-dot" aria-hidden="true"></span>
+        </div>
+        <div class="watch-user-info">
+          <div class="watch-user-name-row">
+            <span class="watch-user-name">${escapeHtml(displayName)}</span>
+            ${part.isHost ? `<span class="watch-user-badge watch-user-badge--host">Host</span>` : ""}
+            ${isSelf ? `<span class="watch-user-badge">Tú</span>` : ""}
+          </div>
+          <div class="watch-user-meta">${escapeHtml(roleMeta)}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function _toggleWatchSidebarSection(sectionKey) {
+  if (!state.watchSidebarCollapsed) {
+    state.watchSidebarCollapsed = { users: false, queue: false, related: false };
+  }
+  const next = !state.watchSidebarCollapsed[sectionKey];
+  state.watchSidebarCollapsed[sectionKey] = next;
+  const sec = $(`#watch-${sectionKey}-section`);
+  if (!sec) return;
+  sec.classList.toggle("is-collapsed", next);
+  const btn = sec.querySelector(`[data-watch-section-toggle="${sectionKey}"]`);
+  if (btn) btn.setAttribute("aria-expanded", next ? "false" : "true");
+}
+
 // ── Player logic ──────────────────────────────────────────────────────────────
 
 function _itemToQueueEntry(item) {
@@ -2295,13 +2554,17 @@ function _updatePlayerControls() {
   }
   if (repeatBtn) {
     const repeat = state.player.repeat;
+    const icoSize = repeatBtn.classList.contains("music-ctrl-sm") ? 18 : 16;
     repeatBtn.classList.toggle("btn-player-ctrl-on", repeat !== "none");
-    repeatBtn.textContent = repeat === "one" ? "↻¹" : "↻";
+    repeatBtn.innerHTML = repeat === "one" ? PLAYER_ICONS.repeatOne(icoSize) : PLAYER_ICONS.repeat(icoSize);
     repeatBtn.title = repeat === "none" ? "Repetir" : repeat === "one" ? "Repetir: una" : "Repetir: todas";
   }
   if (autoplayBtn) {
     autoplayBtn.classList.toggle("btn-player-ctrl-on", state.player.autoplay);
-    autoplayBtn.title = state.player.autoplay ? "Autoplay: activo" : "Autoplay";
+    autoplayBtn.setAttribute("aria-pressed", state.player.autoplay ? "true" : "false");
+    autoplayBtn.title = state.player.autoplay
+      ? "Autoplay: activo (añade canciones relacionadas al terminar)"
+      : "Autoplay: inactivo";
   }
 }
 
@@ -2310,9 +2573,9 @@ function _playerCtrlsHtml() {
   const rep = state.player.repeat;
   const ap = state.player.autoplay;
   return `
-    <button class="btn btn-ghost btn-player-ctrl ${sh ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlShuffle" title="${sh ? "Aleatorio: activo" : "Aleatorio"}">⇄</button>
-    <button class="btn btn-ghost btn-player-ctrl ${rep !== "none" ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlRepeat" title="${rep === "none" ? "Repetir" : rep === "one" ? "Repetir: una" : "Repetir: todas"}">${rep === "one" ? "↻¹" : "↻"}</button>
-    <button class="btn btn-ghost btn-player-ctrl ${ap ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlAutoplay" title="${ap ? "Autoplay: activo" : "Autoplay"}">∞</button>
+    <button class="btn btn-ghost btn-player-ctrl ${sh ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlShuffle" title="${sh ? "Aleatorio: activo" : "Aleatorio"}">${PLAYER_ICONS.shuffle(16)}</button>
+    <button class="btn btn-ghost btn-player-ctrl ${rep !== "none" ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlRepeat" title="${rep === "none" ? "Repetir" : rep === "one" ? "Repetir: una" : "Repetir: todas"}">${rep === "one" ? PLAYER_ICONS.repeatOne(16) : PLAYER_ICONS.repeat(16)}</button>
+    <button class="btn btn-ghost btn-player-ctrl btn-player-ctrl--label ${ap ? "btn-player-ctrl-on" : ""}" type="button" id="ctrlAutoplay" aria-pressed="${ap ? "true" : "false"}" title="${ap ? "Autoplay: activo (añade canciones relacionadas al terminar)" : "Autoplay: inactivo"}">Autoplay</button>
   `;
 }
 
@@ -2614,22 +2877,72 @@ function _currentPlaybackPosition() {
   return { currentTime: 0, duration: null, paused: false };
 }
 
-function _stopYtWatchReporting() {
-  if (_ytWatchSession?.timer) {
-    clearInterval(_ytWatchSession.timer);
+const _sessionWatchedIds = new Set();
+
+function _extractYtVideoId(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  const m = s.match(/(?:[?&]v=|youtu\.be\/|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : "";
+}
+
+function _isLocallyWatchedId(vid) {
+  if (!vid) return false;
+  if (_sessionWatchedIds.has(vid)) return true;
+  const hist = state.history || [];
+  for (let i = 0; i < hist.length; i++) {
+    const h = hist[i];
+    if (_extractYtVideoId(h.url || h.target || h.id) === vid) return true;
+  }
+  return false;
+}
+
+function _getWatchedPercent(item) {
+  if (!item) return 0;
+  if (_isRecommendedMix(item) || item.resultType === "artist" || item.resultType === "album") return 0;
+  const ytPct = Number(item.watchedPercent || 0);
+  if (ytPct > 0) return Math.min(100, Math.round(ytPct));
+  const vid = _extractYtVideoId(item.url || item.id);
+  if (_isLocallyWatchedId(vid)) return 100;
+  return 0;
+}
+
+function _isWatchedVideo(item) {
+  return _getWatchedPercent(item) >= 80;
+}
+
+function _stopYtWatchReporting(sendFinalPause = true) {
+  const sess = _ytWatchSession;
+  if (sess?.timer) {
+    clearInterval(sess.timer);
   }
   _ytWatchSession = null;
+  if (sendFinalPause && sess) {
+    const pos = _currentPlaybackPosition();
+    if (pos.currentTime >= 5 && pos.currentTime > sess.lastSentAt + 2) {
+      api.post("/api/youtube/watch-report", {
+        url: sess.url,
+        eventType: "pause",
+        startTime: sess.lastSentAt,
+        currentTime: pos.currentTime,
+        duration: pos.duration || sess.duration,
+        cpn: sess.cpn,
+      }).catch(() => {});
+    }
+  }
 }
 
 function _finishYtWatchReporting() {
   if (!_ytWatchSession) return;
   const sess = _ytWatchSession;
-  _stopYtWatchReporting();
+  _stopYtWatchReporting(false);
   const pos = _currentPlaybackPosition();
   const dur = pos.duration || sess.duration || null;
   api.post("/api/youtube/watch-report", {
     url: sess.url,
     eventType: "ended",
+    startTime: sess.lastSentAt,
     currentTime: Math.max(pos.currentTime || 0, dur || 15),
     duration: dur,
     cpn: sess.cpn,
@@ -2637,9 +2950,11 @@ function _finishYtWatchReporting() {
 }
 
 function _startYtWatchReporting(item) {
-  _stopYtWatchReporting();
+  _stopYtWatchReporting(true);
   const url = String(item?.url || "");
   if (!/(?:youtube\.com|youtu\.be)/i.test(url)) return;
+  const vid = _extractYtVideoId(url);
+  if (vid) _sessionWatchedIds.add(vid);
   const cpn = _randomCpn();
   const sess = {
     url,
@@ -2653,6 +2968,7 @@ function _startYtWatchReporting(item) {
   api.post("/api/youtube/watch-report", {
     url,
     eventType: "start",
+    startTime: 0,
     currentTime: 0.5,
     duration: sess.duration,
     cpn,
@@ -2670,10 +2986,12 @@ function _startYtWatchReporting(item) {
       }
     }
     if (pos.currentTime - sess.lastSentAt < 12) return;
+    const prevSent = sess.lastSentAt;
     sess.lastSentAt = pos.currentTime;
     api.post("/api/youtube/watch-report", {
       url: sess.url,
       eventType: "progress",
+      startTime: prevSent,
       currentTime: pos.currentTime,
       duration: pos.duration || sess.duration,
       cpn: sess.cpn,
@@ -2695,6 +3013,9 @@ async function loadWebPlayerItem(index, opts = {}) {
   _updateWatchMeta();
   _updateWatchQueue();
   _updateWatchRelated();
+  if (state.view !== "watch") {
+    _showMiniPlayer();
+  }
 
   if (opts?.fromPartySync) {
     _partyMediaLoadingLock = true;
@@ -2766,11 +3087,21 @@ async function _loadMusicItem(item, loadId) {
   const proxiedSrc = streamProxyUrl(rawSrc);
   if (IS_TAURI && isHls && window.videojs) {
     if (!state.player.audioVjs || state.player.audioVjs.isDisposed()) {
+      _applySavedVolumeToMusic();
       state.player.audioVjs = videojs("webPlayerAudio", {
         controls: false,
         autoplay: true,
         preload: "auto",
         html5: { vhs: { overrideNative: true } },
+      });
+      state.player.audioVjs.ready(() => {
+        _applySavedVolumeToMusic();
+      });
+      state.player.audioVjs.on("loadstart", () => {
+        _applySavedVolumeToMusic();
+      });
+      state.player.audioVjs.on("loadedmetadata", () => {
+        _applySavedVolumeToMusic();
       });
       state.player.audioVjs.on("error", () => {
         const err = state.player.audioVjs?.error();
@@ -2780,7 +3111,9 @@ async function _loadMusicItem(item, loadId) {
         _maybePrefetchNextItem(state.player.audioVjs?.currentTime() || 0);
       });
     }
+    _applySavedVolumeToMusic();
     state.player.audioVjs.src({ src: proxiedSrc, type: "application/x-mpegURL" });
+    _applySavedVolumeToMusic();
     state.player.audioVjs.play().catch(() => {});
   } else {
     let targetAudio = audio;
@@ -2810,8 +3143,10 @@ async function _loadMusicItem(item, loadId) {
       const code = targetAudio.error?.code;
       _updateWatchMeta(`Error de audio (código ${code || "?"}). Prueba con 'Abrir externo'.`);
     };
+    _applySavedVolumeToMusic();
     targetAudio.src = proxiedSrc;
     targetAudio.load();
+    _applySavedVolumeToMusic();
     targetAudio.play().catch(() => {});
   }
   _updateWatchMeta();
@@ -2870,7 +3205,10 @@ function _prefetchNextItem() {
 async function _loadVideoItem(item, loadId) {
   state.player.audioTracks = null;
   state.player.audioLang = null;
+  state.player.availableQualities = null;
+  state.player.currentHeight = null;
   const rawQuality = state.config?.playbackQuality || "best";
+  state.player.activeQuality = rawQuality;
   const quality = encodeURIComponent(rawQuality);
 
   // Desktop integrated mode: play inside Playzi via Video.js + local playzi-stream:// HLS proxy.
@@ -2879,12 +3217,18 @@ async function _loadVideoItem(item, loadId) {
     const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
     if (state.player._loadingId !== loadId) return;
     state.player.current = { ...item, ...(info.item || {}) };
+    state.player.availableQualities = Array.isArray(info.availableQualities) && info.availableQualities.length
+      ? info.availableQualities
+      : null;
+    state.player.currentHeight = info.video?.height || null;
     state.player.loading = false;
     const rawSrc = info.streamUrl || info.video?.url || "";
     if (rawSrc) {
       await ensureVideoPlayer();
       if (state.player._loadingId !== loadId) return;
       const player = state.player.vjs;
+      const qualityBtn = player.controlBar?.getChild("QualityButton");
+      if (qualityBtn) qualityBtn.update();
       const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
       const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
       const hlsAudioUrl = info.hlsAudio?.url || "";
@@ -2894,7 +3238,9 @@ async function _loadVideoItem(item, loadId) {
       const mimeType = isHls
         ? "application/x-mpegURL"
         : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+      _applySavedVolumeToVideo(player);
       player.src({ src: proxiedSrc, type: mimeType });
+      _applySavedVolumeToVideo(player);
       player.play().catch(() => {});
     } else {
       _updateWatchMeta("No se pudo resolver un stream reproducible. Puedes intentar con 'Abrir externo'.");
@@ -2917,12 +3263,20 @@ async function _loadVideoItem(item, loadId) {
     ? { manifestUrl: item.manifestUrl, item }
     : await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
   if (state.player._loadingId !== loadId) return;
+  state.player.availableQualities = Array.isArray(info.availableQualities) && info.availableQualities.length
+    ? info.availableQualities
+    : null;
+  state.player.currentHeight = info.video?.height || null;
   await ensureVideoPlayer();
   if (state.player._loadingId !== loadId) return;
   const player = state.player.vjs;
+  const qualityBtn = player.controlBar?.getChild("QualityButton");
+  if (qualityBtn) qualityBtn.update();
   const audioBtn = player.controlBar?.getChild("AudioLangButton");
   if (audioBtn) { audioBtn.show(); audioBtn.update(); }
+  _applySavedVolumeToVideo(player);
   player.src({ type: "application/dash+xml", src: info.manifestUrl });
+  _applySavedVolumeToVideo(player);
   player.play().catch(() => {});
   state.player.current = { ...item, ...(info.item || {}) };
   state.player.loading = false;
@@ -2935,11 +3289,16 @@ async function _loadVideoItem(item, loadId) {
 async function ensureVideoPlayer() {
   if (!window.videojs) throw new Error("Video.js no está cargado.");
   if (state.player.vjs && !state.player.vjs.isDisposed()) return;
-  const videoEl = document.getElementById("webPlayerVideo");
+  let videoEl = document.getElementById("webPlayerVideo");
   if (!videoEl) {
     renderWatch();
+    videoEl = document.getElementById("webPlayerVideo");
   }
-  const player = videojs("webPlayerVideo", {
+  if (!videoEl) throw new Error("No se encontró el contenedor de video.");
+  // Apply saved volume & mute synchronously before Video.js initializes
+  // so autoplay never blasts at 100% or clobbers localStorage on startup.
+  _applySavedVolumeToVideo(null, videoEl);
+  const player = videojs(videoEl, {
     controls: true,
     autoplay: true,
     preload: "auto",
@@ -2957,6 +3316,7 @@ async function ensureVideoPlayer() {
     },
   });
   state.player.vjs = player;
+  let volumeReady = false;
   player.on("error", () => {
     const err = player.error();
     const messages = {
@@ -2976,14 +3336,17 @@ async function ensureVideoPlayer() {
   player.on("pause", () => { _onLocalMediaEvent("pause"); });
   player.on("seeked", () => { _onLocalMediaEvent("seeked"); });
   player.on("ratechange", () => { _onLocalMediaEvent("ratechange"); });
-  // Restore / persist volume
+  player.on("loadstart", () => { _applySavedVolumeToVideo(player); });
+  player.on("loadedmetadata", () => { _applySavedVolumeToVideo(player); });
+  // Restore / persist volume without letting startup events overwrite localStorage
   player.ready(() => {
-    const savedVol = localStorage.getItem("playzi-volume");
-    if (savedVol !== null) player.volume(parseFloat(savedVol));
+    _applySavedVolumeToVideo(player);
+    volumeReady = true;
     _applyPartyPlayerRestrictions();
   });
   player.on("volumechange", () => {
-    localStorage.setItem("playzi-volume", player.volume());
+    if (!volumeReady || performance.now() < _suppressVolumeSaveUntil) return;
+    _saveVolumeState(player.volume(), player.muted());
   });
   _registerQualityMenu(player);
   _registerAudioMenu(player);
@@ -3007,20 +3370,21 @@ function _registerAudioMenu(player) {
     }
     handleClick() {
       const track = this.options_.track;
-      if (!track) return;
+      const p = this.player();
+      if (!track || !p || p.isDisposed()) return;
       state.player.audioLang = track.lang;
-      const curTime = player.currentTime();
-      let src = player.currentSrc().replace(/&audio_lang=[^&]*/, "");
+      const curTime = p.currentTime();
+      let src = p.currentSrc().replace(/&audio_lang=[^&]*/, "");
       if (!track.default) src += `&audio_lang=${encodeURIComponent(track.lang)}`;
       toast(`Cambiando audio a ${track.name}...`);
-      player.src({ type: "application/dash+xml", src });
-      player.one("canplay", () => {
+      p.src({ type: "application/dash+xml", src });
+      p.one("canplay", () => {
         _applyingPartySync = true;
-        player.currentTime(curTime);
-        player.play().catch(() => {});
+        p.currentTime(curTime);
+        p.play().catch(() => {});
         setTimeout(() => { _applyingPartySync = false; }, 250);
       });
-      const btn = player.controlBar.getChild("AudioLangButton");
+      const btn = p.controlBar.getChild("AudioLangButton");
       if (btn) btn.items.forEach((it) => it.options_.track && it.selected(it.options_.track.lang === track.lang));
     }
   }
@@ -3028,9 +3392,10 @@ function _registerAudioMenu(player) {
   class AudioLangButton extends MenuButton {
     buildCSSClass() { return `vjs-audio-lang-button ${super.buildCSSClass()}`; }
     createItems() {
+      const p = this.player();
       const tracks = state.player.audioTracks;
-      if (tracks === null) return [new AudioTrackMenuItem(player, { label: "Cargando idiomas..." })];
-      return tracks.map((t) => new AudioTrackMenuItem(player, { label: t.name, track: t }));
+      if (tracks === null) return [new AudioTrackMenuItem(p, { label: "Cargando idiomas..." })];
+      return tracks.map((t) => new AudioTrackMenuItem(p, { label: t.name, track: t }));
     }
     handleClick() {
       super.handleClick?.();
@@ -3057,38 +3422,108 @@ function _registerAudioMenu(player) {
   player.controlBar.addChild("AudioLangButton", {}, player.controlBar.children().length - 1);
 }
 
-function _registerQualityMenu(player) {
-  const qualities = ["best", "1080p", "720p", "480p", "360p", "240p"];
-  let activeQ = state.config?.playbackQuality || "best";
+function _formatQualityLabel(qualityValue) {
+  if (qualityValue === "best") {
+    const h = state.player.currentHeight;
+    return h ? `Auto (${h}p)` : "Auto";
+  }
+  if (qualityValue === "2160p") return "2160p (4K)";
+  if (qualityValue === "1440p") return "1440p (2K)";
+  return qualityValue;
+}
 
+function _registerQualityMenu(player) {
+  const defaultQualities = ["2160p", "1440p", "1080p", "720p", "480p", "360p", "240p"];
   const MenuButton = videojs.getComponent("MenuButton");
   const MenuItem = videojs.getComponent("MenuItem");
 
   class QualityMenuItem extends MenuItem {
     constructor(p, opts) {
       super(p, { ...opts, selectable: true, multiSelectable: false });
-      this.selected(opts.label === activeQ);
+      const activeQ = state.player.activeQuality || state.config?.playbackQuality || "best";
+      this.selected(opts.qualityValue === activeQ);
     }
-    handleClick() {
-      activeQ = this.options_.label;
-      const curTime = player.currentTime();
-      const curSrc = player.currentSrc();
-      const newSrc = curSrc.replace(/quality=[^&]*/, `quality=${encodeURIComponent(activeQ)}`);
-      player.src({ type: "application/dash+xml", src: newSrc });
-      player.one("canplay", () => {
+    async handleClick() {
+      const p = this.player();
+      if (!p || p.isDisposed()) return;
+      const selectedQ = this.options_.qualityValue;
+      state.player.activeQuality = selectedQ;
+      const curTime = p.currentTime();
+      const wasPaused = p.paused();
+
+      if (IS_TAURI) {
+        const url = state.player.current?.url;
+        if (!url) return;
+        toast(`Cambiando calidad a ${_formatQualityLabel(selectedQ)}...`);
+        try {
+          const info = await api.get(`/api/player/info?url=${encodeURIComponent(url)}&quality=${encodeURIComponent(selectedQ)}`);
+          if (!p || p.isDisposed()) return;
+          if (Array.isArray(info.availableQualities) && info.availableQualities.length) {
+            state.player.availableQualities = info.availableQualities;
+          }
+          state.player.currentHeight = info.video?.height || null;
+          const rawSrc = info.streamUrl || info.video?.url || "";
+          if (!rawSrc) {
+            toast("No se pudo cambiar la calidad del video");
+            return;
+          }
+          const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
+          const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
+          const hlsAudioUrl = info.hlsAudio?.url || "";
+          const proxiedSrc = (isHls && !videoHasAudio && hlsAudioUrl)
+            ? streamMasterProxyUrl(rawSrc, hlsAudioUrl)
+            : streamProxyUrl(rawSrc);
+          const mimeType = isHls
+            ? "application/x-mpegURL"
+            : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+          p.src({ src: proxiedSrc, type: mimeType });
+          p.one("canplay", () => {
+            _applyingPartySync = true;
+            p.currentTime(curTime);
+            if (!wasPaused) p.play().catch(() => {});
+            setTimeout(() => { _applyingPartySync = false; }, 250);
+          });
+          const btn = p.controlBar.getChild("QualityButton");
+          if (btn) btn.update();
+        } catch (err) {
+          toast(err.message || "Error al cambiar la calidad");
+        }
+        return;
+      }
+
+      const curSrc = p.currentSrc();
+      const newSrc = /quality=[^&]*/.test(curSrc)
+        ? curSrc.replace(/quality=[^&]*/, `quality=${encodeURIComponent(selectedQ)}`)
+        : `${curSrc}${curSrc.includes("?") ? "&" : "?"}quality=${encodeURIComponent(selectedQ)}`;
+      p.src({ type: "application/dash+xml", src: newSrc });
+      p.one("canplay", () => {
         _applyingPartySync = true;
-        player.currentTime(curTime);
-        player.play().catch(() => {});
+        p.currentTime(curTime);
+        if (!wasPaused) p.play().catch(() => {});
         setTimeout(() => { _applyingPartySync = false; }, 250);
       });
-      const btn = player.controlBar.getChild("QualityButton");
-      if (btn) btn.items.forEach((it) => it.selected(it.options_.label === activeQ));
+      const btn = p.controlBar.getChild("QualityButton");
+      if (btn) btn.items.forEach((it) => it.selected(it.options_.qualityValue === selectedQ));
     }
   }
 
   class QualityButton extends MenuButton {
+    constructor(p, opts) {
+      super(p, opts);
+      this.controlText("Calidad");
+    }
     buildCSSClass() { return `vjs-quality-button ${super.buildCSSClass()}`; }
-    createItems() { return qualities.map((q) => new QualityMenuItem(player, { label: q })); }
+    createItems() {
+      const p = this.player();
+      const detected = Array.isArray(state.player.availableQualities) && state.player.availableQualities.length
+        ? state.player.availableQualities
+        : defaultQualities;
+      const list = ["best", ...detected.filter((q) => q !== "best")];
+      return list.map((q) => new QualityMenuItem(p, {
+        label: _formatQualityLabel(q),
+        qualityValue: q,
+      }));
+    }
   }
 
   if (!videojs.getComponent("QualityButton")) videojs.registerComponent("QualityButton", QualityButton);
@@ -3129,11 +3564,12 @@ function _miniPlayerHtml() {
         <div class="mini-prog-wrap"><div class="mini-prog-fill" id="miniProgFill" style="width:0%"></div></div>
       </div>
       <div class="mini-btns">
-        <button class="mini-btn" id="miniPrev" title="Anterior" ${hasPrev ? "" : "disabled"}>⏮</button>
-        <button class="mini-btn mini-btn--play" id="miniPlayPause" title="Play/Pausa">⏸</button>
-        <button class="mini-btn" id="miniNext" title="Siguiente" ${hasNext ? "" : "disabled"}>⏭</button>
-        <button class="mini-btn" id="miniExpand" title="Abrir reproductor">⤢</button>
-        <button class="mini-btn" id="miniClose" title="Cerrar">✕</button>
+        <button class="mini-btn" id="miniPrev" title="Anterior" ${hasPrev ? "" : "disabled"}>${PLAYER_ICONS.prev(16)}</button>
+        <button class="mini-btn mini-btn--play" id="miniPlayPause" data-state="playing" title="Play/Pausa">${PLAYER_ICONS.pause(16)}</button>
+        <button class="mini-btn" id="miniNext" title="Siguiente" ${hasNext ? "" : "disabled"}>${PLAYER_ICONS.next(16)}</button>
+        <span class="mini-sep" aria-hidden="true"></span>
+        <button class="mini-btn" id="miniExpand" title="Abrir reproductor">${PLAYER_ICONS.expand(15)}</button>
+        <button class="mini-btn" id="miniClose" title="Cerrar">${PLAYER_ICONS.close(15)}</button>
       </div>
     </div>
   `;
@@ -3166,7 +3602,11 @@ function _updateMiniPlayer() {
   if (fill) fill.style.width = duration ? `${(currentTime / duration) * 100}%` : "0%";
   const playBtn = document.getElementById("miniPlayPause");
   if (playBtn) {
-    playBtn.textContent = paused ? "▶" : "⏸";
+    const nextState = paused ? "paused" : "playing";
+    if (playBtn.dataset.state !== nextState) {
+      playBtn.dataset.state = nextState;
+      playBtn.innerHTML = paused ? PLAYER_ICONS.play(16) : PLAYER_ICONS.pause(16);
+    }
     playBtn.disabled = !_partyCanPlayPause();
   }
   const isPartyGuest = _partyIsGuest();
@@ -3341,12 +3781,15 @@ function videoCard(item) {
   const channelNameHtml = _renderChannelMetaHtml(channelName, resolvedChannelUrl, !isPlaylist);
 
   const isShort = _isShort(item);
+  const watchedPct = _getWatchedPercent(item);
   return `
     <article class="card${isShort ? " card--short" : ""}">
       <div class="thumb">
         ${item.thumbnail ? `<img ${thumbAttrs(item.thumbnail)}>` : ""}
         ${item.membersOnly ? `<span class="badge-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}
+        ${watchedPct >= 80 ? `<span class="badge-watched" title="Ya viste este video">Visto</span>` : ""}
         <span class="duration">${escapeHtml(item.durationText || (isShort ? "Short" : "--:--"))}</span>
+        ${watchedPct > 0 ? `<div class="thumb-watched-bar" title="${watchedPct}% visto"><span class="thumb-watched-fill" style="width:${watchedPct}%"></span></div>` : ""}
       </div>
       <div class="card-body">
         <div class="card-title">${escapeHtml(item.title)}</div>
@@ -4147,8 +4590,19 @@ function bindEvents() {
     }
     if (ev.target.closest("#refreshRecom")) {
       try {
-        toast("Obteniendo recomendaciones de YouTube...");
-        await startBackgroundTask(await api.post("/api/recommendations/refresh"), "Actualizando recomendaciones en segundo plano...");
+        toast("Actualizando recomendaciones de YouTube y YT Music...");
+        const [ytRes, ytmRes] = await Promise.allSettled([
+          api.post("/api/recommendations/refresh"),
+          api.post("/api/music/recommendations/refresh"),
+        ]);
+        const taskRes = ytRes.status === "fulfilled"
+          ? ytRes.value
+          : (ytmRes.status === "fulfilled" ? ytmRes.value : null);
+        if (taskRes) {
+          await startBackgroundTask(taskRes, "Actualizando recomendaciones en segundo plano...");
+        } else if (ytRes.status === "rejected") {
+          throw ytRes.reason;
+        }
       } catch (err) {
         toast(err.message);
       }
@@ -4332,6 +4786,11 @@ function bindEvents() {
     }
 
     // Watch view controls
+    const watchSecToggle = ev.target.closest("[data-watch-section-toggle]");
+    if (watchSecToggle) {
+      _toggleWatchSidebarSection(watchSecToggle.dataset.watchSectionToggle);
+      return;
+    }
     const partyRemoveBtn = ev.target.closest("[data-party-remove-idx]");
     if (partyRemoveBtn) {
       ev.stopPropagation();
@@ -4604,6 +5063,8 @@ let _applyingPartySync = false;
 let _applyingPartySyncTimer = null;
 let _partyMediaLoadingLock = false;
 let _partyHeartbeatTimer = null;
+let _partyViewPollTimer = null;
+let _partyRenderDeferred = false;
 let _partySyncDebounce = null;
 let _partyLastSyncedUrl = "";
 let _partyLastAppliedVersion = -1;
@@ -4693,6 +5154,24 @@ function _socialPendingCount() {
   );
 }
 
+function _partyViewHasFocusedInput() {
+  const root = $("#view-party");
+  const active = document.activeElement;
+  if (!root || !active || !root.contains(active)) return false;
+  const tag = String(active.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+function _requestPartyRender() {
+  if (state.view !== "party") return;
+  if (_partyViewHasFocusedInput()) {
+    _partyRenderDeferred = true;
+    return;
+  }
+  _partyRenderDeferred = false;
+  renderParty();
+}
+
 function _onSocialStateUpdate(snapshot) {
   if (!snapshot) return;
   state.social = snapshot;
@@ -4700,7 +5179,7 @@ function _onSocialStateUpdate(snapshot) {
     state.friends = snapshot.friends;
   }
   _updatePartyBadge();
-  if (state.view === "party") renderParty();
+  _requestPartyRender();
 }
 
 async function _refreshSocialStatus() {
@@ -4710,6 +5189,54 @@ async function _refreshSocialStatus() {
     _onSocialStateUpdate(snap);
   } catch (_) {}
 }
+
+async function _syncPartyViewNow() {
+  if (!IS_TAURI) return;
+  try {
+    const [socialSnap, partySnap] = await Promise.all([
+      api.post("/api/social/sync", {}).catch(() => null),
+      api.get("/api/party/status").catch(() => null),
+    ]);
+    if (socialSnap) _onSocialStateUpdate(socialSnap);
+    if (partySnap) _onPartyStateUpdate(partySnap, { skipAutoLoad: true });
+  } catch (_) {}
+}
+
+function _ensurePartyViewPolling() {
+  if (state.view === "party") {
+    if (!_partyViewPollTimer) {
+      _partyViewPollTimer = setInterval(() => {
+        if (state.view !== "party") {
+          clearInterval(_partyViewPollTimer);
+          _partyViewPollTimer = null;
+          return;
+        }
+        _syncPartyViewNow();
+      }, 5000);
+    }
+  } else if (_partyViewPollTimer) {
+    clearInterval(_partyViewPollTimer);
+    _partyViewPollTimer = null;
+  }
+}
+
+document.addEventListener("focusout", (ev) => {
+  if (!_partyRenderDeferred || state.view !== "party") return;
+  const root = $("#view-party");
+  if (!root || !root.contains(ev.target)) return;
+  setTimeout(() => {
+    if (_partyRenderDeferred && state.view === "party" && !_partyViewHasFocusedInput()) {
+      _partyRenderDeferred = false;
+      renderParty();
+    }
+  }, 50);
+});
+
+window.addEventListener("beforeunload", () => {
+  if (state.party?.active) {
+    try { api.post("/api/party/leave", {}); } catch (_) {}
+  }
+});
 
 function _updatePartyBadge() {
   const badge = $("#partyBadge");
@@ -4984,8 +5511,9 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
   _updatePartyBadge();
   _ensurePartyHeartbeat();
   _updateWatchPartyBar();
+  _updateWatchUsers();
   _applyPartyPlayerRestrictions();
-  if (state.view === "party") renderParty();
+  _requestPartyRender();
 
   if (!snapshot.active) {
     _partyLastSyncedUrl = "";
@@ -5044,7 +5572,6 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
       _partyLastSyncedUrl = targetItem.url;
       _partyLastAppliedVersion = pbVersion;
       state.player.sourceContext = targetItem.sourceContext || "search";
-      if (isGuest && !wasActive) setView("watch");
       loadWebPlayerItem(expectedIdx, {
         fromPartySync: true,
         targetPos,
@@ -5097,10 +5624,19 @@ function renderParty() {
   const incomingFriendReqs = social.incomingFriendRequests || [];
   const outgoingFriendReqs = social.outgoingFriendRequests || [];
   const incomingInvites = social.incomingRoomInvites || [];
-  const incomingJoinReqs = social.incomingJoinRequests || [];
+  const incomingJoinReqs = isHost ? (social.incomingJoinRequests || []) : [];
   const totalPending = incomingFriendReqs.length + incomingInvites.length + incomingJoinReqs.length;
   const roomParticipantIds = new Set((p.participants || []).map((u) => String(u.userId || "").toUpperCase()));
-  const activeFriendRooms = friends.filter((f) => f.room && f.room.roomCode);
+  const myRoomCodeUpper = String(p.roomCode || "").toUpperCase();
+  const activeFriendRooms = friends.filter((f) => {
+    if (!f.room || !f.room.roomCode) return false;
+    const uidUpper = String(f.userId || "").toUpperCase();
+    const fRoomUpper = String(f.room.roomCode || "").toUpperCase();
+    if (p.active && roomParticipantIds.has(uidUpper) && fRoomUpper !== myRoomCodeUpper) {
+      return false;
+    }
+    return true;
+  });
 
   const activeFriendSessionsHtml = (activeFriendRooms.length > 0 || (hubConnected && friends.length > 0 && !p.active)) ? `
     <div class="party-card party-card--wide" style="margin-bottom:16px">

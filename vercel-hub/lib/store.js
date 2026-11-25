@@ -61,6 +61,33 @@ export async function kvGetJson(key, fallback = null) {
   return entry.value;
 }
 
+export async function kvMGetJson(keys) {
+  if (!Array.isArray(keys) || keys.length === 0) return [];
+  const cfg = getRedisConfig();
+  if (cfg) {
+    const rawList = await redisCommand(["MGET", ...keys]);
+    if (!Array.isArray(rawList)) return keys.map(() => null);
+    return rawList.map((raw) => {
+      if (raw == null) return null;
+      try {
+        return typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch {
+        return null;
+      }
+    });
+  }
+  const now = Date.now();
+  return keys.map((key) => {
+    const entry = memoryStore.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt && now > entry.expiresAt) {
+      memoryStore.delete(key);
+      return null;
+    }
+    return entry.value;
+  });
+}
+
 export async function kvSetJson(key, value, ttlSeconds = 0) {
   const cfg = getRedisConfig();
   if (cfg) {

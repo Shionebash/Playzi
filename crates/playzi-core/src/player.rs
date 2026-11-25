@@ -117,6 +117,8 @@ pub struct ResolvedStreamInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hls_audio: Option<StreamFormat>,
     pub audio_tracks: Vec<AudioTrack>,
+    #[serde(default)]
+    pub available_qualities: Vec<String>,
     pub expires_at: Option<i64>,
 }
 
@@ -812,14 +814,22 @@ pub fn format_selector(quality: &str, vlc: bool, audio_only: bool) -> String {
 }
 
 pub fn quality_to_height(quality: &str) -> Option<u32> {
-    match quality.trim().to_lowercase().as_str() {
+    let normalized = quality.trim().to_lowercase();
+    match normalized.as_str() {
+        "best" | "auto" | "" => None,
+        "4320p" | "8k" => Some(4320),
         "2160p" | "4k" => Some(2160),
         "1440p" | "2k" => Some(1440),
         "1080p" => Some(1080),
         "720p" => Some(720),
         "480p" => Some(480),
         "360p" => Some(360),
-        _ => None,
+        "240p" => Some(240),
+        "144p" => Some(144),
+        other => {
+            let digits: String = other.chars().filter(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok().filter(|&h| h >= 144)
+        }
     }
 }
 
@@ -1252,6 +1262,11 @@ pub fn parse_ytdlp_info_json(
 
     let max_h = quality_to_height(quality);
     let selected_hls_audio = select_best_hls_audio(&formats);
+    let available_qualities = if audio_only {
+        Vec::new()
+    } else {
+        extract_available_qualities(&formats, selected_hls_audio.is_some())
+    };
     let selected_video = if audio_only {
         None
     } else {
@@ -1313,6 +1328,7 @@ pub fn parse_ytdlp_info_json(
         audio: selected_audio,
         hls_audio: selected_hls_audio,
         audio_tracks,
+        available_qualities,
         expires_at,
     }
 }
@@ -1488,67 +1504,86 @@ fn select_best_hls_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
         .cloned()
 }
 
+fn video_compat_tier(f: &StreamFormat) -> u8 {
+    let is_hls = is_hls_url(&f.url);
+    let has_audio = !f.acodec.is_empty() && f.acodec != "none";
+    let vcodec = f.vcodec.to_lowercase();
+    if is_hls && has_audio {
+        4
+    } else if is_hls && vcodec.starts_with("avc1") {
+        3
+    } else if is_hls && (vcodec.starts_with("vp09") || vcodec.starts_with("vp9")) {
+        2
+    } else if is_hls {
+        1
+    } else {
+        0
+    }
+}
+
+fn collect_playable_videos<'a>(
+    formats: &'a [StreamFormat],
+    has_hls_audio: bool,
+) -> Vec<&'a StreamFormat> {
+    let all_video: Vec<&StreamFormat> = formats
+        .iter()
+        .filter(|f| !f.vcodec.is_empty() && f.vcodec != "none")
+        .collect();
+
+    // Include all playable HLS formats: muxed HLS (m3u8 with audio) plus video-only HLS
+    // (including 1440p/2160p VP9/AV1 HLS) whenever a separate HLS audio playlist is available.
+    let hls_playable: Vec<&StreamFormat> = all_video
+        .iter()
+        .copied()
+        .filter(|f| {
+            is_hls_url(&f.url)
+                && (has_hls_audio || (!f.acodec.is_empty() && f.acodec != "none"))
+        })
+        .collect();
+    if !hls_playable.is_empty() {
+        return hls_playable;
+    }
+
+    // Otherwise prefer muxed direct HTTP (e.g. itag 18 mp4) over silent video-only streams.
+    let http_muxed: Vec<&StreamFormat> = all_video
+        .iter()
+        .copied()
+        .filter(|f| !is_hls_url(&f.url) && !f.acodec.is_empty() && f.acodec != "none")
+        .collect();
+    if !http_muxed.is_empty() {
+        return http_muxed;
+    }
+
+    let hls_any: Vec<&StreamFormat> = all_video
+        .iter()
+        .copied()
+        .filter(|f| is_hls_url(&f.url))
+        .collect();
+    if !hls_any.is_empty() {
+        return hls_any;
+    }
+
+    all_video
+}
+
+fn extract_available_qualities(formats: &[StreamFormat], has_hls_audio: bool) -> Vec<String> {
+    let playable = collect_playable_videos(formats, has_hls_audio);
+    let mut heights: Vec<u32> = playable
+        .into_iter()
+        .filter_map(|f| f.height)
+        .filter(|&h| h >= 144)
+        .collect();
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    heights.into_iter().map(|h| format!("{h}p")).collect()
+}
+
 fn select_best_video(
     formats: &[StreamFormat],
     max_height: Option<u32>,
     has_hls_audio: bool,
 ) -> Option<StreamFormat> {
-    let all_video: Vec<&StreamFormat> = formats
-        .iter()
-        .filter(|f| !f.vcodec.is_empty() && f.vcodec != "none")
-        .collect();
-    // 1. Prefer muxed HLS (m3u8) streams when available (web_safari serves 1080p H.264+AAC HLS)
-    let hls_muxed: Vec<&StreamFormat> = all_video
-        .iter()
-        .copied()
-        .filter(|f| is_hls_url(&f.url) && !f.acodec.is_empty() && f.acodec != "none")
-        .collect();
-    let mut candidates = if !hls_muxed.is_empty() {
-        hls_muxed
-    } else if has_hls_audio {
-        // 2. When separate HLS audio is available (default client), prefer H.264 (avc1) HLS video
-        // for reliable WebView2 Video.js VHS transmuxing via synthetic master playlist.
-        let hls_h264: Vec<&StreamFormat> = all_video
-            .iter()
-            .copied()
-            .filter(|f| is_hls_url(&f.url) && f.vcodec.to_lowercase().starts_with("avc1"))
-            .collect();
-        if !hls_h264.is_empty() {
-            hls_h264
-        } else {
-            let hls_any: Vec<&StreamFormat> = all_video
-                .iter()
-                .copied()
-                .filter(|f| is_hls_url(&f.url))
-                .collect();
-            if !hls_any.is_empty() {
-                hls_any
-            } else {
-                all_video
-            }
-        }
-    } else {
-        // 3. Otherwise prefer muxed direct HTTP (e.g. itag 18 mp4) over silent video-only streams.
-        let http_muxed: Vec<&StreamFormat> = all_video
-            .iter()
-            .copied()
-            .filter(|f| !is_hls_url(&f.url) && !f.acodec.is_empty() && f.acodec != "none")
-            .collect();
-        if !http_muxed.is_empty() {
-            http_muxed
-        } else {
-            let hls_any: Vec<&StreamFormat> = all_video
-                .iter()
-                .copied()
-                .filter(|f| is_hls_url(&f.url))
-                .collect();
-            if !hls_any.is_empty() {
-                hls_any
-            } else {
-                all_video
-            }
-        }
-    };
+    let mut candidates = collect_playable_videos(formats, has_hls_audio);
     if let Some(limit) = max_height {
         let within: Vec<&StreamFormat> = candidates
             .iter()
@@ -1564,12 +1599,20 @@ fn select_best_video(
         .max_by(|a, b| {
             let ha = a.height.unwrap_or(0);
             let hb = b.height.unwrap_or(0);
-            ha.cmp(&hb).then_with(|| {
-                a.tbr
-                    .unwrap_or(0.0)
-                    .partial_cmp(&b.tbr.unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            ha.cmp(&hb)
+                .then_with(|| video_compat_tier(a).cmp(&video_compat_tier(b)))
+                .then_with(|| {
+                    a.fps
+                        .unwrap_or(0.0)
+                        .partial_cmp(&b.fps.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    a.tbr
+                        .unwrap_or(0.0)
+                        .partial_cmp(&b.tbr.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         })
         .cloned()
 }
@@ -2441,8 +2484,80 @@ mod tests {
         assert_eq!(info.video.as_ref().unwrap().format_id, "248");
         assert_eq!(info.audio.as_ref().unwrap().format_id, "251-en");
         assert_eq!(info.audio_tracks.len(), 2);
+        assert_eq!(info.available_qualities, vec!["2160p", "1080p"]);
         assert_eq!(info.expires_at, Some(1999999500));
         assert_eq!(info.item["title"], "Sample Video");
+    }
+
+    #[test]
+    fn parse_ytdlp_info_detects_and_selects_hls_above_1080p() {
+        let raw = json!({
+            "id": "hiRes123456",
+            "title": "4K Sample",
+            "channel": "Demo",
+            "duration": 180.0,
+            "webpage_url": "https://www.youtube.com/watch?v=hiRes123456",
+            "formats": [
+                {
+                    "format_id": "234",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/audio.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "none",
+                    "acodec": "mp4a.40.2",
+                    "abr": 128.0
+                },
+                {
+                    "format_id": "96",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/mux1080.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "avc1.640028",
+                    "acodec": "mp4a.40.2",
+                    "width": 1920,
+                    "height": 1080,
+                    "tbr": 3500.0
+                },
+                {
+                    "format_id": "270",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/avc1080.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "avc1.640028",
+                    "acodec": "none",
+                    "width": 1920,
+                    "height": 1080,
+                    "tbr": 4200.0
+                },
+                {
+                    "format_id": "620",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/vp9_1440.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "vp09.00.50.08",
+                    "acodec": "none",
+                    "width": 2560,
+                    "height": 1440,
+                    "tbr": 9000.0
+                },
+                {
+                    "format_id": "625",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/vp9_2160.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "vp09.00.51.08",
+                    "acodec": "none",
+                    "width": 3840,
+                    "height": 2160,
+                    "tbr": 18000.0
+                }
+            ]
+        });
+
+        let best = parse_ytdlp_info_json(&raw, "https://www.youtube.com/watch?v=hiRes123456", "best", false);
+        assert_eq!(best.available_qualities, vec!["2160p", "1440p", "1080p"]);
+        assert_eq!(best.video.as_ref().unwrap().format_id, "625");
+
+        let q1440 = parse_ytdlp_info_json(&raw, "https://www.youtube.com/watch?v=hiRes123456", "1440p", false);
+        assert_eq!(q1440.video.as_ref().unwrap().format_id, "620");
+
+        let q1080 = parse_ytdlp_info_json(&raw, "https://www.youtube.com/watch?v=hiRes123456", "1080p", false);
+        assert_eq!(q1080.video.as_ref().unwrap().format_id, "96");
     }
 
     #[test]

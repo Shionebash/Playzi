@@ -333,9 +333,12 @@ export class SocialHub {
         };
       });
 
-    const incomingJoinRequests = Array.from(this.joinRequests.values()).filter(
-      (r) => r.toUserId === userId
-    );
+    const myRoom = this.rooms.get(userId) || null;
+    const incomingJoinRequests = myRoom
+      ? Array.from(this.joinRequests.values()).filter(
+          (r) => r.toUserId === userId && (!r.roomCode || r.roomCode === myRoom.roomCode)
+        )
+      : [];
 
     return {
       type: "social_sync",
@@ -443,6 +446,22 @@ export class SocialHub {
 
     if (type === "ping") {
       safeSend(ws, { type: "pong", ts: Date.now() });
+      return;
+    }
+
+    if (type === "sync") {
+      this.syncUser(userId);
+      return;
+    }
+
+    if (type === "client_disconnect" || type === "disconnect") {
+      this.rooms.delete(userId);
+      for (const [reqId, jr] of this.joinRequests.entries()) {
+        if (jr.toUserId === userId || jr.fromUserId === userId) {
+          this.joinRequests.delete(reqId);
+        }
+      }
+      this.syncFriendsOf(userId);
       return;
     }
 
@@ -742,20 +761,32 @@ export class SocialHub {
 
       const me = this.users[userId] || { userId, displayName: userId };
       const myRoom = this.rooms.get(userId);
-      const inviteUrl = String(msg.inviteUrl || myRoom?.inviteUrl || "").trim();
+      const roomMatches = Boolean(myRoom && (!req.roomCode || myRoom.roomCode === req.roomCode));
+      const inviteUrl = roomMatches ? String(msg.inviteUrl || myRoom.inviteUrl || "").trim() : "";
 
-      if (accept && inviteUrl) {
+      if (accept && roomMatches && inviteUrl) {
         this.sendToUser(req.fromUserId, {
           type: "room_join_approved",
           hostUserId: userId,
           hostDisplayName: me.displayName || userId,
-          roomCode: myRoom?.roomCode || req.roomCode,
+          roomCode: myRoom.roomCode || req.roomCode,
           inviteUrl,
         });
         safeSend(ws, {
           type: "notice",
           level: "ok",
           message: `Aceptaste a ${req.fromDisplayName || req.fromUserId} en la sala.`,
+        });
+      } else if (accept) {
+        this.sendToUser(req.fromUserId, {
+          type: "notice",
+          level: "error",
+          message: "La sesión ya no está activa.",
+        });
+        safeSend(ws, {
+          type: "notice",
+          level: "error",
+          message: "No tienes una sesión activa para aceptar esta solicitud.",
         });
       } else {
         this.sendToUser(req.fromUserId, {

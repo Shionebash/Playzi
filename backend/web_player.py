@@ -33,6 +33,7 @@ def player_info(url: str, quality: str | None = None) -> dict[str, Any]:
         "quality": quality or config.PLAYBACK_QUALITY or "best",
         "video": _public_format(video),
         "audio": _public_format(audio),
+        "availableQualities": _available_qualities(info),
         "manifestUrl": f"/api/player/manifest.mpd?url={quote(url, safe='')}&quality={quote(quality or config.PLAYBACK_QUALITY or 'best', safe='')}",
     }
 
@@ -353,12 +354,29 @@ def _select_formats(info: dict[str, Any], quality: str | None = None, audio_lang
     return videos[0], audios[0]
 
 
+def _available_qualities(info: dict[str, Any]) -> list[str]:
+    formats = info.get("formats") or []
+    heights = sorted(
+        {
+            int(f.get("height") or 0)
+            for f in formats
+            if f.get("url")
+            and f.get("vcodec") not in (None, "none")
+            and f.get("acodec") in (None, "none")
+            and _is_browser_video_candidate(f)
+            and int(f.get("height") or 0) >= 144
+        },
+        reverse=True,
+    )
+    return [f"{h}p" for h in heights]
+
+
 def _is_browser_video_candidate(fmt: dict[str, Any]) -> bool:
     # Only MP4 container — VHS requires ISOBMFF SIDX for DASH; WebM uses EBML Cues (incompatible)
     ext = (fmt.get("ext") or "").lower()
     codec = (fmt.get("vcodec") or "").lower()
     return ext == "mp4" and (
-        codec.startswith("avc1") or codec.startswith("av01")
+        codec.startswith("avc1") or codec.startswith("av01") or codec.startswith("vp09") or codec.startswith("vp9")
     )
 
 

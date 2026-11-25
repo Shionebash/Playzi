@@ -330,6 +330,7 @@ struct HostSessionState {
     relay_connected: bool,
     relay_error: String,
     room_access: String,
+    http_room_endpoint: Option<String>,
 }
 
 struct GuestSessionState {
@@ -1136,6 +1137,7 @@ impl PartyManager {
             relay_connected: false,
             relay_error: String::new(),
             room_access,
+            http_room_endpoint: None,
         };
 
         let snap = host_state.snapshot();
@@ -1306,6 +1308,12 @@ impl PartyManager {
             if let Some(http_base) = detect_http_hub(&http_client, &hub_url).await {
                 let room_endpoint = format!("{http_base}/api/room");
                 let public_room_url = format!("{room_endpoint}?room={room_code}");
+                {
+                    let mut mode = manager.inner.mode.write().await;
+                    if let SessionMode::Host(host) = &mut *mode {
+                        host.http_room_endpoint = Some(room_endpoint.clone());
+                    }
+                }
                 let mut since_seq = 0u64;
                 let mut relay_guests: HashMap<
                     String,
@@ -2155,15 +2163,24 @@ impl PartyManager {
                 .await
                 .map_err(|e| CoreError::External(format!("No se pudo conectar al Hub Vercel: {e}")))?;
             if !join_resp.status().is_success() {
-                return Err(CoreError::External(format!(
-                    "Hub Vercel rechazó la conexión (HTTP {})",
-                    join_resp.status()
-                )));
+                let status = join_resp.status();
+                let err_msg = join_resp
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(Value::as_str).map(String::from))
+                    .unwrap_or_else(|| format!("Hub Vercel rechazó la conexión (HTTP {status})"));
+                return Err(CoreError::External(err_msg));
             }
             let join_body = join_resp
                 .json::<Value>()
                 .await
                 .map_err(|e| CoreError::External(format!("Respuesta inválida del Hub Vercel: {e}")))?;
+            if join_body.get("hostOnline").and_then(Value::as_bool) == Some(false) {
+                return Err(CoreError::External(
+                    "La sesión ya no existe o el host cerró la sala.".into(),
+                ));
+            }
             let conn_id = join_body
                 .get("connId")
                 .and_then(Value::as_str)
@@ -2228,10 +2245,30 @@ impl PartyManager {
                                 .send()
                                 .await;
                             let Ok(r) = resp else { continue; };
+                            if r.status() == reqwest::StatusCode::NOT_FOUND
+                                || r.status() == reqwest::StatusCode::GONE
+                            {
+                                let mut mode = manager.inner.mode.write().await;
+                                *mode = SessionMode::Idle;
+                                drop(mode);
+                                let idle = manager.status().await;
+                                manager.emit_snapshot(idle);
+                                manager.emit_notice("error", "La sesión ha finalizado.");
+                                return;
+                            }
                             if !r.status().is_success() {
                                 continue;
                             }
                             let Ok(body) = r.json::<Value>().await else { continue; };
+                            if body.get("roomClosed").and_then(Value::as_bool) == Some(true) {
+                                let mut mode = manager.inner.mode.write().await;
+                                *mode = SessionMode::Idle;
+                                drop(mode);
+                                let idle = manager.status().await;
+                                manager.emit_snapshot(idle);
+                                manager.emit_notice("error", "El host cerró la sesión.");
+                                return;
+                            }
                             if let Some(seq) = body.get("seq").and_then(Value::as_u64) {
                                 since_seq = seq;
                             }
@@ -2473,10 +2510,14 @@ impl PartyManager {
     }
 
     pub async fn leave_or_stop(&self) -> PartyRoomSnapshot {
+        let mut http_close_target: Option<(String, String)> = None;
         let mut mode = self.inner.mode.write().await;
         match std::mem::replace(&mut *mode, SessionMode::Idle) {
             SessionMode::Idle => {}
             SessionMode::Host(mut host) => {
+                if let Some(ep) = host.http_room_endpoint.take() {
+                    http_close_target = Some((ep, host.room_code.clone()));
+                }
                 let _ = host.shutdown_tx.send(true);
                 for client in host.clients.values() {
                     let _ = client.tx.send(ServerMessage::RoomClosed {
@@ -2492,6 +2533,20 @@ impl PartyManager {
             }
         }
         drop(mode);
+        if let Some((endpoint, code)) = http_close_target {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(1800))
+                .build()
+                .unwrap_or_default();
+            let _ = client
+                .post(&endpoint)
+                .json(&json!({
+                    "action": "host_close",
+                    "room": code,
+                }))
+                .send()
+                .await;
+        }
         let snap = self.status().await;
         self.emit_snapshot(snap.clone());
         snap

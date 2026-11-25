@@ -3,7 +3,7 @@
 
 import { kvGetJson, kvSetJson, setCors } from "../lib/store.js";
 
-const ROOM_TTL_SECS = 60 * 60; // 1 hour idle expiry
+const ROOM_TTL_SECS = 120; // 2 min idle expiry (refreshed on every host_poll)
 const GUEST_STALE_MS = 25_000;
 
 function roomKey(code) {
@@ -14,6 +14,7 @@ function emptyRoom(code) {
   return {
     code,
     seq: 0,
+    closed: false,
     hostLastSeenMs: 0,
     guests: {},       // connId -> { lastSeenMs }
     hostInbox: [],    // [{ seq, event }]  (relayOpen, relayMessage, relayClose)
@@ -52,6 +53,7 @@ export default async function handler(req, res) {
     pruneGuests(room);
 
     if (action === "host_poll") {
+      room.closed = false;
       room.hostLastSeenMs = Date.now();
       const since = Number(body.since || 0);
       const events = room.hostInbox.filter((e) => e.seq > since);
@@ -78,6 +80,7 @@ export default async function handler(req, res) {
     }
 
     if (action === "host_send") {
+      room.closed = false;
       room.hostLastSeenMs = Date.now();
       const outgoing = Array.isArray(body.messages)
         ? body.messages
@@ -98,7 +101,35 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, seq: room.seq });
     }
 
+    if (action === "host_close") {
+      room.closed = true;
+      room.hostLastSeenMs = 0;
+      const closePayload = JSON.stringify({
+        type: "room_closed",
+        reason: "El host cerró la sesión",
+      });
+      for (const cid of Object.keys(room.guests || {})) {
+        room.seq += 1;
+        if (!room.guestInboxes[cid]) room.guestInboxes[cid] = [];
+        room.guestInboxes[cid].push({ seq: room.seq, payload: closePayload });
+      }
+      room.guests = {};
+      await kvSetJson(key, room, 60);
+      return res.status(200).json({ ok: true, closed: true });
+    }
+
     if (action === "guest_join") {
+      const hostOnline =
+        !room.closed &&
+        Number(room.hostLastSeenMs || 0) > 0 &&
+        (Date.now() - Number(room.hostLastSeenMs || 0)) <= GUEST_STALE_MS;
+      if (!hostOnline) {
+        return res.status(410).json({
+          ok: false,
+          hostOnline: false,
+          error: "La sesión ya no existe o el host cerró la sala.",
+        });
+      }
       const connId = String(body.connId || `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
       room.guests[connId] = { lastSeenMs: Date.now() };
       room.guestInboxes[connId] = [];
@@ -109,14 +140,31 @@ export default async function handler(req, res) {
         ok: true,
         connId,
         seq: room.seq,
-        hostOnline: (Date.now() - Number(room.hostLastSeenMs || 0)) <= GUEST_STALE_MS,
+        hostOnline: true,
       });
     }
 
     if (action === "guest_poll") {
       const connId = String(body.connId || "").trim();
+      const hostOnline =
+        !room.closed &&
+        Number(room.hostLastSeenMs || 0) > 0 &&
+        (Date.now() - Number(room.hostLastSeenMs || 0)) <= GUEST_STALE_MS;
+      if (!hostOnline) {
+        if (connId && room.guests[connId]) {
+          delete room.guests[connId];
+          delete room.guestInboxes[connId];
+          await kvSetJson(key, room, 60);
+        }
+        return res.status(200).json({
+          ok: true,
+          roomClosed: true,
+          seq: room.seq,
+          messages: [],
+        });
+      }
       if (!connId || !room.guests[connId]) {
-        return res.status(404).json({ error: "Guest connection not found" });
+        return res.status(404).json({ error: "Guest connection not found", roomClosed: true });
       }
       room.guests[connId].lastSeenMs = Date.now();
       const since = Number(body.since || 0);
@@ -135,6 +183,7 @@ export default async function handler(req, res) {
       await kvSetJson(key, room, ROOM_TTL_SECS);
       return res.status(200).json({
         ok: true,
+        roomClosed: false,
         seq: room.seq,
         messages: msgs.map((m) => m.payload),
       });

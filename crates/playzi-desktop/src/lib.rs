@@ -290,6 +290,7 @@ pub fn run() {
             let mut social_rx = runtime.social.subscribe();
             let app_social = app.handle().clone();
             let party_for_social = runtime.party.clone();
+            let social_for_join = runtime.social.clone();
             tauri::async_runtime::spawn(async move {
                 while let Ok(ev) = social_rx.recv().await {
                     match ev {
@@ -328,14 +329,19 @@ pub fn run() {
                                 invite: invite_url,
                                 room_code: Some(room_code),
                             };
-                            if let Err(err) = party_for_social.join_session(req).await {
-                                let _ = app_social.emit(
-                                    "social-notice",
-                                    serde_json::json!({
-                                        "level": "error",
-                                        "message": err.to_string(),
-                                    }),
-                                );
+                            match party_for_social.join_session(req).await {
+                                Ok(_) => {
+                                    social_for_join.force_clear_room_presence().await;
+                                }
+                                Err(err) => {
+                                    let _ = app_social.emit(
+                                        "social-notice",
+                                        serde_json::json!({
+                                            "level": "error",
+                                            "message": err.to_string(),
+                                        }),
+                                    );
+                                }
                             }
                         }
                     }
@@ -356,6 +362,28 @@ pub fn run() {
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static CLOSING: AtomicBool = AtomicBool::new(false);
+                if !CLOSING.swap(true, Ordering::SeqCst) {
+                    api.prevent_close();
+                    let app_handle = window.app_handle().clone();
+                    let win = window.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let runtime = app_handle.state::<AppRuntime>().inner().clone();
+                        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                            runtime.party.leave_or_stop().await;
+                            runtime.social.shutdown_notify().await;
+                        })
+                        .await;
+                        let _ = win.destroy();
+                    });
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::api_request,

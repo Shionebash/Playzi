@@ -15,7 +15,7 @@ use crate::error::{CoreError, Result};
 use crate::state::StateStore;
 
 pub const DEFAULT_YT_BASE_URL: &str = "https://www.youtube.com";
-const DEFAULT_WEB_CLIENT_VERSION: &str = "2.20250101.00.00";
+const DEFAULT_WEB_CLIENT_VERSION: &str = "2.20260401.00.00";
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(300);
@@ -42,6 +42,8 @@ pub struct MediaItem {
     pub members_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watched_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +319,7 @@ impl YouTubeClient {
             live,
             members_only: is_members_only_playability(&data),
             result_type: if is_short { Some("short".into()) } else { None },
+            watched_percent: None,
         };
 
         self.metadata_cache.set(trimmed.to_string(), item.clone());
@@ -420,13 +423,14 @@ impl YouTubeClient {
             page += 1;
         }
 
-        // Deprioritize recently watched videos (from local history) so refreshes surface fresh videos first.
+        // Filter out already-watched videos (from local history or YouTube's watched overlay)
+        // so recommendations keep surfacing fresh content instead of re-suggesting watched videos.
         let watched_ids: HashSet<String> = store
             .and_then(|st| st.read().ok())
             .map(|s| {
                 s.history
                     .iter()
-                    .take(100)
+                    .take(250)
                     .filter_map(|h| {
                         h.get("url")
                             .or_else(|| h.get("target"))
@@ -437,12 +441,13 @@ impl YouTubeClient {
             })
             .unwrap_or_default();
 
-        if !watched_ids.is_empty() && !merge_existing {
-            let (fresh, watched): (Vec<MediaItem>, Vec<MediaItem>) = items
-                .into_iter()
-                .partition(|item| !watched_ids.contains(&item.id));
+        let is_watched = |item: &MediaItem| -> bool {
+            watched_ids.contains(&item.id) || item.watched_percent.unwrap_or(0) >= 80
+        };
+
+        let fresh: Vec<MediaItem> = items.iter().filter(|item| !is_watched(item)).cloned().collect();
+        if !fresh.is_empty() {
             items = fresh;
-            items.extend(watched);
         }
 
         let mut combined: Vec<MediaItem> = Vec::new();
@@ -453,6 +458,10 @@ impl YouTubeClient {
                 if let Ok(guard) = st.read() {
                     for val in &guard.recommendations {
                         if let Ok(existing) = serde_json::from_value::<MediaItem>(val.clone()) {
+                            let is_mix = existing.result_type.as_deref().is_some_and(|t| t == "mix" || t == "playlist");
+                            if !is_mix && is_watched(&existing) {
+                                continue;
+                            }
                             if combined_ids.insert(existing.id.clone()) {
                                 combined.push(existing);
                             }
@@ -500,6 +509,7 @@ impl YouTubeClient {
         video_id: &str,
         event_type: &str,
         current_time: f64,
+        start_time: Option<f64>,
         duration: Option<f64>,
         cpn: &str,
         cookies: Option<&CookieJar>,
@@ -565,15 +575,23 @@ impl YouTubeClient {
         if event_type == "start" {
             if let Some(base_url) = tracking.playback_url.as_deref() {
                 if let Ok(mut parsed) = reqwest::Url::parse(base_url) {
+                    let existing_keys: HashSet<String> = parsed
+                        .query_pairs()
+                        .map(|(k, _)| k.into_owned())
+                        .collect();
                     {
                         let mut qp = parsed.query_pairs_mut();
                         qp.append_pair("cpn", &cpn_clean);
-                        qp.append_pair("ver", "2");
+                        if !existing_keys.contains("ver") {
+                            qp.append_pair("ver", "2");
+                        }
                         qp.append_pair("fmt", "251");
                         qp.append_pair("fs", "0");
                         qp.append_pair("rt", "0.5");
                         qp.append_pair("euri", "");
-                        qp.append_pair("el", "detailpage");
+                        if !existing_keys.contains("el") {
+                            qp.append_pair("el", "detailpage");
+                        }
                         qp.append_pair("c", "WEB");
                         qp.append_pair("cver", DEFAULT_WEB_CLIENT_VERSION);
                         qp.append_pair("hl", &self.hl);
@@ -601,8 +619,7 @@ impl YouTubeClient {
         if let Some(base_url) = tracking.watchtime_url.as_deref() {
             if let Ok(mut parsed) = reqwest::Url::parse(base_url) {
                 let state_str = match event_type {
-                    "ended" => "paused",
-                    "pause" => "paused",
+                    "ended" | "pause" => "paused",
                     _ => "playing",
                 };
                 let et_val = if event_type == "start" {
@@ -612,13 +629,21 @@ impl YouTubeClient {
                 };
                 let st_val = if event_type == "start" {
                     0.0
+                } else if let Some(st) = start_time {
+                    st.clamp(0.0, et_val)
                 } else {
                     (et_val - 15.0).max(0.0)
                 };
+                let existing_keys: HashSet<String> = parsed
+                    .query_pairs()
+                    .map(|(k, _)| k.into_owned())
+                    .collect();
                 {
                     let mut qp = parsed.query_pairs_mut();
                     qp.append_pair("cpn", &cpn_clean);
-                    qp.append_pair("ver", "2");
+                    if !existing_keys.contains("ver") {
+                        qp.append_pair("ver", "2");
+                    }
                     qp.append_pair("fmt", "251");
                     qp.append_pair("fs", "0");
                     qp.append_pair("rt", &format!("{:.1}", et_val.max(0.5)));
@@ -629,8 +654,10 @@ impl YouTubeClient {
                         qp.append_pair("len", &format!("{:.1}", len_secs));
                     }
                     qp.append_pair("state", state_str);
-                    qp.append_pair("final", if event_type == "ended" { "1" } else { "0" });
-                    qp.append_pair("el", "detailpage");
+                    qp.append_pair("final", if event_type == "ended" || event_type == "pause" { "1" } else { "0" });
+                    if !existing_keys.contains("el") {
+                        qp.append_pair("el", "detailpage");
+                    }
                     qp.append_pair("c", "WEB");
                     qp.append_pair("cver", DEFAULT_WEB_CLIENT_VERSION);
                     qp.append_pair("hl", &self.hl);
@@ -746,6 +773,7 @@ impl YouTubeClient {
                 live,
                 members_only: is_members_only_renderer(renderer),
                 result_type: None,
+                watched_percent: extract_watched_percent(renderer),
             });
             if items.len() >= limit.max(1) {
                 break;
@@ -1325,6 +1353,7 @@ fn parse_shorts_lockup(
         live: false,
         members_only: is_members_only_renderer(shorts),
         result_type: Some("short".into()),
+        watched_percent: extract_watched_percent(shorts),
     })
 }
 
@@ -1437,6 +1466,7 @@ fn parse_lockup_videos(data: &Value) -> Vec<MediaItem> {
             live,
             members_only: is_members_only_renderer(lockup),
             result_type: if is_short { Some("short".into()) } else { None },
+            watched_percent: extract_watched_percent(lockup),
         });
     }
     items
@@ -1634,6 +1664,7 @@ fn parse_recommended_mixes(data: &Value) -> Vec<MediaItem> {
             live: false,
             members_only: false,
             result_type: Some(if is_mix { "mix".into() } else { "playlist".into() }),
+            watched_percent: None,
         });
     }
 
@@ -1676,6 +1707,7 @@ fn parse_recommended_mixes(data: &Value) -> Vec<MediaItem> {
                 live: false,
                 members_only: false,
                 result_type: Some("mix".into()),
+                watched_percent: None,
             });
         }
     }
@@ -1712,6 +1744,7 @@ fn parse_channel_playlists(data: &Value) -> Vec<MediaItem> {
                 live: false,
                 members_only: false,
                 result_type: Some("playlist".into()),
+                watched_percent: None,
             });
         }
     }
@@ -1776,7 +1809,36 @@ fn parse_video_renderer(
         live,
         members_only: is_members_only_renderer(renderer),
         result_type: if is_short { Some("short".into()) } else { None },
+        watched_percent: extract_watched_percent(renderer),
     })
+}
+
+fn extract_watched_percent(node: &Value) -> Option<u8> {
+    for overlay in walk_renderers(node, "thumbnailOverlayResumePlaybackRenderer") {
+        if let Some(pct) = overlay.get("percentDurationWatched").and_then(Value::as_u64) {
+            if pct > 0 {
+                return Some(pct.min(100) as u8);
+            }
+        }
+    }
+    for overlay in walk_renderers(node, "thumbnailBottomOverlayViewModel") {
+        if let Some(pct) = overlay
+            .pointer("/progressBar/percentDurationWatched")
+            .and_then(Value::as_u64)
+        {
+            if pct > 0 {
+                return Some(pct.min(100) as u8);
+            }
+        }
+    }
+    for overlay in walk_renderers(node, "thumbnailOverlayProgressBarViewModel") {
+        if let Some(pct) = overlay.get("startPercent").and_then(Value::as_u64) {
+            if pct > 0 {
+                return Some(pct.min(100) as u8);
+            }
+        }
+    }
+    None
 }
 
 fn is_short_renderer(node: &Value) -> bool {
@@ -2314,6 +2376,7 @@ mod tests {
         assert_eq!(lockups.len(), 1);
         assert_eq!(lockups[0].duration, Some(14 * 60 + 27));
         assert_eq!(lockups[0].duration_text, "14:27");
+        assert_eq!(lockups[0].watched_percent, Some(40));
 
         let overlay_only_renderer = json!({
             "videoId": "xyz98765432",
