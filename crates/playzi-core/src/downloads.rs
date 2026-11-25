@@ -342,9 +342,10 @@ impl DownloadManager {
             output_template.to_string(),
         ];
 
-        if !cfg.ffmpeg_path.trim().is_empty() {
+        let ffmpeg_bin = crate::player::discover_ffmpeg_binary(&cfg.ffmpeg_path, &cfg.root);
+        if !ffmpeg_bin.trim().is_empty() {
             args.push("--ffmpeg-location".to_string());
-            args.push(cfg.ffmpeg_path.clone());
+            args.push(ffmpeg_bin);
         }
 
         if kind == "audio" {

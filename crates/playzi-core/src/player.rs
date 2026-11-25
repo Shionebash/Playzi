@@ -1863,11 +1863,19 @@ pub fn resolve_player_binary(backend: PlayerBackend, configured: &str, root: &Pa
         }
     }
 
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+
     let mut candidates: Vec<PathBuf> = Vec::new();
     match backend {
         PlayerBackend::Mpv => {
             #[cfg(windows)]
             {
+                if let Some(dir) = &exe_dir {
+                    candidates.push(dir.join("bin").join("mpv.exe"));
+                    candidates.push(dir.join("mpv.exe"));
+                }
                 candidates.push(root.join("bin").join("mpv.exe"));
                 candidates.push(PathBuf::from(r"C:\Program Files\MPV Player\mpv.exe"));
                 candidates.push(PathBuf::from(r"C:\Program Files (x86)\MPV Player\mpv.exe"));
@@ -1875,6 +1883,9 @@ pub fn resolve_player_binary(backend: PlayerBackend, configured: &str, root: &Pa
                 if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
                     candidates.push(PathBuf::from(&local_app_data).join("Programs").join("mpv").join("mpv.exe"));
                     candidates.push(PathBuf::from(&local_app_data).join("Microsoft").join("WinGet").join("Links").join("mpv.exe"));
+                    if let Some(winget_mpv) = find_winget_package_exe(&local_app_data, "mpv", "mpv.exe") {
+                        candidates.push(winget_mpv);
+                    }
                 }
                 if let Ok(user_profile) = std::env::var("USERPROFILE") {
                     candidates.push(PathBuf::from(&user_profile).join("scoop").join("shims").join("mpv.exe"));
@@ -1882,6 +1893,10 @@ pub fn resolve_player_binary(backend: PlayerBackend, configured: &str, root: &Pa
             }
             #[cfg(not(windows))]
             {
+                if let Some(dir) = &exe_dir {
+                    candidates.push(dir.join("bin").join("mpv"));
+                    candidates.push(dir.join("mpv"));
+                }
                 candidates.push(root.join("bin").join("mpv"));
                 candidates.push(PathBuf::from("/usr/bin/mpv"));
                 candidates.push(PathBuf::from("/usr/local/bin/mpv"));
@@ -1891,12 +1906,20 @@ pub fn resolve_player_binary(backend: PlayerBackend, configured: &str, root: &Pa
         PlayerBackend::Vlc => {
             #[cfg(windows)]
             {
+                if let Some(dir) = &exe_dir {
+                    candidates.push(dir.join("bin").join("vlc.exe"));
+                    candidates.push(dir.join("vlc.exe"));
+                }
                 candidates.push(root.join("bin").join("vlc.exe"));
                 candidates.push(PathBuf::from(r"C:\Program Files\VideoLAN\VLC\vlc.exe"));
                 candidates.push(PathBuf::from(r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"));
             }
             #[cfg(not(windows))]
             {
+                if let Some(dir) = &exe_dir {
+                    candidates.push(dir.join("bin").join("vlc"));
+                    candidates.push(dir.join("vlc"));
+                }
                 candidates.push(root.join("bin").join("vlc"));
                 candidates.push(PathBuf::from("/usr/bin/vlc"));
                 candidates.push(PathBuf::from("/usr/local/bin/vlc"));
@@ -1968,6 +1991,41 @@ fn resolve_explicit_binary_path(
     None
 }
 
+#[cfg(windows)]
+fn find_winget_package_exe(local_app_data: &str, name_substr: &str, exe_name: &str) -> Option<PathBuf> {
+    let winget_pkgs = PathBuf::from(local_app_data)
+        .join("Microsoft")
+        .join("WinGet")
+        .join("Packages");
+    let entries = std::fs::read_dir(&winget_pkgs).ok()?;
+    let needle = name_substr.to_ascii_lowercase();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !name.contains(&needle) {
+            continue;
+        }
+        let dir = entry.path();
+        let direct = dir.join(exe_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if let Ok(sub_entries) = std::fs::read_dir(&dir) {
+            for sub in sub_entries.flatten() {
+                let sub_path = sub.path();
+                let nested = sub_path.join(exe_name);
+                if nested.is_file() {
+                    return Some(nested);
+                }
+                let nested_bin = sub_path.join("bin").join(exe_name);
+                if nested_bin.is_file() {
+                    return Some(nested_bin);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn discover_ytdlp_binary(root: &Path) -> String {
     let venv_candidate = if cfg!(windows) {
         root.join(".venv").join("Scripts").join("yt-dlp.exe")
@@ -1980,6 +2038,14 @@ pub fn discover_ytdlp_binary(root: &Path) -> String {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            let sidecar_bin = if cfg!(windows) {
+                dir.join("bin").join("yt-dlp.exe")
+            } else {
+                dir.join("bin").join("yt-dlp")
+            };
+            if sidecar_bin.is_file() {
+                return sidecar_bin.to_string_lossy().to_string();
+            }
             let sidecar = if cfg!(windows) {
                 dir.join("yt-dlp.exe")
             } else {
@@ -1989,6 +2055,15 @@ pub fn discover_ytdlp_binary(root: &Path) -> String {
                 return sidecar.to_string_lossy().to_string();
             }
         }
+    }
+
+    let root_bin = if cfg!(windows) {
+        root.join("bin").join("yt-dlp.exe")
+    } else {
+        root.join("bin").join("yt-dlp")
+    };
+    if root_bin.is_file() {
+        return root_bin.to_string_lossy().to_string();
     }
 
     if binary_exists("yt-dlp") {
@@ -2008,27 +2083,8 @@ pub fn discover_ytdlp_binary(root: &Path) -> String {
                     return cand.to_string_lossy().to_string();
                 }
             }
-            let winget_pkgs = base.join("Microsoft").join("WinGet").join("Packages");
-            if let Ok(entries) = std::fs::read_dir(&winget_pkgs) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                    if !name.contains("yt-dlp") {
-                        continue;
-                    }
-                    let dir = entry.path();
-                    let direct = dir.join("yt-dlp.exe");
-                    if direct.is_file() {
-                        return direct.to_string_lossy().to_string();
-                    }
-                    if let Ok(sub_entries) = std::fs::read_dir(&dir) {
-                        for sub in sub_entries.flatten() {
-                            let nested = sub.path().join("yt-dlp.exe");
-                            if nested.is_file() {
-                                return nested.to_string_lossy().to_string();
-                            }
-                        }
-                    }
-                }
+            if let Some(winget_exe) = find_winget_package_exe(&local_app_data, "yt-dlp", "yt-dlp.exe") {
+                return winget_exe.to_string_lossy().to_string();
             }
         }
         if let Ok(profile) = std::env::var("USERPROFILE") {
@@ -2044,6 +2100,101 @@ pub fn discover_ytdlp_binary(root: &Path) -> String {
     }
 
     "yt-dlp".into()
+}
+
+pub fn discover_ffmpeg_binary(configured: &str, root: &Path) -> String {
+    let trimmed = configured
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+
+    if !trimmed.is_empty() {
+        let raw = PathBuf::from(trimmed);
+        if raw.is_file() {
+            return raw.to_string_lossy().to_string();
+        }
+        if raw.is_relative() {
+            let rel = root.join(&raw);
+            if rel.is_file() {
+                return rel.to_string_lossy().to_string();
+            }
+        }
+        if looks_like_explicit_path(trimmed) {
+            return trimmed.to_string();
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower != "ffmpeg" && lower != "ffmpeg.exe" && binary_exists(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sidecar_bin = if cfg!(windows) {
+                dir.join("bin").join("ffmpeg.exe")
+            } else {
+                dir.join("bin").join("ffmpeg")
+            };
+            if sidecar_bin.is_file() {
+                return sidecar_bin.to_string_lossy().to_string();
+            }
+            let sidecar = if cfg!(windows) {
+                dir.join("ffmpeg.exe")
+            } else {
+                dir.join("ffmpeg")
+            };
+            if sidecar.is_file() {
+                return sidecar.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    let root_bin = if cfg!(windows) {
+        root.join("bin").join("ffmpeg.exe")
+    } else {
+        root.join("bin").join("ffmpeg")
+    };
+    if root_bin.is_file() {
+        return root_bin.to_string_lossy().to_string();
+    }
+
+    if binary_exists("ffmpeg") {
+        return "ffmpeg".into();
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let link = PathBuf::from(&local_app_data)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("ffmpeg.exe");
+            if link.is_file() {
+                return link.to_string_lossy().to_string();
+            }
+            if let Some(winget_exe) = find_winget_package_exe(&local_app_data, "ffmpeg", "ffmpeg.exe") {
+                return winget_exe.to_string_lossy().to_string();
+            }
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let scoop = PathBuf::from(profile).join("scoop").join("shims").join("ffmpeg.exe");
+            if scoop.is_file() {
+                return scoop.to_string_lossy().to_string();
+            }
+        }
+        let choco = PathBuf::from(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe");
+        if choco.is_file() {
+            return choco.to_string_lossy().to_string();
+        }
+    }
+
+    if trimmed.is_empty() {
+        "ffmpeg".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub fn binary_exists(bin: &str) -> bool {

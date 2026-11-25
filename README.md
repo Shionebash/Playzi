@@ -6,7 +6,6 @@ Aplicacion de escritorio nativa en **Rust** y **Tauri v2** para explorar, reprod
 
 Descarga el instalador para Windows x64 desde la seccion de Releases:
 
-- **Ultima version (`v1.0.0`)**: [Playzi_1.0.0_x64-setup.exe](https://github.com/Shionebash/Playzi/releases/download/v1.0.0/Playzi_1.0.0_x64-setup.exe)
 - **Todas las releases**: https://github.com/Shionebash/Playzi/releases
 
 ---
@@ -30,12 +29,14 @@ Descarga el instalador para Windows x64 desde la seccion de Releases:
 
 ### Para ejecutar la app instalada
 
+El instalador de Windows (`.exe` NSIS) verifica e instala automaticamente los requisitos obligatorios (`yt-dlp` y `ffmpeg`) junto con la aplicacion, y te permite elegir durante la instalacion si deseas instalar **MPV** y/o **VLC** como reproductores externos opcionales.
+
 | Herramienta | Requerido | Notas |
 |-------------|-----------|-------|
 | Windows 10/11 (x64) | Si | Incluye WebView2 para la ventana nativa |
-| `yt-dlp` | Si | Resolucion de streams y descargas |
-| `ffmpeg` | Si | Conversion y mezcla de audio/video |
-| `mpv` / `vlc` | Opcional | Solo si deseas reproducir en un reproductor externo |
+| `yt-dlp` | Si | Se instala automaticamente con el instalador (resolucion de streams y descargas) |
+| `ffmpeg` | Si | Se instala automaticamente con el instalador (conversion y mezcla de audio/video) |
+| `mpv` / `vlc` | Opcional | Seleccionable durante la instalacion mediante `winget` (reproductor externo) |
 
 ### Para compilar desde el codigo fuente
 
@@ -68,10 +69,10 @@ cd crates\playzi-desktop
 npx @tauri-apps/cli@2 build --bundles nsis
 ```
 
-El instalador generado quedara en:
+El instalador generado quedara en (reemplazando `<version>` por la version actual del proyecto, por ejemplo `1.0.5`):
 
 ```text
-target/release/bundle/nsis/Playzi_1.0.0_x64-setup.exe
+target/release/bundle/nsis/Playzi_<version>_x64-setup.exe
 ```
 
 Para generar los paquetes nativos de tu plataforma actual:
@@ -115,7 +116,7 @@ El proyecto esta organizado como un **Cargo Workspace** en Rust:
 
 ```text
 Playzi/
-├── Cargo.toml                  # Workspace principal de Rust (v1.0.0)
+├── Cargo.toml                  # Workspace principal de Rust
 ├── crates/
 │   ├── playzi-core/            # Logica de negocio y persistencia en Rust
 │   │   └── src/
@@ -134,6 +135,7 @@ Playzi/
 │   │       └── ytmusic.rs      # Integracion con YouTube Music
 │   └── playzi-desktop/         # App de escritorio Tauri v2
 │       ├── tauri.conf.json     # Configuracion de ventana y bundle NSIS
+│       ├── nsis/               # Hooks NSIS e instalador de requisitos (yt-dlp, ffmpeg, MPV/VLC)
 │       ├── build.rs            # Empaquetado de assets de static/ en dist/
 │       └── src/
 │           ├── main.rs         # Punto de entrada Windows/Desktop
