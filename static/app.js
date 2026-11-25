@@ -1879,7 +1879,7 @@ function renderConfig() {
                 const label = d.globalName || d.username || "Conectado";
                 return `<span class="party-pill party-pill--ok">Conectado: ${escapeHtml(label)}</span>`;
               }
-              if (!(c.discordClientId || "").trim()) return `<span class="party-pill party-pill--warn">Falta Client ID</span>`;
+              if (d.configured === false) return `<span class="party-pill party-pill--warn">No disponible</span>`;
               return `<span class="party-pill party-pill--warn">Desconectado</span>`;
             })()}
             <button class="btn btn-ghost" type="button" data-discord-reconnect="1" style="padding:4px 10px;font-size:.78rem">Reconectar</button>
@@ -1907,9 +1907,6 @@ function renderConfig() {
               <div class="config-toggle-title">Mostrar sala activa y permitir invitaciones / solicitudes de unión</div>
               <div class="config-toggle-sub">Muestra que estás en una sala con tus amigos, habilita el botón de invitar (+) en Discord y permite recibir solicitudes de "Pedir unirse".</div>
             </div>
-          </label>
-          <label>Discord Application Client ID
-            <input class="form-input" name="discordClientId" value="${escapeHtml(c.discordClientId || "")}" placeholder="Ej. 1234567890123456789 (desde Discord Developer Portal)">
           </label>
         </div>
       </div>
@@ -4473,7 +4470,6 @@ function bindEvents() {
         discordEnabled: form.get("discordEnabled") === "on",
         discordShowMedia: form.get("discordShowMedia") === "on",
         discordShowParty: form.get("discordShowParty") === "on",
-        discordClientId: String(form.get("discordClientId") || "").trim(),
       };
       try {
         const savedConfig = await api.post("/api/config", submittedConfig);
@@ -6172,6 +6168,7 @@ function renderParty() {
           <button class="btn btn-primary" type="button" data-party-action="send-friend-request" ${hubConnected ? "" : "disabled"}>Enviar solicitud</button>
         </div>
         ${!hubConnected ? `<div class="muted" style="font-size:.8rem">Los amigos funcionan online. ${hubConfigured ? "Reconectando con el servidor..." : "Configura la URL del servidor en Opciones avanzadas."}</div>` : ""}
+        ${!hubConnected && hubConfigured && social.lastError ? `<div class="muted" style="font-size:.78rem;color:#fbbf24">${escapeHtml(social.lastError)}</div>` : ""}
 
         ${outgoingFriendReqs.length ? `
           <div class="party-list" style="margin-top:4px">

@@ -35,10 +35,10 @@ pub const DEFAULT_SOCIAL_HUB_URL: &str = match option_env!("PLAYZI_BUILT_SOCIAL_
     None => "",
 };
 
-/// Built-in default Discord Application Client ID injected at compile time from `DISCORD_CLIENT_ID`.
+/// Built-in default Discord Application Client ID (overridable at compile time via `DISCORD_CLIENT_ID`).
 pub const DEFAULT_DISCORD_CLIENT_ID: &str = match option_env!("PLAYZI_BUILT_DISCORD_CLIENT_ID") {
-    Some(id) => id,
-    None => "",
+    Some(id) if !id.is_empty() => id,
+    _ => "1575271006732423219",
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,7 +68,6 @@ pub struct PublicConfig {
     pub discord_enabled: bool,
     pub discord_show_media: bool,
     pub discord_show_party: bool,
-    pub discord_client_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,7 +88,6 @@ pub struct ConfigUpdate {
     pub discord_enabled: Option<bool>,
     pub discord_show_media: Option<bool>,
     pub discord_show_party: Option<bool>,
-    pub discord_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +254,6 @@ impl AppConfig {
             discord_enabled: self.discord_enabled,
             discord_show_media: self.discord_show_media,
             discord_show_party: self.discord_show_party,
-            discord_client_id: self.discord_client_id.clone(),
         }
     }
 }
@@ -338,9 +335,6 @@ impl ConfigStore {
                 "DISCORD_SHOW_PARTY".to_string(),
                 if v { "true" } else { "false" }.to_string(),
             );
-        }
-        if let Some(v) = patch.discord_client_id {
-            env_map.insert("DISCORD_CLIENT_ID".to_string(), v.trim().to_string());
         }
 
         write_env_map(&cfg.env_file, &env_map)?;

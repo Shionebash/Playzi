@@ -331,7 +331,7 @@ impl DiscordManager {
                     guard.last_error = if !cfg.discord_enabled {
                         String::new()
                     } else {
-                        "Falta configurar Discord Client ID en Configuración.".to_string()
+                        "Discord Client ID no configurado en la aplicación.".to_string()
                     };
                 }
                 self.emit_state().await;
@@ -411,7 +411,7 @@ impl DiscordManager {
             let msg = ready_val
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("Discord cerró la conexión (verifica el Client ID).");
+                .unwrap_or("Discord cerró la conexión.");
             return Err(msg.to_string());
         }
 

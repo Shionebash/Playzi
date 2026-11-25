@@ -613,6 +613,7 @@ impl SocialManager {
         let mut reconnect_rx = self.inner.reconnect_tx.subscribe();
 
         tokio::spawn(async move {
+            let mut http_backoff_secs = 6u64;
             loop {
                 let raw_hub = manager.inner.config.snapshot().social_hub_url;
                 let Some(ws_base) = normalize_hub_ws_base(&raw_hub) else {
@@ -661,6 +662,7 @@ impl SocialManager {
 
                     match initial_res {
                         Ok(resp) if resp.status().is_success() => {
+                            http_backoff_secs = 6;
                             let body = resp.json::<Value>().await.ok();
                             let published_room = {
                                 let mut rt = manager.inner.runtime.write().await;
@@ -681,18 +683,35 @@ impl SocialManager {
                             }));
                         }
                         Ok(resp) => {
+                            let status = resp.status();
+                            let err_detail = resp
+                                .json::<Value>()
+                                .await
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error")
+                                        .and_then(Value::as_str)
+                                        .map(|s| s.trim().to_string())
+                                })
+                                .filter(|s| !s.is_empty());
                             {
                                 let mut rt = manager.inner.runtime.write().await;
                                 rt.connected = false;
                                 rt.hub_url = raw_hub.clone();
                                 rt.outbound_tx = None;
-                                rt.last_error = format!("Hub Social HTTP error ({})", resp.status());
+                                rt.last_error = match err_detail {
+                                    Some(detail) => format!("Hub Social HTTP {status}: {detail}"),
+                                    None => format!("Hub Social HTTP error ({status})"),
+                                };
                             }
                             manager.emit_snapshot().await;
+                            let wait_secs = http_backoff_secs;
+                            http_backoff_secs = (http_backoff_secs * 2).min(30);
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(6)) => {}
+                                _ = tokio::time::sleep(Duration::from_secs(wait_secs)) => {}
                                 res = reconnect_rx.changed() => {
                                     if res.is_err() { break; }
+                                    http_backoff_secs = 6;
                                 }
                             }
                             continue;
@@ -706,17 +725,20 @@ impl SocialManager {
                                 rt.last_error = format!("No se pudo conectar al Hub Social (Vercel): {e}");
                             }
                             manager.emit_snapshot().await;
+                            let wait_secs = http_backoff_secs;
+                            http_backoff_secs = (http_backoff_secs * 2).min(30);
                             tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(6)) => {}
+                                _ = tokio::time::sleep(Duration::from_secs(wait_secs)) => {}
                                 res = reconnect_rx.changed() => {
                                     if res.is_err() { break; }
+                                    http_backoff_secs = 6;
                                 }
                             }
                             continue;
                         }
                     }
 
-                    let mut poll_interval = tokio::time::interval(Duration::from_secs(3));
+                    let mut poll_interval = tokio::time::interval(Duration::from_secs(10));
                     poll_interval.tick().await;
                     let mut consecutive_errors = 0u32;
 

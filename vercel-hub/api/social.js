@@ -4,9 +4,9 @@
 import { kvDel, kvGetJson, kvMGetJson, kvSetJson, normalizeUserId, setCors } from "../lib/store.js";
 
 const STATE_KEY = "playzi:social:state:v1";
-const PRESENCE_TTL_SECS = 15;
+const PRESENCE_TTL_SECS = 35;
 const PRESENCE_TTL_MS = PRESENCE_TTL_SECS * 1000;
-const USER_ROOM_TTL_SECS = 30;
+const USER_ROOM_TTL_SECS = 45;
 const ROOM_HOST_STALE_MS = 20_000;
 const ROOM_STARTUP_GRACE_MS = 12_000;
 const NON_RELAY_ROOM_TTL_MS = 45_000;

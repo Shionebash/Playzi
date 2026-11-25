@@ -1,4 +1,4 @@
-import { isPersistentStorageConfigured, setCors } from "../lib/store.js";
+import { getStorageBackend, isPersistentStorageConfigured, setCors } from "../lib/store.js";
 
 export default function handler(req, res) {
   setCors(res);
@@ -10,6 +10,7 @@ export default function handler(req, res) {
     service: "playzi-vercel-hub",
     transport: "http",
     persistentStorage: isPersistentStorageConfigured(),
+    storageBackend: getStorageBackend(),
     endpoints: {
       health: "/api/health",
       social: "/api/social",

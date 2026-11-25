@@ -12,12 +12,15 @@ Only the `vercel-hub/` directory is deployed to Vercel — **do NOT upload the R
 - `vercel-hub/lib/store.js`
 
 ## Persistent Storage (Recommended for Production)
-Vercel Serverless Functions are stateless across cold starts, so add a free **Upstash Redis** database from the Vercel Marketplace (Storage -> Browse Marketplace -> Upstash Redis -> Connect to Project).
-Vercel will automatically inject:
-- `UPSTASH_REDIS_REST_URL`
-- `UPSTASH_REDIS_REST_TOKEN`
+Vercel Serverless Functions are stateless across cold starts, so connect a free **Turso (SQLite)** database (500M reads/month + 10M writes/month free, no card required):
+1. Create a free database at [turso.tech](https://turso.tech).
+2. Copy its database URL (`libsql://...`) and generate an auth token (Read & Write).
+3. In Vercel -> Project -> **Settings -> Environment Variables**, add:
+   - `TURSO_DATABASE_URL`
+   - `TURSO_AUTH_TOKEN`
+4. Redeploy. The `playzi_kv` table is created automatically on first request, and `/api/health` will report `"storageBackend": "turso"`.
 
-(If not set, the hub falls back to in-memory storage, which is only suitable for local testing.)
+(Upstash Redis via `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` is also supported as a fallback; if neither is set, the hub falls back to in-memory storage for local testing.)
 
 ## Deploy Steps
 
