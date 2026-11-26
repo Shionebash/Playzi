@@ -569,12 +569,15 @@ async fn downloads_queue_semaphore_progress_and_cancellation() {
         "out.%(ext)s",
     );
     assert!(video_args.iter().any(|a| a.contains("height<=720")));
+    assert!(video_args.contains(&"--cache-dir".to_string()));
+    assert!(video_args.contains(&"youtube:player_client=web_safari,default".to_string()));
 
     let audio_args = manager.build_ytdlp_args(
         &json!({"kind": "audio", "url": "https://youtu.be/dQw4w9WgXcQ"}),
         "out.%(ext)s",
     );
     assert!(audio_args.contains(&"--audio-format".to_string()));
+    assert!(audio_args.contains(&"youtube:player_client=web_safari,default".to_string()));
 
     let mut rx = manager.subscribe();
     let job = manager

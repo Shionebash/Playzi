@@ -210,6 +210,7 @@ def _ydl_options(job: dict[str, Any], out_tmpl: str, cancel_event: threading.Eve
         "writeinfojson": True,
         "ffmpeg_location": config.FFMPEG_PATH,
         "progress_hooks": [_progress_hook(job["id"], cancel_event)],
+        "extractor_args": {"youtube": {"player_client": ["web_safari", "default"]}},
         **javascript_runtime_opts(),
     }
     if job["kind"] == "audio":

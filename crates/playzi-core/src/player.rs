@@ -1000,7 +1000,7 @@ pub fn build_vlc_args(
 }
 
 /// Auto-detects a supported JavaScript runtime (`node`, `deno`, `bun`) for `yt-dlp` YouTube EJS solving.
-fn resolve_js_runtime() -> Option<(String, String)> {
+pub fn resolve_js_runtime() -> Option<(String, String)> {
     let candidates: Vec<(&str, PathBuf)> = {
         let mut list = Vec::new();
         #[cfg(windows)]

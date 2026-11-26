@@ -71,6 +71,12 @@ pub struct ProgressUpdate {
     pub finished: bool,
 }
 
+enum YtdlpAttemptOutcome {
+    Success(Option<PathBuf>),
+    Cancelled,
+    Failed(String),
+}
+
 #[derive(Clone)]
 pub struct DownloadManager {
     state: StateStore,
@@ -326,14 +332,35 @@ impl DownloadManager {
     /// Builds `yt-dlp` CLI arguments for a download job.
     pub fn build_ytdlp_args(&self, job: &Value, output_template: &str) -> Vec<String> {
         let cfg = self.config.snapshot();
+        let store = CookieStore::new(&cfg.root, &cfg.data_dir);
+        let configured = if cfg.cookies_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.cookies_file.as_str())
+        };
+        let cookie_file = store.resolve_cookie_file(configured).ok();
+        self.build_ytdlp_args_with_cookies(job, output_template, cookie_file.as_deref())
+    }
+
+    /// Builds `yt-dlp` CLI arguments with an explicit optional cookies file.
+    pub fn build_ytdlp_args_with_cookies(
+        &self,
+        job: &Value,
+        output_template: &str,
+        cookie_file: Option<&Path>,
+    ) -> Vec<String> {
+        let cfg = self.config.snapshot();
         let kind = job.get("kind").and_then(Value::as_str).unwrap_or("video");
         let url = job.get("url").and_then(Value::as_str).unwrap_or("");
+        let cache_dir = cfg.data_dir.join("ytdlp_cache");
 
         let mut args = vec![
             "--newline".to_string(),
             "--no-playlist".to_string(),
             "--write-thumbnail".to_string(),
             "--write-info-json".to_string(),
+            "--cache-dir".to_string(),
+            cache_dir.to_string_lossy().to_string(),
             "--progress-template".to_string(),
             "download:PLAYZI_PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"
                 .to_string(),
@@ -342,6 +369,18 @@ impl DownloadManager {
             "-o".to_string(),
             output_template.to_string(),
         ];
+
+        if let Some((rt_name, rt_path)) = crate::player::resolve_js_runtime() {
+            args.push("--js-runtimes".to_string());
+            args.push(format!("{rt_name}:{rt_path}"));
+            args.push("--remote-components".to_string());
+            args.push("ejs:github".to_string());
+        }
+
+        if source_for_url(url) == "youtube" {
+            args.push("--extractor-args".to_string());
+            args.push("youtube:player_client=web_safari,default".to_string());
+        }
 
         let ffmpeg_bin = crate::player::discover_ffmpeg_binary(&cfg.ffmpeg_path, &cfg.root);
         if !ffmpeg_bin.trim().is_empty() {
@@ -371,15 +410,9 @@ impl DownloadManager {
             args.push("mp4".to_string());
         }
 
-        let store = CookieStore::new(&cfg.root, &cfg.data_dir);
-        let configured = if cfg.cookies_file.trim().is_empty() {
-            None
-        } else {
-            Some(cfg.cookies_file.as_str())
-        };
-        if let Ok(cookie_file) = store.resolve_cookie_file(configured) {
+        if let Some(cf) = cookie_file {
             args.push("--cookies".to_string());
-            args.push(cookie_file.to_string_lossy().to_string());
+            args.push(cf.to_string_lossy().to_string());
         }
 
         args.push(url.to_string());
@@ -433,31 +466,110 @@ impl DownloadManager {
             .join("%(title).180B [%(id)s].%(ext)s")
             .to_string_lossy()
             .to_string();
-        let args = self.build_ytdlp_args(&job, &out_tmpl);
 
+        let store = CookieStore::new(&cfg.root, &cfg.data_dir);
+        let configured = if cfg.cookies_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.cookies_file.as_str())
+        };
+        let cookie_file = store.resolve_cookie_file(configured).ok();
+        let url = job.get("url").and_then(Value::as_str).unwrap_or("");
+        let is_youtube = source_for_url(url) == "youtube";
+
+        // For YouTube, try unauthenticated web_safari/default first to avoid SABR-only
+        // account restrictions that drop formats; fall back to cookies when sign-in is required.
+        let first_cookie = if is_youtube {
+            None
+        } else {
+            cookie_file.as_deref()
+        };
+        let first_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, first_cookie);
+        let mut outcome = self.run_ytdlp_once(&job_id, &first_args, &mut cancel_rx).await;
+
+        if is_youtube {
+            if let (YtdlpAttemptOutcome::Failed(_), Some(cf)) = (&outcome, cookie_file.as_deref()) {
+                let _ = self.patch_job(&job_id, "starting", Some(0.0), "", "", "", None);
+                let auth_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, Some(cf));
+                outcome = self.run_ytdlp_once(&job_id, &auth_args, &mut cancel_rx).await;
+            }
+        }
+
+        match outcome {
+            YtdlpAttemptOutcome::Success(final_path) => {
+                let resolved_path = final_path.unwrap_or_else(|| out_dir.clone());
+                let kind = job.get("kind").and_then(Value::as_str).unwrap_or("video");
+                let format_label = if kind == "audio" {
+                    if cfg.audio_format.eq_ignore_ascii_case("mp3") {
+                        "MP3"
+                    } else {
+                        "OPUS"
+                    }
+                } else {
+                    "MP4"
+                };
+
+                let now = now_timestamp();
+                let library_item = json!({
+                    "id": job_id,
+                    "url": job.get("url").cloned().unwrap_or(Value::Null),
+                    "title": job.get("title").cloned().unwrap_or(Value::Null),
+                    "channel": job.get("channel").cloned().unwrap_or(Value::Null),
+                    "thumbnail": job.get("thumbnail").cloned().unwrap_or(Value::Null),
+                    "kind": kind,
+                    "format": format_label,
+                    "quality": job.get("quality").cloned().unwrap_or(Value::Null),
+                    "collection": collection,
+                    "durationText": "--:--",
+                    "path": resolved_path.to_string_lossy().to_string(),
+                    "mediaUrl": media_url(&resolved_path, &cfg.media_root),
+                    "size": size_text(&resolved_path),
+                    "createdAt": now,
+                });
+
+                let path_str = resolved_path.to_string_lossy().to_string();
+                let _ = self.finish_job(&job_id, library_item, &path_str);
+            }
+            YtdlpAttemptOutcome::Cancelled => {
+                let _ = self.patch_job(
+                    &job_id,
+                    "cancelled",
+                    None,
+                    "",
+                    "",
+                    "Cancelado por el usuario",
+                    None,
+                );
+            }
+            YtdlpAttemptOutcome::Failed(msg) => {
+                let _ = self.patch_job(&job_id, "error", None, "", "", &msg, None);
+            }
+        }
+
+        self.cleanup_canceller(&job_id);
+    }
+
+    async fn run_ytdlp_once(
+        &self,
+        job_id: &str,
+        args: &[String],
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> YtdlpAttemptOutcome {
         let mut cmd = Command::new(&self.ytdlp_bin);
-        cmd.args(&args)
+        cmd.args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);
 
-        let mut child = match cmd.spawn()
-        {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(err) => {
-                let _ = self.patch_job(
-                    &job_id,
-                    "error",
-                    None,
-                    "",
-                    "",
-                    &format!("Failed to launch {}: {err}", self.ytdlp_bin),
-                    None,
-                );
-                self.cleanup_canceller(&job_id);
-                return;
+                return YtdlpAttemptOutcome::Failed(format!(
+                    "Failed to launch {}: {err}",
+                    self.ytdlp_bin
+                ));
             }
         };
 
@@ -503,7 +615,7 @@ impl DownloadManager {
                                 } else if let Some(prog) = parse_progress_line(&line) {
                                     if prog.finished {
                                         let _ = self.patch_job(
-                                            &job_id,
+                                            job_id,
                                             "processing",
                                             Some(99.0),
                                             "",
@@ -513,7 +625,7 @@ impl DownloadManager {
                                         );
                                     } else {
                                         let _ = self.patch_job(
-                                            &job_id,
+                                            job_id,
                                             "downloading",
                                             Some(prog.progress),
                                             &prog.speed,
@@ -538,68 +650,18 @@ impl DownloadManager {
         }
 
         if cancelled || *cancel_rx.borrow() {
-            let _ = self.patch_job(
-                &job_id,
-                "cancelled",
-                None,
-                "",
-                "",
-                "Cancelado por el usuario",
-                None,
-            );
-            self.cleanup_canceller(&job_id);
-            return;
+            return YtdlpAttemptOutcome::Cancelled;
         }
 
         match status {
-            Ok(exit) if exit.success() => {
-                let resolved_path = final_path.unwrap_or_else(|| out_dir.clone());
-                let kind = job.get("kind").and_then(Value::as_str).unwrap_or("video");
-                let format_label = if kind == "audio" {
-                    if cfg.audio_format.eq_ignore_ascii_case("mp3") {
-                        "MP3"
-                    } else {
-                        "OPUS"
-                    }
-                } else {
-                    "MP4"
-                };
-
-                let now = now_timestamp();
-                let library_item = json!({
-                    "id": job_id,
-                    "url": job.get("url").cloned().unwrap_or(Value::Null),
-                    "title": job.get("title").cloned().unwrap_or(Value::Null),
-                    "channel": job.get("channel").cloned().unwrap_or(Value::Null),
-                    "thumbnail": job.get("thumbnail").cloned().unwrap_or(Value::Null),
-                    "kind": kind,
-                    "format": format_label,
-                    "quality": job.get("quality").cloned().unwrap_or(Value::Null),
-                    "collection": collection,
-                    "durationText": "--:--",
-                    "path": resolved_path.to_string_lossy().to_string(),
-                    "mediaUrl": media_url(&resolved_path, &cfg.media_root),
-                    "size": size_text(&resolved_path),
-                    "createdAt": now,
-                });
-
-                let path_str = resolved_path.to_string_lossy().to_string();
-                let _ = self.finish_job(&job_id, library_item, &path_str);
-            }
-            Ok(exit) => {
-                let msg = if last_err_line.is_empty() {
-                    format!("yt-dlp exited with status {exit}")
-                } else {
-                    last_err_line
-                };
-                let _ = self.patch_job(&job_id, "error", None, "", "", &msg, None);
-            }
-            Err(err) => {
-                let _ = self.patch_job(&job_id, "error", None, "", "", &err.to_string(), None);
-            }
+            Ok(exit) if exit.success() => YtdlpAttemptOutcome::Success(final_path),
+            Ok(exit) => YtdlpAttemptOutcome::Failed(if last_err_line.is_empty() {
+                format!("yt-dlp exited with status {exit}")
+            } else {
+                last_err_line
+            }),
+            Err(err) => YtdlpAttemptOutcome::Failed(err.to_string()),
         }
-
-        self.cleanup_canceller(&job_id);
     }
 
     fn patch_job(
