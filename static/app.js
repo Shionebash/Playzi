@@ -378,6 +378,7 @@ function _formatTime(sec) {
 
 function _destroyPlayer() {
   _ambientStop();
+  _ambientClear();
   if (state.player._listenerAbort) {
     state.player._listenerAbort.abort();
     state.player._listenerAbort = null;
@@ -427,7 +428,6 @@ function setView(view) {
     view = "home";
   }
   if (state.view === "watch" && view !== "watch") {
-    _ambientStop();
     if (state.player.current) {
       // keep player alive — show mini player
       _showMiniPlayer();
@@ -442,7 +442,7 @@ function setView(view) {
   $(`#view-${view}`).classList.remove("hidden");
   $$(".nav-item[data-view]").forEach((el) => el.classList.toggle("active", el.dataset.view === view));
   render();
-  if (view === "watch") _syncAmbientState();
+  _syncAmbientState();
   _ensurePartyViewPolling();
   if (view === "party") {
     _syncPartyViewNow();
@@ -508,14 +508,25 @@ function _ambientIsEnabled() {
   return Boolean(state.player.ambientLight) && !_ambientPrefersReducedMotion();
 }
 
+function _ambientCanvasEl() {
+  return document.getElementById("ambientBackdrop");
+}
+
+function _ambientSetActive(active) {
+  const canvas = _ambientCanvasEl();
+  if (canvas) canvas.classList.toggle("is-active", Boolean(active));
+  document.body.classList.toggle("ambient-active", Boolean(active));
+}
+
 function _ambientClear() {
-  const canvas = document.getElementById("ambientCanvas");
-  if (!canvas) return;
-  canvas.classList.remove("is-active");
-  const ctx = canvas.getContext("2d");
-  if (ctx) {
-    ctx.globalAlpha = 1;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const canvas = _ambientCanvasEl();
+  _ambientSetActive(false);
+  if (canvas) {
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.globalAlpha = 1;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
   }
   _ambient.hasDrawnFrame = false;
   _ambient.fallbackThumbKey = "";
@@ -529,10 +540,10 @@ function _ambientStop() {
 }
 
 function _ambientDrawImage(img) {
-  const canvas = document.getElementById("ambientCanvas");
+  const canvas = _ambientCanvasEl();
   if (!canvas) return;
   if (!_ambientIsEnabled() || !img || !img.complete || img.naturalWidth === 0) {
-    canvas.classList.remove("is-active");
+    _ambientSetActive(false);
     return;
   }
   const ctx = canvas.getContext("2d", { alpha: false });
@@ -540,19 +551,19 @@ function _ambientDrawImage(img) {
   try {
     ctx.globalAlpha = 1;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    canvas.classList.add("is-active");
     _ambient.hasDrawnFrame = true;
+    _ambientSetActive(true);
   } catch (_) {
-    canvas.classList.remove("is-active");
+    _ambientSetActive(false);
   }
 }
 
 function _ambientDrawStaticThumb(url) {
-  const canvas = document.getElementById("ambientCanvas");
+  const canvas = _ambientCanvasEl();
   if (!canvas || !_ambientIsEnabled() || !url) return;
   const src = thumbSrc(url, false);
   if (!src || _ambient.fallbackThumbKey === src) {
-    if (_ambient.hasDrawnFrame) canvas.classList.add("is-active");
+    if (_ambient.hasDrawnFrame) _ambientSetActive(true);
     return;
   }
   _ambient.fallbackThumbKey = src;
@@ -567,13 +578,13 @@ function _ambientDrawStaticThumb(url) {
 }
 
 function _ambientTickVideo(immediate = false) {
-  const canvas = document.getElementById("ambientCanvas");
-  if (!canvas || !_ambientIsEnabled()) {
+  const canvas = _ambientCanvasEl();
+  if (!canvas || !_ambientIsEnabled() || !state.player.current) {
     _ambientStop();
-    if (canvas) canvas.classList.remove("is-active");
+    _ambientSetActive(false);
     return;
   }
-  if (state.view !== "watch" || document.hidden || document.fullscreenElement || state.player.native?.active) {
+  if (document.hidden || document.fullscreenElement || state.player.native?.active) {
     _ambientStop();
     return;
   }
@@ -591,7 +602,7 @@ function _ambientTickVideo(immediate = false) {
     ctx.globalAlpha = (immediate || !_ambient.hasDrawnFrame) ? 1 : 0.22;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     _ambient.hasDrawnFrame = true;
-    canvas.classList.add("is-active");
+    _ambientSetActive(true);
   } catch (_) {
     // Graceful fallback to static thumbnail if stream host blocks canvas read
     _ambient.corsBlocked = true;
@@ -601,14 +612,19 @@ function _ambientTickVideo(immediate = false) {
 }
 
 function _syncAmbientState() {
-  const canvas = document.getElementById("ambientCanvas");
-  if (!canvas) {
+  const canvas = _ambientCanvasEl();
+  if (!canvas || !state.player.current) {
     _ambientStop();
+    _ambientSetActive(false);
     return;
   }
-  if (!_ambientIsEnabled() || state.view !== "watch" || document.hidden || document.fullscreenElement || state.player.native?.active) {
+  if (!_ambientIsEnabled()) {
     _ambientStop();
-    if (!_ambientIsEnabled()) canvas.classList.remove("is-active");
+    _ambientSetActive(false);
+    return;
+  }
+  if (document.hidden || document.fullscreenElement || state.player.native?.active) {
+    _ambientStop();
     return;
   }
   const useMusicLayout = state.player.sourceContext === "music" || state.player.audioOnly;
@@ -626,6 +642,7 @@ function _syncAmbientState() {
   const video = player && !player.isDisposed() ? _getVideoMediaEl(player) : document.getElementById("webPlayerVideo");
   if (!video) {
     _ambientStop();
+    if (state.player.current?.thumbnail) _ambientDrawStaticThumb(state.player.current.thumbnail);
     return;
   }
   if (_ambient.corsBlocked) {
@@ -2205,7 +2222,6 @@ function _videoLayoutHtml() {
     <div class="watch-layout watch-layout--video">
       <div class="watch-main">
         <div class="watch-video-stage">
-          <canvas id="ambientCanvas" class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
           <div class="watch-video-wrap">
             <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline crossorigin="anonymous"></video>
             <div id="webPlayerOverlay" class="player-overlay" style="display:none">
@@ -2225,7 +2241,6 @@ function _musicLayoutHtml() {
     <div id="watch-party-bar"></div>
     <div class="watch-layout watch-layout--music">
       <div class="watch-main watch-main--music">
-        <canvas id="ambientCanvas" class="ambient-canvas ambient-canvas--music" width="24" height="24" aria-hidden="true"></canvas>
         <div class="music-player-card">
           <div class="music-art-wrap">
             <img id="musicArt" class="music-art" src="" alt="" crossorigin="anonymous" referrerpolicy="no-referrer" style="display:none"
@@ -3763,6 +3778,14 @@ async function ensureVideoPlayer() {
     _onLocalMediaEvent("play");
     _syncAmbientState();
   });
+  player.on("playing", () => {
+    _ambientTickVideo(!_ambient.hasDrawnFrame);
+    _syncAmbientState();
+  });
+  player.on("canplay", () => {
+    _ambientTickVideo(!_ambient.hasDrawnFrame);
+    _syncAmbientState();
+  });
   player.on("pause", () => {
     _onLocalMediaEvent("pause");
     _syncAmbientState();
@@ -3776,8 +3799,12 @@ async function ensureVideoPlayer() {
     _applySavedVolumeToVideo(player);
     _ambient.corsBlocked = false;
     _ambient.hasDrawnFrame = false;
+    _ambient.fallbackThumbKey = "";
   });
-  player.on("loadeddata", () => { _ambientTickVideo(true); });
+  player.on("loadeddata", () => {
+    _ambientTickVideo(true);
+    _syncAmbientState();
+  });
   player.on("loadedmetadata", () => { _applySavedVolumeToVideo(player); });
   // Restore / persist volume without letting startup events overwrite localStorage
   player.ready(() => {
