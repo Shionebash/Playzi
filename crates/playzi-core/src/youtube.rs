@@ -118,6 +118,108 @@ impl<T: Clone> TtlCache<T> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoChapter {
+    pub title: String,
+    pub start_time: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionTrack {
+    pub base_url: String,
+    pub language_code: String,
+    pub name: String,
+    pub is_auto: bool,
+    pub is_translatable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationLanguage {
+    pub language_code: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryboardSpec {
+    pub template_url: String,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frame_count: u32,
+    pub cols: u32,
+    pub rows: u32,
+    pub interval_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentSortOption {
+    pub label: String,
+    pub continuation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoDetails {
+    pub video_id: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_date_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_date_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view_count_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub like_count_text: Option<String>,
+    pub chapters: Vec<VideoChapter>,
+    pub caption_tracks: Vec<CaptionTrack>,
+    pub translation_languages: Vec<TranslationLanguage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storyboard: Option<StoryboardSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comments_continuation: Option<String>,
+    pub comments_sort_options: Vec<CommentSortOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoComment {
+    pub id: String,
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_avatar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_channel_url: Option<String>,
+    pub is_channel_owner: bool,
+    pub is_pinned: bool,
+    pub is_hearted: bool,
+    pub published_time_text: String,
+    pub text: String,
+    pub like_count_text: String,
+    pub reply_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replies_continuation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentsPage {
+    pub comments: Vec<VideoComment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_continuation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_count_text: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct PlaybackTrackingUrls {
     playback_url: Option<String>,
@@ -135,6 +237,7 @@ pub struct YouTubeClient {
     metadata_cache: Arc<TtlCache<MediaItem>>,
     browse_cache: Arc<TtlCache<ChannelBrowseResult>>,
     tracking_cache: Arc<TtlCache<PlaybackTrackingUrls>>,
+    details_cache: Arc<TtlCache<VideoDetails>>,
 }
 
 impl YouTubeClient {
@@ -164,6 +267,7 @@ impl YouTubeClient {
             metadata_cache: Arc::new(TtlCache::new(SEARCH_CACHE_TTL, SEARCH_CACHE_MAX)),
             browse_cache: Arc::new(TtlCache::new(BROWSE_CACHE_TTL, BROWSE_CACHE_MAX)),
             tracking_cache: Arc::new(TtlCache::new(Duration::from_secs(600), 128)),
+            details_cache: Arc::new(TtlCache::new(BROWSE_CACHE_TTL, 64)),
         }
     }
 
@@ -1107,6 +1211,105 @@ impl YouTubeClient {
             }
         }
         Ok(results)
+    }
+
+    /// Fetches rich watch-page video details (description, publish date, relative time,
+    /// chapters, caption tracks, storyboard spec, and comments continuation) via InnerTube.
+    pub async fn fetch_video_details(
+        &self,
+        url_or_id: &str,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+    ) -> Result<VideoDetails> {
+        let video_id = extract_video_id(url_or_id).ok_or_else(|| {
+            CoreError::Validation(format!("Invalid YouTube video URL or ID: {url_or_id}"))
+        })?;
+        if let Some(cached) = self.details_cache.get(&video_id) {
+            return Ok(cached);
+        }
+
+        let (player_res, next_res) = tokio::join!(
+            self.post_innertube_with_cookies_and_user(
+                "player",
+                json!({ "videoId": video_id }),
+                cookies,
+                auth_user,
+            ),
+            self.post_innertube_with_cookies_and_user(
+                "next",
+                json!({ "videoId": video_id }),
+                cookies,
+                auth_user,
+            ),
+        );
+
+        let player_data = player_res.unwrap_or(Value::Null);
+        let next_data = next_res.unwrap_or(Value::Null);
+        if player_data.is_null() && next_data.is_null() {
+            return Err(CoreError::External(format!(
+                "Could not fetch video details for {video_id}"
+            )));
+        }
+
+        let details = parse_video_details(&video_id, &player_data, &next_data);
+        self.details_cache.set(video_id, details.clone());
+        Ok(details)
+    }
+
+    /// Fetches a page of comments (or replies) using an InnerTube continuation token.
+    pub async fn fetch_comments(
+        &self,
+        continuation: &str,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+    ) -> Result<CommentsPage> {
+        let token = continuation.trim();
+        if token.is_empty() {
+            return Err(CoreError::Validation(
+                "Missing comments continuation token".into(),
+            ));
+        }
+        let data = self
+            .post_innertube_with_cookies_and_user(
+                "next",
+                json!({ "continuation": token }),
+                cookies,
+                auth_user,
+            )
+            .await?;
+        Ok(parse_comments_response(&data))
+    }
+
+    /// Fetches a YouTube subtitle track as WebVTT, optionally auto-translated via `tlang`.
+    pub async fn fetch_subtitle_vtt(
+        &self,
+        base_url: &str,
+        tlang: Option<&str>,
+        cookies: Option<&CookieJar>,
+    ) -> Result<String> {
+        let target_url = build_timedtext_vtt_url(base_url, tlang)?;
+        let mut req = self.http.get(&target_url);
+        if let Some(jar) = cookies {
+            let raw_cookie = jar.cookie_header_for_host("www.youtube.com");
+            if !raw_cookie.is_empty() {
+                req = req.header("Cookie", raw_cookie);
+            }
+        }
+        let resp = req.send().await?.error_for_status()?;
+        let body = resp.text().await?;
+        let trimmed = body.trim();
+        if trimmed.starts_with("WEBVTT") {
+            return Ok(body);
+        }
+        if let Some(vtt) = convert_xml_subtitles_to_vtt(trimmed) {
+            return Ok(vtt);
+        }
+        if trimmed.is_empty() {
+            return Ok("WEBVTT\n\n".to_string());
+        }
+        Err(CoreError::External(
+            "Unsupported subtitle format returned by YouTube".into(),
+        ))
     }
 }
 
@@ -2642,4 +2845,1001 @@ mod tests {
             Some("https://lh3.googleusercontent.com/xyz=w544-h544-l90-rj")
         );
     }
+
+    #[test]
+    fn parses_chapters_from_description_timestamps() {
+        let desc = "Check out this video!\n0:00 Intro\n01:30 - Main Topic\n[05:45] Deep Dive\n1:02:10 Outro & Summary\n";
+        let chapters = parse_chapters_from_description(desc, Some(4000.0));
+        assert_eq!(chapters.len(), 4);
+        assert_eq!(chapters[0].title, "Intro");
+        assert_eq!(chapters[0].start_time, 0.0);
+        assert_eq!(chapters[0].end_time, Some(90.0));
+        assert_eq!(chapters[1].title, "Main Topic");
+        assert_eq!(chapters[1].start_time, 90.0);
+        assert_eq!(chapters[2].title, "Deep Dive");
+        assert_eq!(chapters[2].start_time, 345.0);
+        assert_eq!(chapters[3].title, "Outro & Summary");
+        assert_eq!(chapters[3].start_time, 3730.0);
+        assert_eq!(chapters[3].end_time, Some(4000.0));
+    }
+
+    #[test]
+    fn parses_youtube_storyboard_spec() {
+        let spec = "https://i.ytimg.com/sb/abc12345678/storyboard3_L$L/$N.jpg?sqp=test|48#27#100#10#10#0#default#rs1|80#45#100#10#10#2000#M$M#rs2|160#90#100#5#5#2000#M$M#rs3";
+        let sb = parse_storyboard_spec(spec, Some(200.0)).expect("storyboard parsed");
+        assert_eq!(sb.frame_width, 160);
+        assert_eq!(sb.frame_height, 90);
+        assert_eq!(sb.frame_count, 100);
+        assert_eq!(sb.cols, 5);
+        assert_eq!(sb.rows, 5);
+        assert_eq!(sb.interval_ms, 2000);
+        assert!(sb.template_url.contains("storyboard3_L2/M$M.jpg"));
+        assert!(sb.template_url.contains("sigh=rs3"));
+    }
+
+    #[test]
+    fn builds_safe_timedtext_vtt_url_with_translation() {
+        let url = build_timedtext_vtt_url(
+            "https://www.youtube.com/api/timedtext?v=dQw4w9WgXcQ&lang=en&fmt=srv3",
+            Some("es"),
+        )
+        .expect("valid timedtext url");
+        assert!(url.contains("fmt=vtt"));
+        assert!(url.contains("tlang=es"));
+        assert!(!url.contains("fmt=srv3"));
+
+        assert!(build_timedtext_vtt_url("https://evil.example.com/api/timedtext?v=1", None).is_err());
+    }
+
+    #[test]
+    fn parses_modern_entity_comments_response() {
+        let resp = json!({
+            "onResponseReceivedEndpoints": [
+                {
+                    "reloadContinuationItemsCommand": {
+                        "continuationItems": [
+                            {
+                                "commentThreadRenderer": {
+                                    "commentViewModel": {
+                                        "commentViewModel": {
+                                            "commentKey": "ck_1",
+                                            "pinnedText": "Fijado por Creador"
+                                        }
+                                    },
+                                    "replies": {
+                                        "commentRepliesRenderer": {
+                                            "contents": [{
+                                                "continuationItemRenderer": {
+                                                    "continuationEndpoint": {
+                                                        "continuationCommand": { "token": "rep_tok_1" }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "continuationItemRenderer": {
+                                    "continuationEndpoint": {
+                                        "continuationCommand": { "token": "next_page_tok" }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [
+                        {
+                            "entityKey": "ck_1",
+                            "payload": {
+                                "commentEntityPayload": {
+                                    "properties": {
+                                        "commentId": "Ugx123",
+                                        "content": { "content": "Excelente video 01:20!" },
+                                        "publishedTime": "hace 2 días",
+                                        "replyLevel": 0
+                                    },
+                                    "author": {
+                                        "displayName": "@tester",
+                                        "avatarThumbnailUrl": "https://yt3.ggpht.com/avatar.jpg",
+                                        "channelUrl": "/@tester",
+                                        "isCreator": true
+                                    },
+                                    "toolbar": {
+                                        "likeCountLiked": "42",
+                                        "likeCountNotliked": "41",
+                                        "replyCount": "3"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let page = parse_comments_response(&resp);
+        assert_eq!(page.comments.len(), 1);
+        assert_eq!(page.comments[0].author, "@tester");
+        assert_eq!(page.comments[0].text, "Excelente video 01:20!");
+        assert!(page.comments[0].is_channel_owner);
+        assert!(page.comments[0].is_pinned);
+        assert_eq!(page.comments[0].like_count_text, "41");
+        assert_eq!(page.comments[0].reply_count, 3);
+        assert_eq!(page.comments[0].replies_continuation.as_deref(), Some("rep_tok_1"));
+        assert_eq!(page.next_continuation.as_deref(), Some("next_page_tok"));
+    }
+}
+
+fn parse_video_details(video_id: &str, player_data: &Value, next_data: &Value) -> VideoDetails {
+    let video_details = player_data.get("videoDetails");
+    let microformat = player_data
+        .get("microformat")
+        .and_then(|m| m.get("playerMicroformatRenderer"));
+
+    let duration_secs = video_details
+        .and_then(|d| d.get("lengthSeconds"))
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| v.as_f64())
+        });
+
+    let publish_date = microformat
+        .and_then(|m| m.get("publishDate").or_else(|| m.get("uploadDate")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let view_count = video_details
+        .and_then(|d| d.get("viewCount"))
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| v.as_u64())
+        });
+
+    let short_desc = video_details
+        .and_then(|d| d.get("shortDescription"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let (next_desc, publish_date_text, relative_date_text, view_count_text, like_count_text) =
+        extract_primary_and_secondary_info(next_data);
+
+    let description = if next_desc.trim().len() >= short_desc.trim().len() && !next_desc.is_empty() {
+        next_desc
+    } else {
+        short_desc
+    };
+
+    let mut chapters = extract_chapters_from_next(next_data, duration_secs);
+    if chapters.is_empty() {
+        chapters = parse_chapters_from_description(&description, duration_secs);
+    }
+
+    let (caption_tracks, translation_languages) = parse_caption_tracks(player_data);
+
+    let storyboard = player_data
+        .get("storyboards")
+        .and_then(|s| s.get("playerStoryboardSpecRenderer"))
+        .and_then(|r| r.get("spec"))
+        .and_then(Value::as_str)
+        .and_then(|spec| parse_storyboard_spec(spec, duration_secs));
+
+    let (comments_continuation, comments_sort_options) = extract_comments_entry(next_data);
+
+    VideoDetails {
+        video_id: video_id.to_string(),
+        description,
+        publish_date,
+        publish_date_text,
+        relative_date_text,
+        view_count,
+        view_count_text,
+        like_count_text,
+        chapters,
+        caption_tracks,
+        translation_languages,
+        storyboard,
+        comments_continuation,
+        comments_sort_options,
+    }
+}
+
+fn extract_text_runs(val: Option<&Value>) -> Option<String> {
+    let v = val?;
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        return (!t.is_empty()).then(|| t.to_string());
+    }
+    if let Some(s) = v.get("simpleText").and_then(Value::as_str) {
+        let t = s.trim();
+        return (!t.is_empty()).then(|| t.to_string());
+    }
+    if let Some(s) = v.get("content").and_then(Value::as_str) {
+        let t = s.trim();
+        return (!t.is_empty()).then(|| t.to_string());
+    }
+    if let Some(runs) = v.get("runs").and_then(Value::as_array) {
+        let joined: String = runs
+            .iter()
+            .filter_map(|r| r.get("text").and_then(Value::as_str))
+            .collect();
+        if !joined.trim().is_empty() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+fn extract_primary_and_secondary_info(
+    next_data: &Value,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let mut description = String::new();
+    let mut publish_date_text = None;
+    let mut relative_date_text = None;
+    let mut view_count_text = None;
+    let mut like_count_text = None;
+
+    let contents = next_data
+        .pointer("/contents/twoColumnWatchNextResults/results/results/contents")
+        .and_then(Value::as_array);
+
+    if let Some(arr) = contents {
+        for item in arr {
+            if let Some(primary) = item.get("videoPrimaryInfoRenderer") {
+                if publish_date_text.is_none() {
+                    publish_date_text = extract_text_runs(primary.get("dateText"));
+                }
+                if relative_date_text.is_none() {
+                    relative_date_text = extract_text_runs(primary.get("relativeDateText"));
+                }
+                if view_count_text.is_none() {
+                    view_count_text = extract_text_runs(
+                        primary.pointer("/viewCount/videoViewCountRenderer/viewCount"),
+                    )
+                    .or_else(|| {
+                        extract_text_runs(
+                            primary.pointer("/viewCount/videoViewCountRenderer/shortViewCount"),
+                        )
+                    });
+                }
+                if like_count_text.is_none() {
+                    like_count_text = extract_like_count_text(primary);
+                }
+            }
+            if let Some(secondary) = item.get("videoSecondaryInfoRenderer") {
+                if description.is_empty() {
+                    if let Some(content) = secondary
+                        .pointer("/attributedDescription/content")
+                        .and_then(Value::as_str)
+                    {
+                        description = content.to_string();
+                    } else if let Some(d) = extract_text_runs(secondary.get("description")) {
+                        description = d;
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        description,
+        publish_date_text,
+        relative_date_text,
+        view_count_text,
+        like_count_text,
+    )
+}
+
+fn extract_like_count_text(primary: &Value) -> Option<String> {
+    let buttons = primary
+        .pointer("/videoActions/menuRenderer/topLevelButtons")
+        .and_then(Value::as_array)?;
+    for btn in buttons {
+        if let Some(title) = btn
+            .pointer("/segmentedLikeDislikeButtonViewModel/likeButtonViewModel/likeButtonViewModel/toggleButtonViewModel/toggleButtonViewModel/defaultButtonViewModel/buttonViewModel/title")
+            .and_then(Value::as_str)
+        {
+            if !title.trim().is_empty() {
+                return Some(title.trim().to_string());
+            }
+        }
+        if let Some(t) = extract_text_runs(
+            btn.pointer("/segmentedLikeDislikeButtonRenderer/likeButton/toggleButtonRenderer/defaultText"),
+        ) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+fn extract_chapters_from_next(next_data: &Value, duration_secs: Option<f64>) -> Vec<VideoChapter> {
+    let mut chapters = Vec::new();
+    let mut stack = vec![next_data];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(map) => {
+                if let Some(ch) = map.get("chapterRenderer") {
+                    let title = extract_text_runs(ch.get("title")).unwrap_or_default();
+                    let start_ms = ch
+                        .get("timeRangeStartMillis")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        });
+                    if !title.is_empty() {
+                        if let Some(ms) = start_ms {
+                            chapters.push(VideoChapter {
+                                title,
+                                start_time: ms as f64 / 1000.0,
+                                end_time: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                for v in map.values() {
+                    if v.is_object() || v.is_array() {
+                        stack.push(v);
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter().rev() {
+                    if v.is_object() || v.is_array() {
+                        stack.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    finalize_chapters(chapters, duration_secs)
+}
+
+fn finalize_chapters(mut chapters: Vec<VideoChapter>, duration_secs: Option<f64>) -> Vec<VideoChapter> {
+    if chapters.is_empty() {
+        return chapters;
+    }
+    chapters.sort_by(|a, b| {
+        a.start_time
+            .partial_cmp(&b.start_time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    chapters.dedup_by(|a, b| (a.start_time - b.start_time).abs() < 0.5);
+    for i in 0..chapters.len() {
+        if i + 1 < chapters.len() {
+            chapters[i].end_time = Some(chapters[i + 1].start_time);
+        } else if let Some(dur) = duration_secs {
+            if dur > chapters[i].start_time {
+                chapters[i].end_time = Some(dur);
+            }
+        }
+    }
+    chapters
+}
+
+pub fn parse_chapters_from_description(
+    description: &str,
+    duration_secs: Option<f64>,
+) -> Vec<VideoChapter> {
+    static TS_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TS_RE.get_or_init(|| {
+        Regex::new(r"(?:^|[\s(\[])(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[\s)\]]|$)").unwrap()
+    });
+
+    let mut chapters = Vec::new();
+    for raw_line in description.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.len() > 240 {
+            continue;
+        }
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
+        let hours: u64 = caps
+            .get(1)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let mins: u64 = caps
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        let secs: u64 = caps
+            .get(3)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        if mins >= 60 || secs >= 60 {
+            continue;
+        }
+        let start = (hours * 3600 + mins * 60 + secs) as f64;
+        if let Some(dur) = duration_secs {
+            if dur > 0.0 && start >= dur {
+                continue;
+            }
+        }
+        let full_match = caps.get(0).unwrap();
+        let before = line[..full_match.start()].trim();
+        let after = line[full_match.end()..].trim();
+        let raw_title = if !after.is_empty() { after } else { before };
+        let title = raw_title
+            .trim_matches(|c: char| matches!(c, '-' | '–' | '—' | ':' | '|' | '•' | '·' | ')' | ']' | ' '))
+            .trim()
+            .to_string();
+        if title.is_empty() {
+            continue;
+        }
+        chapters.push(VideoChapter {
+            title,
+            start_time: start,
+            end_time: None,
+        });
+    }
+
+    if chapters.len() < 2 {
+        return Vec::new();
+    }
+    let finalized = finalize_chapters(chapters, duration_secs);
+    // Require ascending timestamps starting near the beginning or at least 2 distinct entries
+    if finalized.len() < 2 {
+        return Vec::new();
+    }
+    finalized
+}
+
+pub fn parse_caption_tracks(player_data: &Value) -> (Vec<CaptionTrack>, Vec<TranslationLanguage>) {
+    let renderer = match player_data
+        .get("captions")
+        .and_then(|c| c.get("playerCaptionsTracklistRenderer"))
+    {
+        Some(r) => r,
+        None => return (Vec::new(), Vec::new()),
+    };
+
+    let tracks = renderer
+        .get("captionTracks")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let base_url = t.get("baseUrl").and_then(Value::as_str)?.trim().to_string();
+                    if base_url.is_empty() {
+                        return None;
+                    }
+                    let language_code = t
+                        .get("languageCode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("und")
+                        .to_string();
+                    let name = extract_text_runs(t.get("name"))
+                        .unwrap_or_else(|| language_code.clone());
+                    let is_auto = t.get("kind").and_then(Value::as_str) == Some("asr");
+                    let is_translatable = t
+                        .get("isTranslatable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    Some(CaptionTrack {
+                        base_url,
+                        language_code,
+                        name,
+                        is_auto,
+                        is_translatable,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let translation_languages = renderer
+        .get("translationLanguages")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    let language_code = l
+                        .get("languageCode")
+                        .and_then(Value::as_str)?
+                        .trim()
+                        .to_string();
+                    if language_code.is_empty() {
+                        return None;
+                    }
+                    let name = extract_text_runs(l.get("languageName"))
+                        .unwrap_or_else(|| language_code.clone());
+                    Some(TranslationLanguage {
+                        language_code,
+                        name,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (tracks, translation_languages)
+}
+
+pub fn parse_storyboard_spec(spec: &str, duration_secs: Option<f64>) -> Option<StoryboardSpec> {
+    let parts: Vec<&str> = spec.split('|').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let base_template = parts[0].trim();
+    if !base_template.starts_with("http") {
+        return None;
+    }
+
+    let mut best: Option<(usize, StoryboardSpec)> = None;
+    for (level_idx, level_raw) in parts.iter().skip(1).enumerate() {
+        let fields: Vec<&str> = level_raw.split('#').collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let frame_width: u32 = fields[0].parse().ok()?;
+        let frame_height: u32 = fields[1].parse().ok()?;
+        let frame_count: u32 = fields[2].parse().ok()?;
+        let cols: u32 = fields[3].parse().ok()?;
+        let rows: u32 = fields[4].parse().ok()?;
+        let mut interval_ms: u32 = fields[5].parse().unwrap_or(0);
+        let name_tpl = fields[6];
+        let sigh = fields[7];
+
+        if frame_width == 0 || frame_height == 0 || cols == 0 || rows == 0 || frame_count == 0 {
+            continue;
+        }
+        if interval_ms == 0 {
+            if let Some(dur) = duration_secs {
+                if dur > 0.0 {
+                    interval_ms = ((dur * 1000.0) / frame_count as f64).round().max(1000.0) as u32;
+                }
+            }
+        }
+        if interval_ms == 0 {
+            interval_ms = 2000;
+        }
+
+        let mut url = base_template
+            .replace("$L", &level_idx.to_string())
+            .replace("$N", name_tpl);
+        if !sigh.is_empty() {
+            if url.contains('?') {
+                url.push_str(&format!("&sigh={sigh}"));
+            } else {
+                url.push_str(&format!("?sigh={sigh}"));
+            }
+        }
+
+        let candidate = StoryboardSpec {
+            template_url: url,
+            frame_width,
+            frame_height,
+            frame_count,
+            cols,
+            rows,
+            interval_ms,
+        };
+
+        // Prefer ~160px width (standard YouTube hover preview), otherwise highest <= 320px
+        let replace = match &best {
+            None => true,
+            Some((_, prev)) => {
+                let prev_ok = prev.frame_width <= 240;
+                let cand_ok = candidate.frame_width <= 240;
+                (cand_ok && (!prev_ok || candidate.frame_width >= prev.frame_width))
+                    || (!prev_ok && candidate.frame_width < prev.frame_width)
+            }
+        };
+        if replace {
+            best = Some((level_idx, candidate));
+        }
+    }
+
+    best.map(|(_, s)| s)
+}
+
+fn extract_comments_entry(next_data: &Value) -> (Option<String>, Vec<CommentSortOption>) {
+    let mut continuation = None;
+    let mut sort_options = Vec::new();
+
+    if let Some(contents) = next_data
+        .pointer("/contents/twoColumnWatchNextResults/results/results/contents")
+        .and_then(Value::as_array)
+    {
+        for item in contents {
+            if let Some(sec) = item.get("itemSectionRenderer") {
+                let sec_id = sec
+                    .get("sectionIdentifier")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if sec_id == "comment-item-section" {
+                    if let Some(tok) = sec
+                        .pointer("/contents/0/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                        .and_then(Value::as_str)
+                    {
+                        continuation = Some(tok.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(panels) = next_data.get("engagementPanels").and_then(Value::as_array) {
+        for panel in panels {
+            let panel_id = panel
+                .pointer("/engagementPanelSectionListRenderer/panelIdentifier")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if panel_id == "engagement-panel-comments-section" {
+                if let Some(sub_items) = panel
+                    .pointer("/engagementPanelSectionListRenderer/header/engagementPanelTitleHeaderRenderer/menu/sortFilterSubMenuRenderer/subMenuItems")
+                    .and_then(Value::as_array)
+                {
+                    for opt in sub_items {
+                        let label = opt
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let tok = opt
+                            .pointer("/serviceEndpoint/continuationCommand/token")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        if !label.is_empty() {
+                            if let Some(t) = tok {
+                                sort_options.push(CommentSortOption {
+                                    label,
+                                    continuation: t,
+                                });
+                            }
+                        }
+                    }
+                }
+                if continuation.is_none() {
+                    continuation = panel
+                        .pointer("/engagementPanelSectionListRenderer/content/sectionListRenderer/contents/0/itemSectionRenderer/contents/0/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+        }
+    }
+
+    (continuation, sort_options)
+}
+
+pub fn parse_comments_response(data: &Value) -> CommentsPage {
+    // Index modern commentEntityPayload mutations by entityKey
+    let mut entity_map: HashMap<String, &Value> = HashMap::new();
+    if let Some(mutations) = data
+        .pointer("/frameworkUpdates/entityBatchUpdate/mutations")
+        .and_then(Value::as_array)
+    {
+        for m in mutations {
+            if let (Some(key), Some(payload)) = (
+                m.get("entityKey").and_then(Value::as_str),
+                m.pointer("/payload/commentEntityPayload"),
+            ) {
+                entity_map.insert(key.to_string(), payload);
+            }
+        }
+    }
+
+    let mut comments = Vec::new();
+    let mut next_continuation = None;
+    let mut total_count_text = None;
+
+    let endpoints = data
+        .get("onResponseReceivedEndpoints")
+        .and_then(Value::as_array);
+    if let Some(eps) = endpoints {
+        for ep in eps {
+            let items = ep
+                .pointer("/reloadContinuationItemsCommand/continuationItems")
+                .or_else(|| ep.pointer("/appendContinuationItemsAction/continuationItems"))
+                .and_then(Value::as_array);
+
+            if let Some(arr) = items {
+                for entry in arr {
+                    if let Some(hdr) = entry.get("commentsHeaderRenderer") {
+                        if total_count_text.is_none() {
+                            total_count_text = extract_text_runs(hdr.get("countText"))
+                                .or_else(|| extract_text_runs(hdr.get("commentsCount")));
+                        }
+                        continue;
+                    }
+                    if let Some(tok) = entry
+                        .pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                        .or_else(|| {
+                            entry.pointer("/continuationItemRenderer/button/buttonRenderer/command/continuationCommand/token")
+                        })
+                        .and_then(Value::as_str)
+                    {
+                        next_continuation = Some(tok.to_string());
+                        continue;
+                    }
+                    if let Some(thread) = entry.get("commentThreadRenderer") {
+                        if let Some(c) = parse_comment_thread(thread, &entity_map) {
+                            comments.push(c);
+                        }
+                        continue;
+                    }
+                    if let Some(vm) = entry.get("commentViewModel") {
+                        if let Some(c) = parse_comment_view_model(vm, &entity_map, None) {
+                            comments.push(c);
+                        }
+                        continue;
+                    }
+                    if let Some(cr) = entry.get("commentRenderer") {
+                        if let Some(c) = parse_legacy_comment_renderer(cr, None) {
+                            comments.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    CommentsPage {
+        comments,
+        next_continuation,
+        total_count_text,
+    }
+}
+
+fn parse_comment_thread(
+    thread: &Value,
+    entity_map: &HashMap<String, &Value>,
+) -> Option<VideoComment> {
+    let replies_continuation = thread
+        .pointer("/replies/commentRepliesRenderer/contents/0/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+        .or_else(|| {
+            thread.pointer("/replies/commentRepliesRenderer/contents/0/continuationItemRenderer/button/buttonRenderer/command/continuationCommand/token")
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if let Some(vm) = thread
+        .pointer("/commentViewModel/commentViewModel")
+        .or_else(|| thread.get("commentViewModel"))
+    {
+        return parse_comment_view_model(vm, entity_map, replies_continuation);
+    }
+
+    if let Some(cr) = thread.pointer("/comment/commentRenderer") {
+        return parse_legacy_comment_renderer(cr, replies_continuation);
+    }
+
+    None
+}
+
+fn parse_comment_view_model(
+    vm: &Value,
+    entity_map: &HashMap<String, &Value>,
+    replies_continuation: Option<String>,
+) -> Option<VideoComment> {
+    let inner = vm.get("commentViewModel").unwrap_or(vm);
+    let key = inner.get("commentKey").and_then(Value::as_str)?;
+    let payload = entity_map.get(key)?;
+
+    let props = payload.get("properties")?;
+    let author_obj = payload.get("author");
+    let toolbar = payload.get("toolbar");
+
+    let id = props
+        .get("commentId")
+        .and_then(Value::as_str)
+        .unwrap_or(key)
+        .to_string();
+    let text = props
+        .pointer("/content/content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let published_time_text = props
+        .get("publishedTime")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let author = author_obj
+        .and_then(|a| a.get("displayName"))
+        .and_then(Value::as_str)
+        .unwrap_or("Usuario")
+        .to_string();
+    let author_avatar = author_obj
+        .and_then(|a| a.get("avatarThumbnailUrl"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let author_channel_url = author_obj
+        .and_then(|a| a.get("channelUrl"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|u| {
+            if u.starts_with("http") {
+                u.to_string()
+            } else {
+                format!("{DEFAULT_YT_BASE_URL}{u}")
+            }
+        });
+    let is_channel_owner = author_obj
+        .and_then(|a| a.get("isCreator"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_pinned = inner.get("pinnedText").is_some();
+    let is_hearted = toolbar
+        .and_then(|t| t.get("heartActiveTooltip"))
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let like_count_text = toolbar
+        .and_then(|t| t.get("likeCountNotliked").or_else(|| t.get("likeCountLiked")))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let reply_count = toolbar
+        .and_then(|t| t.get("replyCount"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
+
+    Some(VideoComment {
+        id,
+        author,
+        author_avatar,
+        author_channel_url,
+        is_channel_owner,
+        is_pinned,
+        is_hearted,
+        published_time_text,
+        text,
+        like_count_text,
+        reply_count,
+        replies_continuation,
+    })
+}
+
+fn parse_legacy_comment_renderer(
+    cr: &Value,
+    replies_continuation: Option<String>,
+) -> Option<VideoComment> {
+    let id = cr
+        .get("commentId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let text = extract_text_runs(cr.get("contentText"))?;
+    let author = extract_text_runs(cr.get("authorText")).unwrap_or_else(|| "Usuario".into());
+    let author_avatar = last_thumbnail_url(cr.get("authorThumbnail"));
+    let author_channel_url = cr
+        .pointer("/authorEndpoint/browseEndpoint/canonicalBaseUrl")
+        .and_then(Value::as_str)
+        .map(|u| format!("{DEFAULT_YT_BASE_URL}{u}"));
+    let is_channel_owner = cr
+        .get("authorIsChannelOwner")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_pinned = cr.get("pinnedCommentBadge").is_some();
+    let is_hearted = cr
+        .pointer("/actionButtons/commentActionButtonsRenderer/creatorHeart/creatorHeartRenderer/isHearted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let published_time_text = extract_text_runs(cr.get("publishedTimeText")).unwrap_or_default();
+    let like_count_text = extract_text_runs(cr.get("voteCount")).unwrap_or_default();
+    let reply_count = cr.get("replyCount").and_then(Value::as_u64).unwrap_or(0);
+
+    Some(VideoComment {
+        id,
+        author,
+        author_avatar,
+        author_channel_url,
+        is_channel_owner,
+        is_pinned,
+        is_hearted,
+        published_time_text,
+        text,
+        like_count_text,
+        reply_count,
+        replies_continuation,
+    })
+}
+
+pub fn build_timedtext_vtt_url(base_url: &str, tlang: Option<&str>) -> Result<String> {
+    let mut parsed = reqwest::Url::parse(base_url.trim())
+        .map_err(|_| CoreError::Validation("Invalid subtitle URL".into()))?;
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let allowed_host = host == "www.youtube.com" || host == "youtube.com";
+    if !allowed_host || !parsed.path().starts_with("/api/timedtext") {
+        return Err(CoreError::Validation(
+            "Subtitle URL must point to youtube.com/api/timedtext".into(),
+        ));
+    }
+
+    let existing: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(k, _)| k != "fmt" && k != "tlang")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    {
+        let mut qp = parsed.query_pairs_mut();
+        qp.clear();
+        for (k, v) in existing {
+            qp.append_pair(&k, &v);
+        }
+        qp.append_pair("fmt", "vtt");
+        if let Some(lang) = tlang.map(str::trim).filter(|s| !s.is_empty()) {
+            qp.append_pair("tlang", lang);
+        }
+    }
+
+    Ok(parsed.to_string())
+}
+
+fn convert_xml_subtitles_to_vtt(xml: &str) -> Option<String> {
+    static TEXT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TEXT_RE.get_or_init(|| {
+        Regex::new(r#"(?s)<text\s+start="([0-9.]+)"(?:\s+dur="([0-9.]+)")?[^>]*>(.*?)</text>"#)
+            .unwrap()
+    });
+    let mut out = String::from("WEBVTT\n\n");
+    let mut count = 0usize;
+    for cap in re.captures_iter(xml) {
+        let start: f64 = cap.get(1)?.as_str().parse().ok()?;
+        let dur: f64 = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(2.5);
+        let raw_text = cap.get(3)?.as_str();
+        let clean = decode_xml_entities(raw_text);
+        if clean.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "{} --> {}\n{}\n\n",
+            format_vtt_ts(start),
+            format_vtt_ts(start + dur.max(0.2)),
+            clean.trim()
+        ));
+        count += 1;
+    }
+    (count > 0).then_some(out)
+}
+
+fn format_vtt_ts(secs: f64) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as u64;
+    let h = total_ms / 3_600_000;
+    let m = (total_ms % 3_600_000) / 60_000;
+    let s = (total_ms % 60_000) / 1000;
+    let ms = total_ms % 1000;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+fn decode_xml_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
 }

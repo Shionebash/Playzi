@@ -47,6 +47,24 @@ const state = {
     currentHeight: null,
     native: null,
     capabilities: null,
+    theaterMode: false,
+    loadingStage: "",
+    loadingStartedAt: 0,
+    _loadingTimer: null,
+    buffering: false,
+    details: null,
+    detailsLoading: false,
+    detailsVideoId: "",
+    descExpanded: false,
+    comments: [],
+    commentsNext: null,
+    commentsTotalText: "",
+    commentsLoading: false,
+    commentsLoaded: false,
+    commentsSortIndex: 0,
+    commentsReplies: {},
+    activeSubtitle: null,
+    subtitleBlobUrl: null,
   },
   config: null,
   updateStatus: null,
@@ -377,6 +395,8 @@ function _formatTime(sec) {
 }
 
 function _destroyPlayer() {
+  _stopLoadingStatus();
+  _revokeSubtitleBlob();
   _ambientStop();
   _ambientClear();
   if (state.player._listenerAbort) {
@@ -395,8 +415,23 @@ function _destroyPlayer() {
   state.player.queue = [];
   state.player._originalQueue = [];
   state.player.loading = false;
+  state.player.buffering = false;
+  state.player.theaterMode = false;
+  state.player.details = null;
+  state.player.detailsLoading = false;
+  state.player.detailsVideoId = "";
+  state.player.descExpanded = false;
+  state.player.comments = [];
+  state.player.commentsNext = null;
+  state.player.commentsTotalText = "";
+  state.player.commentsLoading = false;
+  state.player.commentsLoaded = false;
+  state.player.commentsReplies = {};
+  state.player.activeSubtitle = null;
   state.player.audioOnly = false;
   state.player.sourceContext = "search";
+  const watchEl = $("#view-watch");
+  if (watchEl) watchEl.classList.remove("watch-theater-active");
   _syncDiscordMediaPresence(true);
 }
 
@@ -2219,17 +2254,32 @@ function _watchSidebarHtml() {
 function _videoLayoutHtml() {
   return `
     <div id="watch-party-bar"></div>
-    <div class="watch-layout watch-layout--video">
+    <div class="watch-layout watch-layout--video${state.player.theaterMode ? " watch-layout--theater" : ""}">
       <div class="watch-main">
         <div class="watch-video-stage">
           <div class="watch-video-wrap">
             <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline crossorigin="anonymous"></video>
             <div id="webPlayerOverlay" class="player-overlay" style="display:none">
-              <div class="player-overlay-spinner"></div>
+              <div class="player-overlay-card">
+                <div class="player-overlay-spinner"></div>
+                <div class="player-overlay-title" id="webPlayerOverlayStage">Conectando con YouTube...</div>
+                <div class="player-overlay-bar"><div class="player-overlay-bar-fill"></div></div>
+                <div class="player-overlay-sub" id="webPlayerOverlaySub"></div>
+                <div class="player-overlay-actions hidden" id="webPlayerOverlayActions">
+                  <button class="btn btn-ghost btn-sm" type="button" data-action="retry-web-player">Reintentar</button>
+                  <button class="btn btn-ghost btn-sm" type="button" id="overlayExternalBtn">Abrir externo</button>
+                </div>
+              </div>
+            </div>
+            <div id="webPlayerBufferPill" class="player-buffer-pill hidden">
+              <span class="player-buffer-dot"></span>
+              <span>Almacenando en búfer...</span>
             </div>
           </div>
         </div>
         <div id="watch-info"></div>
+        <div id="watch-description-root"></div>
+        <div id="watch-comments-root"></div>
       </div>
       ${_watchSidebarHtml()}
     </div>
@@ -2327,6 +2377,7 @@ function renderWatch() {
     // video: ended listener added inside ensureVideoPlayer()
   }
 
+  root.classList.toggle("watch-theater-active", !useMusicLayout && Boolean(state.player.theaterMode));
   _updateWatchMeta();
   _updatePlayerControls();
   _updateWatchUsers();
@@ -2345,6 +2396,79 @@ function _updateWatchMeta(error = "") {
   }
 }
 
+function _startLoadingStatus(initialStage = "Conectando con YouTube...") {
+  _stopLoadingStatus();
+  state.player.loading = true;
+  state.player.buffering = false;
+  state.player.loadingStage = initialStage;
+  state.player.loadingStartedAt = Date.now();
+  _renderLoadingOverlayText();
+  state.player._loadingTimer = setInterval(() => {
+    if (!state.player.loading) {
+      _stopLoadingStatus();
+      return;
+    }
+    const elapsedSec = Math.floor((Date.now() - state.player.loadingStartedAt) / 1000);
+    if (state.player.loadingStage === "Conectando con YouTube..." && elapsedSec >= 2) {
+      state.player.loadingStage = "Resolviendo stream y calidades...";
+    } else if (state.player.loadingStage === "Resolviendo stream y calidades..." && elapsedSec >= 5) {
+      state.player.loadingStage = "Obteniendo enlace de reproducción...";
+    }
+    _renderLoadingOverlayText();
+  }, 500);
+}
+
+function _setLoadingStage(stage) {
+  state.player.loadingStage = stage;
+  _renderLoadingOverlayText();
+}
+
+function _stopLoadingStatus() {
+  if (state.player._loadingTimer) {
+    clearInterval(state.player._loadingTimer);
+    state.player._loadingTimer = null;
+  }
+  state.player.loading = false;
+  state.player.loadingStage = "";
+  const overlay = $("#webPlayerOverlay");
+  if (overlay) overlay.style.display = "none";
+  const pill = $("#webPlayerBufferPill");
+  if (pill) pill.classList.add("hidden");
+}
+
+function _renderLoadingOverlayText() {
+  const stage = state.player.loadingStage || "Cargando video...";
+  const elapsedSec = state.player.loadingStartedAt
+    ? Math.max(0, Math.floor((Date.now() - state.player.loadingStartedAt) / 1000))
+    : 0;
+  const stageEl = $("#webPlayerOverlayStage");
+  if (stageEl) stageEl.textContent = stage;
+  const subEl = $("#webPlayerOverlaySub");
+  if (subEl) {
+    if (elapsedSec >= 6) {
+      subEl.textContent = `Esto puede tardar unos segundos la primera vez (${elapsedSec}s)`;
+    } else if (elapsedSec >= 2) {
+      subEl.textContent = `Preparando reproducción (${elapsedSec}s)...`;
+    } else {
+      subEl.textContent = "Por favor espera un momento";
+    }
+  }
+  const actionsEl = $("#webPlayerOverlayActions");
+  if (actionsEl) {
+    actionsEl.classList.toggle("hidden", elapsedSec < 12);
+  }
+  const infoStatus = $("#watchLoadingBannerText");
+  if (infoStatus) {
+    infoStatus.textContent = elapsedSec >= 2 ? `${stage} (${elapsedSec}s)` : stage;
+  }
+  const musicStatus = $("#musicStatus");
+  if (musicStatus && state.player.loading) {
+    musicStatus.innerHTML = `<span class="loading-pulse-dot"></span><span>${escapeHtml(elapsedSec >= 2 ? `${stage} (${elapsedSec}s)` : stage)}</span>`;
+    musicStatus.style.display = "";
+    musicStatus.className = "player-status player-status--loading";
+  }
+}
+
 function _updateVideoOverlay(error = "") {
   const overlay = $("#webPlayerOverlay");
   if (!overlay) return;
@@ -2352,10 +2476,81 @@ function _updateVideoOverlay(error = "") {
     const thumb = state.player.current?.thumbnail;
     overlay.style.backgroundImage = thumb ? `url("${thumbSrc(thumb, true)}")` : "";
     overlay.style.display = "flex";
+    _renderLoadingOverlayText();
     if (thumb) _ambientDrawStaticThumb(thumb);
   } else {
     overlay.style.display = "none";
   }
+}
+
+function _formatPublishDateEs(iso) {
+  if (!iso) return "";
+  const m = String(iso).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(iso);
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (Number.isNaN(d.getTime())) return String(iso);
+  try {
+    return new Intl.DateTimeFormat("es", { day: "numeric", month: "short", year: "numeric" }).format(d);
+  } catch (_) {
+    return `${m[3]}/${m[2]}/${m[1]}`;
+  }
+}
+
+function _formatRelativeTimeEs(iso) {
+  if (!iso) return "";
+  const m = String(iso).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return "";
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (Number.isNaN(d.getTime())) return "";
+  const diffSec = Math.round((d.getTime() - Date.now()) / 1000);
+  const abs = Math.abs(diffSec);
+  const rtf = typeof Intl !== "undefined" && Intl.RelativeTimeFormat
+    ? new Intl.RelativeTimeFormat("es", { numeric: "auto" })
+    : null;
+  if (!rtf) return "";
+  if (abs < 86400) return "hoy";
+  const days = Math.round(diffSec / 86400);
+  if (Math.abs(days) < 7) return rtf.format(days, "day");
+  const weeks = Math.round(days / 7);
+  if (Math.abs(days) < 30) return rtf.format(weeks, "week");
+  const months = Math.round(days / 30.4375);
+  if (Math.abs(days) < 365) return rtf.format(months, "month");
+  const years = Math.round(days / 365.25);
+  return rtf.format(years, "year");
+}
+
+function _formatViewCountEs(count) {
+  const n = Number(count);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  try {
+    return `${new Intl.NumberFormat("es").format(n)} visualizaciones`;
+  } catch (_) {
+    return `${n} visualizaciones`;
+  }
+}
+
+function _parseTimestampToSec(ts) {
+  const parts = String(ts).split(":").map((x) => Number(x));
+  if (parts.some((x) => !Number.isFinite(x))) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
+function _formatRichText(raw) {
+  const escaped = escapeHtml(raw || "");
+  const withLinks = escaped.replace(
+    /(https?:\/\/[^\s<>"']+)/gi,
+    (url) => `<a class="rich-link" href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+  );
+  return withLinks.replace(
+    /(^|[\s(\[])(\d{1,2}:\d{2}(?::\d{2})?)(?=[\s)\],.;!?]|$)/gm,
+    (full, prefix, ts) => {
+      const secs = _parseTimestampToSec(ts);
+      if (secs === null) return full;
+      return `${prefix}<button type="button" class="ts-link" data-seek-sec="${secs}" title="Ir a ${ts}">${ts}</button>`;
+    }
+  );
 }
 
 function _updateVideoMeta(error = "") {
@@ -2363,6 +2558,7 @@ function _updateVideoMeta(error = "") {
   const el = $("#watch-info");
   if (!el) return;
   const item = state.player.current;
+  const details = state.player.details;
   const title = item?.title || item?.url || "...";
   const channel = item?.channel || "";
   const channelUrl = item?.channelUrl || "";
@@ -2374,6 +2570,19 @@ function _updateVideoMeta(error = "") {
   const hasNext = !isPartyGuest && state.player.index < state.player.queue.length - 1;
   const membersOnlyErr = _isMembersOnlyError(error);
   const isMembers = Boolean(item?.membersOnly || membersOnlyErr);
+
+  const viewsText = details?.viewCountText || _formatViewCountEs(details?.viewCount || item?.viewCount);
+  const pubDateText = details?.publishDateText || _formatPublishDateEs(details?.publishDate);
+  const relDateText = details?.relativeDateText || _formatRelativeTimeEs(details?.publishDate);
+  const likeText = details?.likeCountText || "";
+  const metaChips = [];
+  if (viewsText) metaChips.push(escapeHtml(viewsText));
+  if (pubDateText) metaChips.push(`Publicado: ${escapeHtml(pubDateText)}`);
+  if (relDateText && (!pubDateText || !pubDateText.toLowerCase().includes(relDateText.toLowerCase()))) {
+    metaChips.push(escapeHtml(relDateText));
+  }
+  if (likeText) metaChips.push(`👍 ${escapeHtml(likeText)}`);
+
   const errorBannerHtml = !error
     ? ""
     : membersOnlyErr
@@ -2391,6 +2600,7 @@ function _updateVideoMeta(error = "") {
   el.innerHTML = `
     <div class="watch-title">${escapeHtml(title)}</div>
     <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}${isMembers ? ` <span class="tag tag-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}</div>
+    ${metaChips.length ? `<div class="watch-meta-row">${metaChips.map((c) => `<span class="watch-meta-chip">${c}</span>`).join(`<span class="watch-meta-sep">·</span>`)}</div>` : ""}
     <div class="watch-actions">
       <button class="btn btn-ghost btn-with-ico" type="button" id="watchPrev" ${hasPrev ? "" : "disabled"}>${PLAYER_ICONS.prev(15)}<span>Anterior</span></button>
       <button class="btn btn-ghost btn-with-ico" type="button" id="watchNext" ${hasNext ? "" : "disabled"}><span>Siguiente</span>${PLAYER_ICONS.next(15)}</button>
@@ -2404,10 +2614,229 @@ function _updateVideoMeta(error = "") {
       <button class="btn btn-ghost btn-with-ico" type="button" id="watchBack">${PLAYER_ICONS.back(14)}<span>Volver</span></button>
     </div>
     ${_nativePlayerBarHtml()}
-    ${state.player.loading ? `<div class="player-status">Cargando...</div>` : ""}
+    ${state.player.loading ? `<div class="player-status player-status--loading"><span class="loading-pulse-dot"></span><span id="watchLoadingBannerText">${escapeHtml(state.player.loadingStage || "Cargando video...")}</span></div>` : ""}
     ${errorBannerHtml}
   `;
+  _renderWatchDescription();
+  _renderWatchComments();
   _applyPartyPlayerRestrictions();
+}
+
+function _renderWatchDescription() {
+  const root = $("#watch-description-root");
+  if (!root) return;
+  const details = state.player.details;
+  if (state.player.detailsLoading && !details) {
+    root.innerHTML = `<div class="watch-desc-card watch-desc-card--loading"><span class="loading-pulse-dot"></span><span>Cargando descripción e información del video...</span></div>`;
+    return;
+  }
+  const desc = (details?.description || "").trim();
+  const chapters = details?.chapters || [];
+  if (!desc && !chapters.length) {
+    root.innerHTML = "";
+    return;
+  }
+  const expanded = Boolean(state.player.descExpanded);
+  const isLong = desc.length > 260 || (desc.match(/\n/g) || []).length >= 3;
+  const chaptersStripHtml = chapters.length
+    ? `<div class="watch-chapters-strip">
+        <div class="watch-chapters-strip-hdr">Capítulos (${chapters.length})</div>
+        <div class="watch-chapters-chips">
+          ${chapters.map((ch) => `<button type="button" class="watch-chapter-chip" data-seek-sec="${Math.floor(ch.startTime)}" title="${escapeHtml(ch.title)}"><span class="watch-chapter-chip-time">${_formatTime(ch.startTime)}</span><span class="watch-chapter-chip-title">${escapeHtml(ch.title)}</span></button>`).join("")}
+        </div>
+      </div>`
+    : "";
+
+  root.innerHTML = `
+    <div class="watch-desc-card${expanded ? " is-expanded" : ""}">
+      ${desc ? `<div class="watch-desc-body${!expanded && isLong ? " is-clamped" : ""}">${_formatRichText(desc)}</div>` : ""}
+      ${isLong ? `<button type="button" class="watch-desc-toggle" data-watch-action="toggle-desc">${expanded ? "Mostrar menos" : "Mostrar más"}</button>` : ""}
+      ${chaptersStripHtml}
+    </div>
+  `;
+}
+
+function _renderWatchComments() {
+  const root = $("#watch-comments-root");
+  if (!root) return;
+  const details = state.player.details;
+  if (!details && !state.player.detailsLoading) {
+    root.innerHTML = "";
+    return;
+  }
+  if (state.player.detailsLoading && !details) {
+    root.innerHTML = "";
+    return;
+  }
+  const sortOpts = details?.commentsSortOptions || [];
+  const comments = state.player.comments || [];
+  const totalLabel = state.player.commentsTotalText || (comments.length ? `${comments.length}${state.player.commentsNext ? "+" : ""} comentarios` : "Comentarios");
+  const sortHtml = sortOpts.length > 1
+    ? `<div class="watch-comments-sort">
+        ${sortOpts.map((opt, idx) => `<button type="button" class="btn btn-ghost btn-sm${idx === state.player.commentsSortIndex ? " active" : ""}" data-comment-sort="${idx}">${escapeHtml(opt.label)}</button>`).join("")}
+      </div>`
+    : "";
+
+  const renderItem = (c, isReply = false) => {
+    const repState = state.player.commentsReplies[c.id];
+    const repliesHtml = !isReply && (c.replyCount > 0 || c.repliesContinuation)
+      ? `<div class="comment-replies-wrap">
+          <button type="button" class="comment-replies-toggle" data-comment-replies="${escapeHtml(c.id)}">
+            ${repState?.open ? "▾ Ocultar respuestas" : `▸ ${c.replyCount > 0 ? `${c.replyCount} respuesta${c.replyCount === 1 ? "" : "s"}` : "Ver respuestas"}`}
+          </button>
+          ${repState?.open ? `<div class="comment-replies-list">
+            ${repState.loading && !repState.items?.length ? `<div class="comment-loading-inline"><span class="loading-pulse-dot"></span><span>Cargando respuestas...</span></div>` : ""}
+            ${(repState.items || []).map((r) => renderItem(r, true)).join("")}
+            ${repState.next ? `<button type="button" class="comment-replies-toggle" data-comment-replies-more="${escapeHtml(c.id)}">${repState.loading ? "Cargando..." : "Cargar más respuestas"}</button>` : ""}
+          </div>` : ""}
+        </div>`
+      : "";
+
+    const avatarHtml = c.authorAvatar
+      ? `<img class="comment-avatar" src="${escapeHtml(thumbSrc(c.authorAvatar))}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+      : `<div class="comment-avatar comment-avatar--fallback">${escapeHtml((c.author || "?").slice(0, 1).toUpperCase())}</div>`;
+
+    return `
+      <div class="comment-item${isReply ? " comment-item--reply" : ""}">
+        ${avatarHtml}
+        <div class="comment-body">
+          <div class="comment-hdr">
+            <span class="comment-author${c.isChannelOwner ? " is-owner" : ""}">${escapeHtml(c.author)}</span>
+            ${c.isPinned ? `<span class="comment-badge">Fijado</span>` : ""}
+            ${c.publishedTimeText ? `<span class="comment-time">${escapeHtml(c.publishedTimeText)}</span>` : ""}
+          </div>
+          <div class="comment-text">${_formatRichText(c.text)}</div>
+          <div class="comment-meta">
+            ${c.likeCountText ? `<span class="comment-likes">👍 ${escapeHtml(c.likeCountText)}</span>` : ""}
+            ${c.isHearted ? `<span class="comment-heart" title="Corazón del creador">❤</span>` : ""}
+          </div>
+          ${repliesHtml}
+        </div>
+      </div>
+    `;
+  };
+
+  let bodyHtml = "";
+  if (state.player.commentsLoading && !comments.length) {
+    bodyHtml = `<div class="comment-loading-inline"><span class="loading-pulse-dot"></span><span>Cargando comentarios...</span></div>`;
+  } else if (!comments.length && state.player.commentsLoaded) {
+    bodyHtml = `<div class="comment-empty">No hay comentarios disponibles o están desactivados para este video.</div>`;
+  } else if (!comments.length && !details?.commentsContinuation) {
+    bodyHtml = `<div class="comment-empty">Los comentarios no están disponibles para este video.</div>`;
+  } else {
+    bodyHtml = `
+      <div class="watch-comments-list">${comments.map((c) => renderItem(c, false)).join("")}</div>
+      ${state.player.commentsNext ? `<div class="watch-comments-more"><button type="button" class="btn btn-ghost" data-watch-action="load-more-comments" ${state.player.commentsLoading ? "disabled" : ""}>${state.player.commentsLoading ? "Cargando más comentarios..." : "Cargar más comentarios"}</button></div>` : ""}
+    `;
+  }
+
+  root.innerHTML = `
+    <div class="watch-comments-section">
+      <div class="watch-comments-hdr">
+        <span class="watch-comments-title">${escapeHtml(totalLabel)}</span>
+        ${sortHtml}
+      </div>
+      ${bodyHtml}
+    </div>
+  `;
+}
+
+async function _loadVideoDetails(item, loadId) {
+  if (!item?.url || !IS_TAURI) return;
+  state.player.details = null;
+  state.player.detailsLoading = true;
+  state.player.descExpanded = false;
+  state.player.comments = [];
+  state.player.commentsNext = null;
+  state.player.commentsTotalText = "";
+  state.player.commentsLoading = false;
+  state.player.commentsLoaded = false;
+  state.player.commentsSortIndex = 0;
+  state.player.commentsReplies = {};
+  _renderWatchDescription();
+  _renderWatchComments();
+
+  try {
+    const details = await api.get(`/api/youtube/video-details?url=${encodeURIComponent(item.url)}`);
+    if (state.player._loadingId !== loadId) return;
+    state.player.details = details;
+    state.player.detailsLoading = false;
+    state.player.detailsVideoId = details?.videoId || "";
+    _updateVideoMeta();
+    _applyVideoDetailsToPlayer(details);
+    if (details?.commentsContinuation) {
+      _loadVideoComments(details.commentsContinuation, loadId, { reset: true });
+    } else {
+      state.player.commentsLoaded = true;
+      _renderWatchComments();
+    }
+  } catch (_) {
+    if (state.player._loadingId !== loadId) return;
+    state.player.detailsLoading = false;
+    _renderWatchDescription();
+    _renderWatchComments();
+  }
+}
+
+async function _loadVideoComments(continuation, loadId, { reset = false } = {}) {
+  if (!continuation || state.player.commentsLoading) return;
+  state.player.commentsLoading = true;
+  if (reset) {
+    state.player.comments = [];
+    state.player.commentsNext = null;
+    state.player.commentsReplies = {};
+  }
+  _renderWatchComments();
+  try {
+    const page = await api.get(`/api/youtube/comments?continuation=${encodeURIComponent(continuation)}`);
+    if (state.player._loadingId !== loadId) return;
+    const incoming = Array.isArray(page?.comments) ? page.comments : [];
+    state.player.comments = reset ? incoming : [...state.player.comments, ...incoming];
+    state.player.commentsNext = page?.nextContinuation || null;
+    if (page?.totalCountText) state.player.commentsTotalText = page.totalCountText;
+    state.player.commentsLoaded = true;
+  } catch (_) {
+    if (state.player._loadingId !== loadId) return;
+    state.player.commentsLoaded = true;
+  } finally {
+    if (state.player._loadingId === loadId) {
+      state.player.commentsLoading = false;
+      _renderWatchComments();
+    }
+  }
+}
+
+async function _toggleCommentReplies(commentId) {
+  const comment = (state.player.comments || []).find((c) => c.id === commentId);
+  if (!comment) return;
+  const cur = state.player.commentsReplies[commentId] || { items: [], next: comment.repliesContinuation || null, loading: false, open: false };
+  cur.open = !cur.open;
+  state.player.commentsReplies[commentId] = cur;
+  _renderWatchComments();
+  if (cur.open && !cur.items.length && cur.next && !cur.loading) {
+    await _loadMoreCommentReplies(commentId);
+  }
+}
+
+async function _loadMoreCommentReplies(commentId) {
+  const cur = state.player.commentsReplies[commentId];
+  if (!cur || !cur.next || cur.loading) return;
+  const loadId = state.player._loadingId;
+  cur.loading = true;
+  _renderWatchComments();
+  try {
+    const page = await api.get(`/api/youtube/comments?continuation=${encodeURIComponent(cur.next)}`);
+    if (state.player._loadingId !== loadId) return;
+    cur.items = [...cur.items, ...(page?.comments || [])];
+    cur.next = page?.nextContinuation || null;
+  } catch (_) {
+    // ignore
+  } finally {
+    if (state.player._loadingId === loadId) {
+      cur.loading = false;
+      _renderWatchComments();
+    }
+  }
 }
 
 function _nativePlayerBarHtml() {
@@ -3434,7 +3863,7 @@ async function loadWebPlayerItem(index, opts = {}) {
   const loadId = ++state.player._loadingId;
   state.player.index = index;
   state.player.current = item;
-  state.player.loading = true;
+  _startLoadingStatus("Conectando con YouTube...");
   if (item.sourceContext && state.party?.active) {
     state.player.sourceContext = item.sourceContext;
   }
@@ -3477,7 +3906,7 @@ async function loadWebPlayerItem(index, opts = {}) {
   } catch (err) {
     if (opts?.fromPartySync) _partyMediaLoadingLock = false;
     if (state.player._loadingId !== loadId) return;
-    state.player.loading = false;
+    _stopLoadingStatus();
     const msg = err?.message || String(err || "Error inesperado");
     if (_isMembersOnlyError(msg)) {
       _markMembersOnlyByUrl(item.url);
@@ -3515,7 +3944,7 @@ async function _loadMusicItem(item, loadId, opts = {}) {
   if (!audio) return;
   state.player.current = { ...item, ...(info.item || {}) };
   _setCurrentLoudnessDb(info.loudnessDb);
-  state.player.loading = false;
+  _stopLoadingStatus();
   const rawSrc = info.streamUrl || info.proxyUrl || "";
   const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist");
   const proxiedSrc = streamProxyUrl(rawSrc);
@@ -3674,6 +4103,8 @@ async function _loadVideoItem(item, loadId, opts = {}) {
   // Desktop integrated mode: play inside Playzi via Video.js + local playzi-stream:// HLS proxy.
   // External players (VLC / mpv) remain available via the "Abrir externo" button and local files.
   if (IS_TAURI) {
+    // Load rich details (description, dates, chapters, captions, storyboards, comments) in parallel
+    _loadVideoDetails(item, loadId);
     const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}${refreshParam}`);
     if (state.player._loadingId !== loadId) return;
     state.player.current = { ...item, ...(info.item || {}) };
@@ -3682,14 +4113,16 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       ? info.availableQualities
       : null;
     state.player.currentHeight = info.video?.height || null;
-    state.player.loading = false;
+    _setLoadingStage("Iniciando reproductor...");
     const rawSrc = info.streamUrl || info.video?.url || "";
     if (rawSrc) {
       await ensureVideoPlayer();
       if (state.player._loadingId !== loadId) return;
       const player = state.player.vjs;
+      _clearPlayerSubtitles(player);
       const qualityBtn = player.controlBar?.getChild("QualityButton");
       if (qualityBtn) qualityBtn.update();
+      if (state.player.details) _applyVideoDetailsToPlayer(state.player.details);
       const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
       const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
       const hlsAudioUrl = info.hlsAudio?.url || "";
@@ -3705,8 +4138,20 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       const mimeType = isHls
         ? "application/x-mpegURL"
         : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+      _setLoadingStage("Cargando video en búfer...");
       _applySavedVolumeToVideo(player);
       player.src({ src: proxiedSrc, type: mimeType });
+      const finishLoad = () => {
+        if (state.player._loadingId !== loadId) return;
+        if (state.player.loading) {
+          _stopLoadingStatus();
+          _updateWatchMeta();
+        }
+      };
+      player.one("canplay", finishLoad);
+      player.one("playing", finishLoad);
+      player.one("loadeddata", finishLoad);
+      player.one("error", finishLoad);
       if (opts?.resumeTime > 1) {
         const targetTime = opts.resumeTime;
         player.one("canplay", () => {
@@ -3718,6 +4163,7 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       _applySavedVolumeToVideo(player);
       player.play().catch(() => {});
     } else {
+      _stopLoadingStatus();
       _updateWatchMeta("No se pudo resolver un stream reproducible. Puedes intentar con 'Abrir externo'.");
       return;
     }
@@ -3833,21 +4279,44 @@ async function ensureVideoPlayer() {
     _ambientStop();
     _onTrackEnded();
   });
-  player.on("timeupdate", () => { _maybePrefetchNextItem(player.currentTime()); });
+  player.on("timeupdate", () => {
+    const ct = player.currentTime();
+    _maybePrefetchNextItem(ct);
+    _updateCurrentChapterIndicator(player, ct);
+  });
+  let _bufferPillTimer = null;
+  const _showBufferPill = () => {
+    if (state.player.loading) return;
+    if (_bufferPillTimer) clearTimeout(_bufferPillTimer);
+    _bufferPillTimer = setTimeout(() => {
+      if (state.player.loading || player.isDisposed() || player.paused()) return;
+      const pill = $("#webPlayerBufferPill");
+      if (pill) pill.classList.remove("hidden");
+    }, 450);
+  };
+  const _hideBufferPill = () => {
+    if (_bufferPillTimer) { clearTimeout(_bufferPillTimer); _bufferPillTimer = null; }
+    const pill = $("#webPlayerBufferPill");
+    if (pill) pill.classList.add("hidden");
+  };
+  player.on("waiting", _showBufferPill);
   player.on("play", () => {
     _resumeVideoAudioGraph(player);
     _onLocalMediaEvent("play");
     _syncAmbientState();
   });
   player.on("playing", () => {
+    _hideBufferPill();
     _ambientTickVideo(!_ambient.hasDrawnFrame);
     _syncAmbientState();
   });
   player.on("canplay", () => {
+    _hideBufferPill();
     _ambientTickVideo(!_ambient.hasDrawnFrame);
     _syncAmbientState();
   });
   player.on("pause", () => {
+    _hideBufferPill();
     _onLocalMediaEvent("pause");
     _syncAmbientState();
   });
@@ -3866,11 +4335,23 @@ async function ensureVideoPlayer() {
     _ambientTickVideo(true);
     _syncAmbientState();
   });
-  player.on("loadedmetadata", () => { _applySavedVolumeToVideo(player); });
+  player.on("loadedmetadata", () => {
+    _applySavedVolumeToVideo(player);
+    if (state.player.details?.chapters?.length) {
+      _renderPlayerChapters(player, state.player.details.chapters);
+    }
+  });
+  player.on("durationchange", () => {
+    if (state.player.details?.chapters?.length) {
+      _renderPlayerChapters(player, state.player.details.chapters);
+    }
+  });
   // Restore / persist volume without letting startup events overwrite localStorage
   player.ready(() => {
     _applySavedVolumeToVideo(player);
     volumeReady = true;
+    _attachScrubPreview(player);
+    if (state.player.details) _applyVideoDetailsToPlayer(state.player.details);
     _applyPartyPlayerRestrictions();
   });
   player.on("volumechange", () => {
@@ -3890,6 +4371,8 @@ async function ensureVideoPlayer() {
       _saveVolumeState(unnormalized, isMuted || rawVol === 0);
     }
   });
+  _registerChapterButton(player);
+  _registerSubtitleMenu(player);
   _registerQualityMenu(player);
   _registerAudioMenu(player);
   _registerTheaterBtn(player);
@@ -4079,15 +4562,450 @@ function _registerQualityMenu(player) {
   player.controlBar.addChild("QualityButton", {}, player.controlBar.children().length - 1);
 }
 
+const _SUB_PREF_KEY = "playzi-sub-pref";
+const _PINNED_TRANSLATE_LANGS = ["es", "en", "pt", "fr", "de", "it", "ja", "ko"];
+
+function _revokeSubtitleBlob() {
+  if (state.player.subtitleBlobUrl) {
+    try { URL.revokeObjectURL(state.player.subtitleBlobUrl); } catch (_) {}
+    state.player.subtitleBlobUrl = null;
+  }
+}
+
+function _clearPlayerSubtitles(player) {
+  _revokeSubtitleBlob();
+  state.player.activeSubtitle = null;
+  if (!player || player.isDisposed()) return;
+  const remote = player.remoteTextTracks?.();
+  if (remote) {
+    for (let i = remote.length - 1; i >= 0; i--) {
+      try { player.removeRemoteTextTrack(remote[i]); } catch (_) {}
+    }
+  }
+  const btn = player.controlBar?.getChild("SubtitleButton");
+  if (btn) {
+    btn.el_?.classList.remove("vjs-subtitles-active");
+    btn.update();
+  }
+}
+
+async function _applySubtitleSelection(player, track, tlang = null, label = "") {
+  if (!player || player.isDisposed()) return;
+  if (!track) {
+    _clearPlayerSubtitles(player);
+    try { localStorage.setItem(_SUB_PREF_KEY, JSON.stringify({ enabled: false })); } catch (_) {}
+    return;
+  }
+  const displayLabel = label || (tlang ? `${track.name} → ${tlang.toUpperCase()}` : track.name);
+  try {
+    const qs = new URLSearchParams({ baseUrl: track.baseUrl });
+    if (tlang) qs.set("tlang", tlang);
+    const data = await api.get(`/api/youtube/subtitle?${qs.toString()}`);
+    if (player.isDisposed()) return;
+    const vtt = data?.vtt || "WEBVTT\n\n";
+    _clearPlayerSubtitles(player);
+    const blob = new Blob([vtt], { type: "text/vtt;charset=utf-8" });
+    const blobUrl = URL.createObjectURL(blob);
+    state.player.subtitleBlobUrl = blobUrl;
+    state.player.activeSubtitle = {
+      baseUrl: track.baseUrl,
+      languageCode: track.languageCode,
+      tlang: tlang || "",
+      label: displayLabel,
+    };
+    const trackEl = player.addRemoteTextTrack({
+      kind: "subtitles",
+      src: blobUrl,
+      srclang: tlang || track.languageCode || "es",
+      label: displayLabel,
+      default: true,
+    }, false);
+    if (trackEl?.track) trackEl.track.mode = "showing";
+    const tracks = player.textTracks?.();
+    if (tracks) {
+      for (let i = 0; i < tracks.length; i++) {
+        tracks[i].mode = tracks[i].label === displayLabel ? "showing" : "disabled";
+      }
+    }
+    try {
+      localStorage.setItem(_SUB_PREF_KEY, JSON.stringify({
+        enabled: true,
+        languageCode: track.languageCode,
+        tlang: tlang || "",
+      }));
+    } catch (_) {}
+    const btn = player.controlBar?.getChild("SubtitleButton");
+    if (btn) {
+      btn.el_?.classList.add("vjs-subtitles-active");
+      btn.update();
+    }
+    toast(`Subtítulos: ${displayLabel}`);
+  } catch (err) {
+    toast(`No se pudieron cargar los subtítulos: ${err?.message || err}`);
+  }
+}
+
+function _registerSubtitleMenu(player) {
+  const MenuButton = videojs.getComponent("MenuButton");
+  const MenuItem = videojs.getComponent("MenuItem");
+
+  class SubtitleMenuItem extends MenuItem {
+    constructor(p, opts) {
+      super(p, { ...opts, selectable: !opts.isHeader && !opts.isToggle, multiSelectable: false });
+      if (opts.isHeader) this.addClass("vjs-menu-header-item");
+      if (opts.isToggle) this.addClass("vjs-menu-toggle-item");
+      if (opts.selected) this.selected(true);
+    }
+    handleClick() {
+      const opts = this.options_;
+      const p = this.player();
+      if (!p || p.isDisposed() || opts.isHeader) return;
+      if (opts.isToggle) {
+        const btn = p.controlBar?.getChild("SubtitleButton");
+        if (btn) {
+          btn._translateMode = !btn._translateMode;
+          btn.update();
+        }
+        return;
+      }
+      _applySubtitleSelection(p, opts.track || null, opts.tlang || null, opts.displayLabel || "");
+    }
+  }
+
+  class SubtitleButton extends MenuButton {
+    constructor(p, opts) {
+      super(p, opts);
+      this._translateMode = false;
+      this.controlText("Subtítulos (CC)");
+    }
+    buildCSSClass() { return `vjs-subtitles-menu-button ${super.buildCSSClass()}`; }
+    createItems() {
+      const p = this.player();
+      const details = state.player.details;
+      const tracks = details?.captionTracks || [];
+      const transLangs = details?.translationLanguages || [];
+      const active = state.player.activeSubtitle;
+
+      if (!tracks.length) {
+        return [new SubtitleMenuItem(p, {
+          label: state.player.detailsLoading ? "Cargando subtítulos..." : "Sin subtítulos disponibles",
+          isHeader: true,
+        })];
+      }
+
+      if (this._translateMode) {
+        const baseTrack = tracks.find((t) => t.isTranslatable && !t.isAuto)
+          || tracks.find((t) => t.isTranslatable)
+          || tracks[0];
+        const items = [
+          new SubtitleMenuItem(p, { label: "← Volver a subtítulos", isToggle: true }),
+        ];
+        const byCode = new Map(transLangs.map((l) => [l.languageCode, l]));
+        const ordered = [];
+        for (const code of _PINNED_TRANSLATE_LANGS) {
+          if (byCode.has(code)) {
+            ordered.push(byCode.get(code));
+            byCode.delete(code);
+          }
+        }
+        for (const l of byCode.values()) ordered.push(l);
+        for (const lang of ordered) {
+          const isSel = Boolean(active && active.tlang === lang.languageCode);
+          items.push(new SubtitleMenuItem(p, {
+            label: lang.name,
+            track: baseTrack,
+            tlang: lang.languageCode,
+            displayLabel: `${lang.name} (traducido)`,
+            selected: isSel,
+          }));
+        }
+        return items;
+      }
+
+      const items = [
+        new SubtitleMenuItem(p, { label: "Desactivados", track: null, selected: !active }),
+      ];
+      for (const t of tracks) {
+        const lbl = t.isAuto ? `${t.name} (automático)` : t.name;
+        const isSel = Boolean(active && !active.tlang && active.baseUrl === t.baseUrl);
+        items.push(new SubtitleMenuItem(p, {
+          label: lbl,
+          track: t,
+          tlang: null,
+          displayLabel: lbl,
+          selected: isSel,
+        }));
+      }
+      if (transLangs.length && tracks.some((t) => t.isTranslatable)) {
+        items.push(new SubtitleMenuItem(p, {
+          label: "Traducir automáticamente ▸",
+          isToggle: true,
+        }));
+      }
+      return items;
+    }
+  }
+
+  if (!videojs.getComponent("SubtitleMenuItem")) videojs.registerComponent("SubtitleMenuItem", SubtitleMenuItem);
+  if (!videojs.getComponent("SubtitleButton")) videojs.registerComponent("SubtitleButton", SubtitleButton);
+  player.controlBar.addChild("SubtitleButton", {}, player.controlBar.children().length - 1);
+}
+
+function _findChapterAtTime(chapters, secs) {
+  if (!Array.isArray(chapters) || !chapters.length || !Number.isFinite(secs)) return null;
+  let match = null;
+  for (const ch of chapters) {
+    if (secs >= ch.startTime - 0.1) match = ch;
+    else break;
+  }
+  return match;
+}
+
+function _registerChapterButton(player) {
+  const Button = videojs.getComponent("Button");
+  class ChapterDisplayButton extends Button {
+    constructor(p, opts) {
+      super(p, opts);
+      this.el_.style.display = "none";
+      this.controlText("Capítulos");
+    }
+    buildCSSClass() { return "vjs-chapter-display-btn vjs-control vjs-button"; }
+    handleClick() {
+      const p = this.player();
+      if (!p || p.isDisposed()) return;
+      _toggleChaptersPopover(p);
+    }
+  }
+  if (!videojs.getComponent("ChapterDisplayButton")) videojs.registerComponent("ChapterDisplayButton", ChapterDisplayButton);
+  const idx = Math.min(4, player.controlBar.children().length);
+  player.controlBar.addChild("ChapterDisplayButton", {}, idx);
+}
+
+function _toggleChaptersPopover(player) {
+  const existing = player.el()?.querySelector(".vjs-chapters-popover");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  const chapters = state.player.details?.chapters || [];
+  if (!chapters.length) return;
+  const curTime = Number(player.currentTime() || 0);
+  const activeCh = _findChapterAtTime(chapters, curTime);
+  const pop = document.createElement("div");
+  pop.className = "vjs-chapters-popover";
+  pop.innerHTML = `
+    <div class="vjs-chapters-popover-hdr">
+      <span>Capítulos (${chapters.length})</span>
+      <button type="button" class="vjs-chapters-popover-close" aria-label="Cerrar">✕</button>
+    </div>
+    <div class="vjs-chapters-popover-list">
+      ${chapters.map((ch) => `
+        <button type="button" class="vjs-chapters-popover-item${activeCh === ch ? " is-active" : ""}" data-seek-sec="${Math.floor(ch.startTime)}">
+          <span class="vjs-chapters-popover-time">${_formatTime(ch.startTime)}</span>
+          <span class="vjs-chapters-popover-title">${escapeHtml(ch.title)}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+  pop.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (ev.target.closest(".vjs-chapters-popover-close")) {
+      pop.remove();
+      return;
+    }
+    const row = ev.target.closest("[data-seek-sec]");
+    if (row) {
+      const sec = Number(row.dataset.seekSec);
+      if (Number.isFinite(sec) && !player.isDisposed()) {
+        player.currentTime(sec);
+        player.play().catch(() => {});
+      }
+      pop.remove();
+    }
+  });
+  player.el().appendChild(pop);
+}
+
+function _renderPlayerChapters(player, chapters) {
+  if (!player || player.isDisposed()) return;
+  const holder = player.el()?.querySelector(".vjs-progress-holder");
+  if (holder) {
+    const old = holder.querySelector(".vjs-chapter-markers");
+    if (old) old.remove();
+    const dur = Number(player.duration() || state.player.current?.duration || 0);
+    if (Array.isArray(chapters) && chapters.length > 1 && Number.isFinite(dur) && dur > 0) {
+      const wrap = document.createElement("div");
+      wrap.className = "vjs-chapter-markers";
+      for (const ch of chapters) {
+        if (ch.startTime <= 0.5 || ch.startTime >= dur - 0.5) continue;
+        const pct = (ch.startTime / dur) * 100;
+        const tick = document.createElement("span");
+        tick.className = "vjs-chapter-marker";
+        tick.style.left = `${pct.toFixed(3)}%`;
+        wrap.appendChild(tick);
+      }
+      holder.appendChild(wrap);
+    }
+  }
+  const btn = player.controlBar?.getChild("ChapterDisplayButton");
+  if (btn?.el_) {
+    if (Array.isArray(chapters) && chapters.length) {
+      btn.el_.style.display = "inline-flex";
+      _updateCurrentChapterIndicator(player, Number(player.currentTime() || 0));
+    } else {
+      btn.el_.style.display = "none";
+      btn.el_.textContent = "";
+    }
+  }
+}
+
+function _updateCurrentChapterIndicator(player, currentTime) {
+  const chapters = state.player.details?.chapters;
+  if (!chapters?.length || !player || player.isDisposed()) return;
+  const btn = player.controlBar?.getChild("ChapterDisplayButton");
+  if (!btn?.el_) return;
+  const ch = _findChapterAtTime(chapters, currentTime);
+  const label = ch ? `${ch.title} ▸` : "";
+  if (btn.el_.dataset.chapterLabel !== label) {
+    btn.el_.dataset.chapterLabel = label;
+    btn.el_.innerHTML = `<span class="vjs-chapter-display-text">${escapeHtml(ch ? ch.title : "")}</span><span class="vjs-chapter-display-caret">▾</span>`;
+    btn.el_.title = ch ? `Capítulo: ${ch.title} (clic para ver todos)` : "Capítulos";
+  }
+}
+
+function _attachScrubPreview(player) {
+  if (!player || player.isDisposed()) return;
+  const progressCtrl = player.el()?.querySelector(".vjs-progress-control");
+  const holder = player.el()?.querySelector(".vjs-progress-holder");
+  if (!progressCtrl || !holder || progressCtrl.querySelector(".vjs-scrub-preview")) return;
+
+  const preview = document.createElement("div");
+  preview.className = "vjs-scrub-preview hidden";
+  preview.innerHTML = `
+    <div class="vjs-scrub-thumb hidden"></div>
+    <div class="vjs-scrub-chapter hidden"></div>
+    <div class="vjs-scrub-time">0:00</div>
+  `;
+  progressCtrl.appendChild(preview);
+
+  const thumbEl = preview.querySelector(".vjs-scrub-thumb");
+  const chapterEl = preview.querySelector(".vjs-scrub-chapter");
+  const timeEl = preview.querySelector(".vjs-scrub-time");
+
+  const updatePreview = (clientX) => {
+    const dur = Number(player.duration() || state.player.current?.duration || 0);
+    if (!Number.isFinite(dur) || dur <= 0) {
+      preview.classList.add("hidden");
+      return;
+    }
+    const holderRect = holder.getBoundingClientRect();
+    const ctrlRect = progressCtrl.getBoundingClientRect();
+    if (holderRect.width <= 0) return;
+
+    const pct = Math.max(0, Math.min(1, (clientX - holderRect.left) / holderRect.width));
+    const hoverTime = pct * dur;
+    timeEl.textContent = _formatTime(hoverTime);
+
+    // Chapter title at hover time
+    const chapters = state.player.details?.chapters || [];
+    const ch = _findChapterAtTime(chapters, hoverTime);
+    if (ch) {
+      chapterEl.textContent = ch.title;
+      chapterEl.classList.remove("hidden");
+    } else {
+      chapterEl.textContent = "";
+      chapterEl.classList.add("hidden");
+    }
+
+    // Storyboard thumbnail sprite frame
+    const sb = state.player.details?.storyboard;
+    if (sb && sb.templateUrl && sb.cols > 0 && sb.rows > 0 && sb.intervalMs > 0) {
+      const displayW = Math.min(180, Math.max(144, sb.frameWidth || 160));
+      const aspect = sb.frameHeight > 0 && sb.frameWidth > 0 ? sb.frameHeight / sb.frameWidth : 9 / 16;
+      const displayH = Math.round(displayW * aspect);
+      const perSheet = sb.cols * sb.rows;
+      const frameIdx = Math.max(0, Math.min(sb.frameCount - 1, Math.floor((hoverTime * 1000) / sb.intervalMs)));
+      const sheetIdx = Math.floor(frameIdx / perSheet);
+      const localIdx = frameIdx % perSheet;
+      const col = localIdx % sb.cols;
+      const row = Math.floor(localIdx / sb.cols);
+      const sheetUrl = sb.templateUrl.replace("$M", String(sheetIdx));
+
+      thumbEl.style.width = `${displayW}px`;
+      thumbEl.style.height = `${displayH}px`;
+      thumbEl.style.backgroundImage = `url("${sheetUrl}")`;
+      thumbEl.style.backgroundSize = `${sb.cols * displayW}px ${sb.rows * displayH}px`;
+      thumbEl.style.backgroundPosition = `-${col * displayW}px -${row * displayH}px`;
+      thumbEl.classList.remove("hidden");
+    } else {
+      thumbEl.classList.add("hidden");
+    }
+
+    preview.classList.remove("hidden");
+    const previewW = preview.offsetWidth || 168;
+    const rawLeft = (clientX - ctrlRect.left);
+    const minLeft = previewW / 2 + 6;
+    const maxLeft = Math.max(minLeft, ctrlRect.width - previewW / 2 - 6);
+    preview.style.left = `${Math.max(minLeft, Math.min(maxLeft, rawLeft))}px`;
+  };
+
+  progressCtrl.addEventListener("mousemove", (ev) => updatePreview(ev.clientX));
+  progressCtrl.addEventListener("mouseleave", () => preview.classList.add("hidden"));
+}
+
+function _applyVideoDetailsToPlayer(details) {
+  const player = state.player.vjs;
+  if (!player || player.isDisposed()) return;
+  _renderPlayerChapters(player, details?.chapters || []);
+  const subBtn = player.controlBar?.getChild("SubtitleButton");
+  if (subBtn) {
+    subBtn._translateMode = false;
+    subBtn.update();
+  }
+  // Restore user's saved subtitle preference if enabled
+  try {
+    const raw = localStorage.getItem(_SUB_PREF_KEY);
+    if (raw) {
+      const pref = JSON.parse(raw);
+      if (pref?.enabled && details?.captionTracks?.length) {
+        const tracks = details.captionTracks;
+        if (pref.tlang) {
+          const base = tracks.find((t) => t.isTranslatable && !t.isAuto) || tracks.find((t) => t.isTranslatable) || tracks[0];
+          if (base) {
+            const langObj = (details.translationLanguages || []).find((l) => l.languageCode === pref.tlang);
+            _applySubtitleSelection(player, base, pref.tlang, langObj ? `${langObj.name} (traducido)` : "");
+          }
+        } else if (pref.languageCode) {
+          const exact = tracks.find((t) => t.languageCode === pref.languageCode && !t.isAuto)
+            || tracks.find((t) => t.languageCode === pref.languageCode);
+          if (exact) _applySubtitleSelection(player, exact, null, exact.isAuto ? `${exact.name} (automático)` : exact.name);
+        }
+      }
+    }
+  } catch (_) {}
+}
+
 function _registerTheaterBtn(player) {
   const Button = videojs.getComponent("Button");
 
   class TheaterButton extends Button {
+    constructor(p, opts) {
+      super(p, opts);
+      this.controlText("Modo teatro");
+      if (state.player.theaterMode) this.el_.classList.add("vjs-theater-active");
+    }
     buildCSSClass() { return "vjs-theater-button vjs-control vjs-button"; }
     handleClick() {
+      state.player.theaterMode = !state.player.theaterMode;
       const layout = document.querySelector(".watch-layout--video");
-      if (layout) layout.classList.toggle("watch-layout--theater");
-      this.el_.classList.toggle("vjs-theater-active");
+      if (layout) layout.classList.toggle("watch-layout--theater", state.player.theaterMode);
+      const watchView = $("#view-watch");
+      if (watchView) watchView.classList.toggle("watch-theater-active", state.player.theaterMode);
+      this.el_.classList.toggle("vjs-theater-active", state.player.theaterMode);
+      if (state.player.theaterMode && _partyUsersCardOpen) {
+        _partyUsersCardOpen = false;
+        _updateWatchPartyBar();
+      }
     }
   }
 
@@ -7148,11 +8066,71 @@ document.addEventListener("click", async (ev) => {
     return;
   }
 
+  const seekBtn = ev.target.closest("[data-seek-sec]");
+  if (seekBtn) {
+    const sec = Number(seekBtn.dataset.seekSec);
+    if (Number.isFinite(sec) && sec >= 0) {
+      if (state.player.vjs && !state.player.vjs.isDisposed()) {
+        state.player.vjs.currentTime(sec);
+        state.player.vjs.play().catch(() => {});
+        const stage = document.querySelector(".watch-video-stage");
+        if (stage) stage.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }
+    return;
+  }
+
+  const watchAct = ev.target.closest("[data-watch-action]");
+  if (watchAct) {
+    const act = watchAct.dataset.watchAction;
+    if (act === "toggle-desc") {
+      state.player.descExpanded = !state.player.descExpanded;
+      _renderWatchDescription();
+      return;
+    }
+    if (act === "load-more-comments" && state.player.commentsNext) {
+      _loadVideoComments(state.player.commentsNext, state.player._loadingId, { reset: false });
+      return;
+    }
+  }
+
+  const sortBtn = ev.target.closest("[data-comment-sort]");
+  if (sortBtn) {
+    const idx = Number(sortBtn.dataset.commentSort);
+    const opts = state.player.details?.commentsSortOptions || [];
+    if (Number.isFinite(idx) && opts[idx]?.continuation) {
+      state.player.commentsSortIndex = idx;
+      _loadVideoComments(opts[idx].continuation, state.player._loadingId, { reset: true });
+    }
+    return;
+  }
+
+  const repToggle = ev.target.closest("[data-comment-replies]");
+  if (repToggle) {
+    _toggleCommentReplies(repToggle.dataset.commentReplies);
+    return;
+  }
+
+  const repMore = ev.target.closest("[data-comment-replies-more]");
+  if (repMore) {
+    _loadMoreCommentReplies(repMore.dataset.commentRepliesMore);
+    return;
+  }
+
+  if (ev.target.closest("#overlayExternalBtn")) {
+    $("#playerExternal")?.click();
+    return;
+  }
+
   const actionBtn = ev.target.closest("[data-party-action]");
   if (!actionBtn) {
     if (_partyUsersCardOpen && !ev.target.closest("#watch-party-bar")) {
       _partyUsersCardOpen = false;
       _updateWatchPartyBar();
+    }
+    const openChapPop = document.querySelector(".vjs-chapters-popover");
+    if (openChapPop && !ev.target.closest(".vjs-chapters-popover") && !ev.target.closest(".vjs-chapter-display-btn")) {
+      openChapPop.remove();
     }
     return;
   }

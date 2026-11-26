@@ -689,6 +689,72 @@ pub async fn dispatch_api_request(
                 .unwrap_or(false);
             Ok(json!({ "ok": true, "reported": reported }))
         }
+        ("GET", "/api/youtube/video-details") => {
+            let url_or_id = query
+                .get("url")
+                .or_else(|| query.get("videoId"))
+                .cloned()
+                .unwrap_or_default();
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let details = runtime
+                .youtube
+                .fetch_video_details(&url_or_id, jar.as_ref(), auth_user)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(details).map_err(|e| e.to_string())
+        }
+        ("GET", "/api/youtube/comments") => {
+            let continuation = query.get("continuation").cloned().unwrap_or_default();
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let page = runtime
+                .youtube
+                .fetch_comments(&continuation, jar.as_ref(), auth_user)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(page).map_err(|e| e.to_string())
+        }
+        ("GET", "/api/youtube/subtitle") => {
+            let base_url = query.get("baseUrl").cloned().unwrap_or_default();
+            let tlang = query
+                .get("tlang")
+                .map(String::as_str)
+                .filter(|s| !s.trim().is_empty());
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let vtt = runtime
+                .youtube
+                .fetch_subtitle_vtt(&base_url, tlang, jar.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "vtt": vtt }))
+        }
         ("GET", "/api/music/playlists") => {
             let s = runtime.state.read().map_err(|e| e.to_string())?;
             Ok(json!({
