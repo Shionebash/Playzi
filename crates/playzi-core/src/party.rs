@@ -15,6 +15,8 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use url::Url;
 use uuid::Uuid;
 
@@ -331,6 +333,7 @@ struct HostSessionState {
     relay_error: String,
     room_access: String,
     http_room_endpoint: Option<String>,
+    host_secret: String,
 }
 
 struct GuestSessionState {
@@ -379,10 +382,17 @@ fn generate_room_code() -> String {
         .collect()
 }
 
+fn generate_secret_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
 pub fn ensure_user_profile(store: &StateStore) -> Result<UserProfile> {
     store.update(|s| {
         if s.user_profile.user_id.trim().is_empty() {
             s.user_profile.user_id = generate_user_id();
+        }
+        if s.user_profile.auth_token.trim().is_empty() {
+            s.user_profile.auth_token = generate_secret_token();
         }
         let google_name = s.music_account_name.trim().to_string();
         if !google_name.is_empty() && s.user_profile.google_account_name != google_name {
@@ -856,11 +866,7 @@ impl HostSessionState {
         added_by: PartyUserRef,
     ) -> Result<PartyQueueItem> {
         let url = input.url.trim().to_string();
-        if url.is_empty() {
-            return Err(CoreError::Validation(
-                "La URL del video o canción es obligatoria".to_string(),
-            ));
-        }
+        crate::player::validate_http_url(&url)?;
         let item = PartyQueueItem {
             id: Uuid::new_v4().to_string(),
             url: url.clone(),
@@ -1117,6 +1123,7 @@ impl PartyManager {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let relay_shutdown_rx = shutdown_tx.subscribe();
         let room_access = normalize_room_access(req.room_access.as_deref());
+        let host_secret = generate_secret_token();
 
         let host_state = HostSessionState {
             room_code: room_code.clone(),
@@ -1138,6 +1145,7 @@ impl PartyManager {
             relay_error: String::new(),
             room_access,
             http_room_endpoint: None,
+            host_secret: host_secret.clone(),
         };
 
         let snap = host_state.snapshot();
@@ -1184,7 +1192,7 @@ impl PartyManager {
             && public_ws_url.is_empty();
 
         if using_relay {
-            self.spawn_host_relay(configured_hub, room_code, relay_shutdown_rx);
+            self.spawn_host_relay(configured_hub, room_code, host_secret, relay_shutdown_rx);
         }
 
         // If no online relay or public host is configured, auto-start Cloudflare Tunnel by default
@@ -1295,6 +1303,7 @@ impl PartyManager {
         &self,
         hub_url: String,
         room_code: String,
+        host_secret: String,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let manager = self.clone();
@@ -1337,9 +1346,11 @@ impl PartyManager {
                             }
                             let resp = http_client
                                 .post(&room_endpoint)
+                                .header("X-Playzi-Host-Secret", &host_secret)
                                 .json(&json!({
                                     "action": "host_poll",
                                     "room": room_code,
+                                    "hostSecret": host_secret,
                                     "since": since_seq,
                                     "messages": outgoing,
                                 }))
@@ -1482,9 +1493,17 @@ impl PartyManager {
                     break;
                 }
 
+                let mut ws_req = match host_relay_url.as_str().into_client_request() {
+                    Ok(req) => req,
+                    Err(_) => break,
+                };
+                if let Ok(val) = HeaderValue::from_str(&host_secret) {
+                    ws_req.headers_mut().insert("X-Playzi-Host-Secret", val);
+                }
+
                 let connect_res = tokio::time::timeout(
                     Duration::from_secs(12),
-                    tokio_tungstenite::connect_async(&host_relay_url),
+                    tokio_tungstenite::connect_async(ws_req),
                 )
                 .await;
 
@@ -1831,6 +1850,24 @@ impl PartyManager {
 
                 if user.user_id.trim().is_empty() {
                     user.user_id = generate_user_id();
+                } else {
+                    user.user_id = user.user_id.trim().to_string();
+                }
+                if user.user_id.eq_ignore_ascii_case(&host.host_user.user_id) {
+                    let _ = out_tx.send(ServerMessage::RoomClosed {
+                        reason: "Identidad inválida: no puedes usar el ID del anfitrión".to_string(),
+                    });
+                    return false;
+                }
+                if host
+                    .clients
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(&user.user_id))
+                {
+                    let _ = out_tx.send(ServerMessage::RoomClosed {
+                        reason: "Ese usuario ya está conectado en la sala".to_string(),
+                    });
+                    return false;
                 }
                 if user.display_name.trim().is_empty() {
                     user.display_name = if !user.google_account_name.is_empty() {
@@ -2510,13 +2547,13 @@ impl PartyManager {
     }
 
     pub async fn leave_or_stop(&self) -> PartyRoomSnapshot {
-        let mut http_close_target: Option<(String, String)> = None;
+        let mut http_close_target: Option<(String, String, String)> = None;
         let mut mode = self.inner.mode.write().await;
         match std::mem::replace(&mut *mode, SessionMode::Idle) {
             SessionMode::Idle => {}
             SessionMode::Host(mut host) => {
                 if let Some(ep) = host.http_room_endpoint.take() {
-                    http_close_target = Some((ep, host.room_code.clone()));
+                    http_close_target = Some((ep, host.room_code.clone(), host.host_secret.clone()));
                 }
                 let _ = host.shutdown_tx.send(true);
                 for client in host.clients.values() {
@@ -2533,16 +2570,18 @@ impl PartyManager {
             }
         }
         drop(mode);
-        if let Some((endpoint, code)) = http_close_target {
+        if let Some((endpoint, code, host_secret)) = http_close_target {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_millis(1800))
                 .build()
                 .unwrap_or_default();
             let _ = client
                 .post(&endpoint)
+                .header("X-Playzi-Host-Secret", &host_secret)
                 .json(&json!({
                     "action": "host_close",
                     "room": code,
+                    "hostSecret": host_secret,
                 }))
                 .send()
                 .await;

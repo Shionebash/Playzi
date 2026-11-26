@@ -174,6 +174,7 @@ class PlaylistItemRemoveRequest(BaseModel):
 class PlaylistImportRequest(BaseModel):
     url: str = Field(min_length=1)
     mode: Literal["copy", "linked"] = "copy"
+    forceNew: bool = False
 
 
 class PlaylistRenameRequest(BaseModel):
@@ -452,7 +453,7 @@ def api_playlists_create(payload: PlaylistRequest):
 @app.post("/api/playlists/import")
 def api_playlists_import(payload: PlaylistImportRequest):
     try:
-        return import_playlist(payload.url, payload.mode)
+        return import_playlist(payload.url, payload.mode, force_new=payload.forceNew)
     except Exception as exc:
         logger.exception("Error al importar playlist: %s", payload.url)
         raise HTTPException(status_code=400, detail=str(exc)) from exc

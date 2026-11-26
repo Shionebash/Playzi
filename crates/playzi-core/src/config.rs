@@ -298,12 +298,22 @@ impl ConfigStore {
 
         let mut apply_non_empty = |key: &str, val: Option<String>| {
             if let Some(v) = val {
-                let s = v.trim().to_string();
+                let s = sanitize_env_value(&v);
                 if !s.is_empty() {
                     env_map.insert(key.to_string(), s);
                 }
             }
         };
+
+        if let Some(ref p) = patch.mpv_path {
+            validate_player_binary_path(p, "mpv")?;
+        }
+        if let Some(ref p) = patch.vlc_path {
+            validate_player_binary_path(p, "vlc")?;
+        }
+        if let Some(ref p) = patch.ffmpeg_path {
+            validate_player_binary_path(p, "ffmpeg")?;
+        }
 
         apply_non_empty("MEDIA_ROOT", patch.media_root);
         apply_non_empty("DEFAULT_PLAYER", patch.default_player);
@@ -324,16 +334,16 @@ impl ConfigStore {
         }
 
         if let Some(v) = patch.cookies_browser {
-            env_map.insert("COOKIES_BROWSER".to_string(), v.trim().to_string());
+            env_map.insert("COOKIES_BROWSER".to_string(), sanitize_env_value(&v));
         }
         if let Some(v) = patch.cookies_file {
-            env_map.insert("COOKIES_FILE".to_string(), v.trim().to_string());
+            env_map.insert("COOKIES_FILE".to_string(), sanitize_env_value(&v));
         }
         if let Some(v) = patch.show_shorts {
             env_map.insert("SHOW_SHORTS".to_string(), if v { "true" } else { "false" }.to_string());
         }
         if let Some(v) = patch.social_hub_url {
-            env_map.insert("SOCIAL_HUB_URL".to_string(), v.trim().to_string());
+            env_map.insert("SOCIAL_HUB_URL".to_string(), sanitize_env_value(&v));
         }
         if let Some(v) = patch.discord_enabled {
             env_map.insert(
@@ -386,6 +396,31 @@ fn read_env_map(path: &Path) -> BTreeMap<String, String> {
     map
 }
 
+fn sanitize_env_value(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn validate_player_binary_path(raw: &str, allowed_stem: &str) -> Result<()> {
+    let trimmed = sanitize_env_value(raw);
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let stem = Path::new(&trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !stem.eq_ignore_ascii_case(allowed_stem) {
+        return Err(crate::error::CoreError::Validation(format!(
+            "Ruta inválida para {allowed_stem}: el ejecutable debe llamarse {allowed_stem}"
+        )));
+    }
+    Ok(())
+}
+
 fn write_env_map(path: &Path, values: &BTreeMap<String, String>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -393,12 +428,12 @@ fn write_env_map(path: &Path, values: &BTreeMap<String, String>) -> Result<()> {
     let mut lines = Vec::with_capacity(values.len());
     for &key in ENV_KEY_ORDER {
         if let Some(val) = values.get(key) {
-            lines.push(format!("{key}={val}"));
+            lines.push(format!("{}={}", sanitize_env_value(key), sanitize_env_value(val)));
         }
     }
     for (key, val) in values {
         if !ENV_KEY_ORDER.contains(&key.as_str()) {
-            lines.push(format!("{key}={val}"));
+            lines.push(format!("{}={}", sanitize_env_value(key), sanitize_env_value(val)));
         }
     }
     let body = format!("{}\n", lines.join("\n"));

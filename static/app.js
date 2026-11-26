@@ -306,7 +306,7 @@ function streamMasterProxyUrl(videoUrl, audioUrl, meta = null) {
 function thumbAttrs(url, eager = false) {
   const rawUrl = upgradeThumbUrl(url, false);
   const origUrl = normalizeThumbUrl(url);
-  return `src="${escapeHtml(thumbSrc(rawUrl))}" data-thumb-url="${escapeHtml(rawUrl)}" data-thumb-orig="${escapeHtml(origUrl)}" alt="" loading="${eager ? "eager" : "lazy"}" referrerpolicy="no-referrer" onerror="fallbackThumb(this)"`;
+  return `src="${escapeHtml(thumbSrc(rawUrl))}" data-thumb-url="${escapeHtml(rawUrl)}" data-thumb-orig="${escapeHtml(origUrl)}" data-thumb-fallback="1" alt="" loading="${eager ? "eager" : "lazy"}" referrerpolicy="no-referrer"`;
 }
 
 function fallbackThumb(img) {
@@ -1610,7 +1610,7 @@ function renderLibrary() {
   $("#view-library").innerHTML = `
     <div class="section-hdr"><span class="section-title">Biblioteca</span><span class="meta">${state.library.length} archivos</span></div>
     ${visible.length ? `<div class="grid">${visible.map(libraryCard).join("")}</div>` : empty("Biblioteca vacía", "Los archivos descargados aparecerán aquí.")}
-    ${hasMore ? `<div style="text-align:center;padding:16px 0"><button class="btn btn-ghost" type="button" onclick="_libraryLimit += 100; renderLibrary()">Ver más (${state.library.length - _libraryLimit} restantes)</button></div>` : ""}
+    ${hasMore ? `<div style="text-align:center;padding:16px 0"><button class="btn btn-ghost" type="button" data-action="library-load-more">Ver más (${state.library.length - _libraryLimit} restantes)</button></div>` : ""}
   `;
 }
 
@@ -1896,9 +1896,9 @@ function renderMusic() {
           ${state.musicPlaylists.map((p) => `
             <div style="position:relative">
               <button class="collection-card" type="button" data-music-playlist="${escapeHtml(p.url)}" data-music-playlist-title="${escapeHtml(p.title)}" style="width:100%">
-                ${p.thumbnail ? `<img src="${escapeHtml(thumbSrc(p.thumbnail))}" style="width:38px;height:38px;border-radius:8px;object-fit:cover" onerror="this.style.display='none'">` : `<span>♪</span>`}
+                ${p.thumbnail ? `<img src="${escapeHtml(thumbSrc(p.thumbnail))}" style="width:38px;height:38px;border-radius:8px;object-fit:cover" data-hide-on-error="1">` : `<span>♪</span>`}
                 <strong>${escapeHtml(p.title)}</strong>
-                <small>${p.count ? `${p.count} canciones` : "Playlist"}</small>
+                <small>${p.count ? `${escapeHtml(p.count)} canciones` : "Playlist"}</small>
               </button>
             </div>`).join("")}
          </div>`
@@ -1927,7 +1927,7 @@ function playlistGrid(playlists) {
           <button class="collection-card" type="button" data-playlist-id="${escapeHtml(pl.id)}" style="width:100%">
             ${pl.thumbnail ? `<img class="collection-thumb" ${thumbAttrs(pl.thumbnail)}>` : `<span>▶</span>`}
             <strong>${escapeHtml(pl.name)}</strong>
-            <small>${pl.itemCount || pl.items?.length || 0} items · ${escapeHtml(sourceLabel(pl.source || "playzi"))}${pl.importMode === "linked" ? " · vinculada" : ""}</small>
+            <small>${Number(pl.itemCount || pl.items?.length || 0)} items · ${escapeHtml(sourceLabel(pl.source || "playzi"))}${pl.importMode === "linked" ? " · vinculada" : ""}</small>
           </button>
           ${pl.importMode === "linked" ? `<button class="btn btn-ghost" type="button" data-sync-playlist="${escapeHtml(pl.id)}" style="position:absolute;top:8px;left:8px;padding:3px 7px;font-size:11px" title="Sincronizar">Sync</button>` : ""}
           <button class="btn btn-danger" type="button" data-delete-playlist="${escapeHtml(pl.id)}" style="position:absolute;top:8px;right:8px;padding:3px 7px;font-size:11px" title="Eliminar playlist">✕</button>
@@ -2006,7 +2006,7 @@ function renderHistory() {
     <div class="history-list">
       ${visible.length ? visible.map(historyCard).join("") : empty("Sin historial", "Las descargas y reproducciones aparecerán aquí.")}
     </div>
-    ${hasMore ? `<div style="text-align:center;padding:16px 0"><button class="btn btn-ghost" type="button" onclick="_historyLimit += 100; renderHistory()">Ver más (${state.history.length - _historyLimit} restantes)</button></div>` : ""}
+    ${hasMore ? `<div style="text-align:center;padding:16px 0"><button class="btn btn-ghost" type="button" data-action="history-load-more">Ver más (${state.history.length - _historyLimit} restantes)</button></div>` : ""}
   `;
 }
 
@@ -2045,7 +2045,7 @@ function _formatUpdateStatusHtml() {
           <div style="font-weight:600;margin-bottom:4px">Playzi ${curVer}</div>
           <div style="font-size:13px;color:var(--tx2)">${msg}</div>
         </div>
-        <button type="button" class="btn btn-primary" onclick="checkForAppUpdates()" ${busy ? "disabled" : ""}>
+        <button type="button" class="btn btn-primary" data-action="check-app-updates" ${busy ? "disabled" : ""}>
           ${busy ? "Actualizando..." : "Buscar actualizaciones"}
         </button>
       </div>
@@ -2076,8 +2076,8 @@ function renderConfig() {
       <div style="margin-bottom:16px">
         <div class="section-title" style="margin-bottom:10px">Tema</div>
         <div style="display:flex;gap:8px">
-          <button type="button" class="btn ${state.theme === "dark" ? "btn-primary" : "btn-ghost"}" onclick="setTheme('dark')" style="gap:7px">${MOON_SVG} Oscuro</button>
-          <button type="button" class="btn ${state.theme === "light" ? "btn-primary" : "btn-ghost"}" onclick="setTheme('light')" style="gap:7px">${SUN_SVG} Claro</button>
+          <button type="button" class="btn ${state.theme === "dark" ? "btn-primary" : "btn-ghost"}" data-set-theme="dark" style="gap:7px">${MOON_SVG} Oscuro</button>
+          <button type="button" class="btn ${state.theme === "light" ? "btn-primary" : "btn-ghost"}" data-set-theme="light" style="gap:7px">${SUN_SVG} Claro</button>
         </div>
       </div>
       <div>
@@ -2244,8 +2244,8 @@ function _musicLayoutHtml() {
         <div class="music-player-card">
           <div class="music-art-wrap">
             <img id="musicArt" class="music-art" src="" alt="" crossorigin="anonymous" referrerpolicy="no-referrer" style="display:none"
-              onload="onMusicArtLoad(this)"
-              onerror="fallbackThumb(this)">
+              data-music-art="1"
+              data-thumb-fallback="1">
             <div class="music-art-fallback" id="musicArtFallback">${PLAYER_ICONS.musicNote(58)}</div>
           </div>
           <div id="musicTitle" class="music-title">...</div>
@@ -2383,11 +2383,11 @@ function _updateVideoMeta(error = "") {
             <span>Este video es exclusivo para miembros del canal. Necesitas una membresía activa en tu cuenta de YouTube para reproducirlo.</span>
           </div>
           <div class="player-info-card-actions">
-            ${item?.url ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noopener">Abrir en YouTube</a>` : ""}
-            <button class="btn btn-ghost" type="button" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>
+            ${item?.url && /^https?:\/\//i.test(String(item.url).trim()) ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">Abrir en YouTube</a>` : ""}
+            <button class="btn btn-ghost" type="button" data-action="retry-web-player">Reintentar</button>
           </div>
         </div>`
-      : `<div class="player-error-card"><span>⚠ ${escapeHtml(error)}</span><button class="btn btn-ghost" type="button" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button></div>`;
+      : `<div class="player-error-card"><span>⚠ ${escapeHtml(error)}</span><button class="btn btn-ghost" type="button" data-action="retry-web-player">Reintentar</button></div>`;
   el.innerHTML = `
     <div class="watch-title">${escapeHtml(title)}</div>
     <div class="watch-channel">${channelHtml}${duration ? ` · ${escapeHtml(duration)}` : ""}${isMembers ? ` <span class="tag tag-members" title="Video exclusivo para miembros del canal">★ Solo miembros</span>` : ""}</div>
@@ -2515,11 +2515,11 @@ function _updateMusicMeta(error = "") {
       statusEl.className = "player-status";
     } else if (error) {
       if (_isMembersOnlyError(error)) {
-        statusEl.innerHTML = `<span class="tag tag-members">★ Solo miembros</span> Este contenido es exclusivo para miembros del canal. <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>`;
+        statusEl.innerHTML = `<span class="tag tag-members">★ Solo miembros</span> Este contenido es exclusivo para miembros del canal. <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" data-action="retry-web-player">Reintentar</button>`;
         statusEl.style.display = "";
         statusEl.className = "player-status";
       } else {
-        statusEl.innerHTML = `⚠ ${escapeHtml(error)} <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" onclick="loadWebPlayerItem(state.player.index)">Reintentar</button>`;
+        statusEl.innerHTML = `⚠ ${escapeHtml(error)} <button class="btn btn-ghost" type="button" style="padding:2px 8px;font-size:11px" data-action="retry-web-player">Reintentar</button>`;
         statusEl.style.display = "";
         statusEl.className = "player-status error-text";
       }
@@ -4328,7 +4328,7 @@ function libraryCard(item) {
       </div>
       <div class="card-actions">
         <button class="btn btn-primary" type="button" data-local-play-default data-path="${escapeHtml(item.path)}">▶ Reproducir</button>
-        ${item.mediaUrl ? `<a class="btn btn-ghost" href="${escapeHtml(item.mediaUrl)}" target="_blank">Navegador</a>` : ""}
+        ${item.mediaUrl && (/^(\/|https?:\/\/)/i.test(String(item.mediaUrl).trim())) ? `<a class="btn btn-ghost" href="${escapeHtml(item.mediaUrl)}" target="_blank" rel="noopener noreferrer">Navegador</a>` : ""}
       </div>
     </article>
   `;
@@ -4528,6 +4528,34 @@ function openDownloadModal(item, kind, presetCollection = "") {
   };
 }
 
+function extractNormalizedPlaylistId(urlOrId = "") {
+  const raw = String(urlOrId || "").trim();
+  if (!raw) return "";
+  let listId = "";
+  try {
+    const parsed = new URL(raw);
+    listId = (parsed.searchParams.get("list") || "").trim();
+  } catch {
+    if (/^(PL|VL|OLAK|RD|LM|LL|UU)/i.test(raw)) listId = raw;
+  }
+  if (listId.startsWith("VL") && listId.length > 2) {
+    return listId.slice(2);
+  }
+  return listId;
+}
+
+function findMatchingPlaylistByUrl(url = "") {
+  const cleanUrl = String(url || "").trim();
+  if (!cleanUrl) return null;
+  const incomingId = extractNormalizedPlaylistId(cleanUrl);
+  return (state.playlists || []).find((pl) => {
+    const existingUrl = String(pl.externalUrl || "").trim();
+    const existingId = extractNormalizedPlaylistId(pl.externalId || existingUrl);
+    if (incomingId && existingId && existingId === incomingId) return true;
+    return Boolean(existingUrl && existingUrl.toLowerCase() === cleanUrl.toLowerCase());
+  }) || null;
+}
+
 function openImportPlaylistModal(url = "") {
   const root = $("#modalRoot");
   root.innerHTML = `
@@ -4538,6 +4566,13 @@ function openImportPlaylistModal(url = "") {
         <div class="field">
           <label>URL</label>
           <input id="importPlaylistUrl" class="form-input" value="${escapeHtml(url)}" placeholder="https://youtube.com/playlist?list=...">
+        </div>
+        <div id="importDuplicateBox" class="field" style="display:none;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12)">
+          <div id="importDuplicateMsg" class="meta" style="margin-bottom:8px;color:var(--text,#fff)"></div>
+          <div class="pills">
+            <button class="pill active" type="button" data-duplicate-action="update">Actualizar existente</button>
+            <button class="pill" type="button" data-duplicate-action="new">Crear nueva copia</button>
+          </div>
         </div>
         <div class="field">
           <label>Modo</label>
@@ -4554,27 +4589,77 @@ function openImportPlaylistModal(url = "") {
     </div>
   `;
   let mode = "copy";
+  let duplicateAction = "update";
+  let matchedPlaylist = null;
+
+  const setModeUi = (nextMode) => {
+    mode = nextMode === "linked" ? "linked" : "copy";
+    root.querySelectorAll("[data-import-mode]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.importMode === mode);
+    });
+  };
+
+  const syncDuplicateUi = (rawUrl, autoSelectMode = false) => {
+    matchedPlaylist = findMatchingPlaylistByUrl(rawUrl);
+    const box = $("#importDuplicateBox");
+    const msg = $("#importDuplicateMsg");
+    const confirmBtn = $("#confirmImportPlaylist");
+    if (!box || !msg || !confirmBtn) return;
+    if (matchedPlaylist) {
+      const count = matchedPlaylist.itemCount ?? matchedPlaylist.items?.length ?? 0;
+      msg.textContent = `Esta playlist ya existe: "${matchedPlaylist.name}" (${count} canciones). Se actualizará con las canciones nuevas.`;
+      box.style.display = "";
+      if (autoSelectMode && (matchedPlaylist.importMode === "linked" || matchedPlaylist.importMode === "copy")) {
+        setModeUi(matchedPlaylist.importMode);
+      }
+      confirmBtn.textContent = duplicateAction === "update" ? "Actualizar" : "Importar nueva";
+    } else {
+      box.style.display = "none";
+      confirmBtn.textContent = "Importar";
+    }
+  };
+
   root.querySelectorAll("[data-import-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => setModeUi(btn.dataset.importMode));
+  });
+  root.querySelectorAll("[data-duplicate-action]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      mode = btn.dataset.importMode;
-      root.querySelectorAll("[data-import-mode]").forEach((b) => b.classList.toggle("active", b === btn));
+      duplicateAction = btn.dataset.duplicateAction === "new" ? "new" : "update";
+      root.querySelectorAll("[data-duplicate-action]").forEach((b) => b.classList.toggle("active", b === btn));
+      const confirmBtn = $("#confirmImportPlaylist");
+      if (confirmBtn && matchedPlaylist) {
+        confirmBtn.textContent = duplicateAction === "update" ? "Actualizar" : "Importar nueva";
+      }
     });
   });
+
+  const urlInput = $("#importPlaylistUrl");
+  urlInput.addEventListener("input", () => syncDuplicateUi(urlInput.value, true));
+  syncDuplicateUi(url, true);
+
   $("#cancelImportPlaylist").onclick = () => root.innerHTML = "";
   $(".modal-backdrop").onclick = (ev) => { if (ev.target.classList.contains("modal-backdrop")) root.innerHTML = ""; };
   $("#confirmImportPlaylist").onclick = async () => {
-    const target = $("#importPlaylistUrl").value.trim();
+    const target = urlInput.value.trim();
     if (!target) {
       toast("Pega la URL de la playlist.");
       return;
     }
+    const forceNew = Boolean(matchedPlaylist && duplicateAction === "new");
+    const willUpdate = Boolean(matchedPlaylist && !forceNew);
     root.innerHTML = "";
     try {
-      toast("Importando playlist...");
-      await api.post("/api/playlists/import", { url: target, mode });
+      toast(willUpdate ? "Actualizando playlist..." : "Importando playlist...");
+      const result = await api.post("/api/playlists/import", { url: target, mode, forceNew });
       await refreshLists();
       setView("collections");
-      toast("Playlist importada");
+      if (result?.updated) {
+        const added = Number(result.addedCount || 0);
+        toast(added > 0 ? `Playlist actualizada (+${added} canciones)` : "Playlist actualizada (sin canciones nuevas)");
+      } else {
+        const count = Number(result?.itemCount ?? result?.items?.length ?? 0);
+        toast(count > 0 ? `Playlist importada (${count} canciones)` : "Playlist importada");
+      }
     } catch (err) {
       toast(err.message);
     }
@@ -4643,7 +4728,7 @@ function _renderPlaylistDetail(plId) {
         <button class="btn btn-ghost" type="button" data-add-song-to-playlist="${escapeHtml(pl.id)}">＋ Agregar</button>
         ${pl.importMode === "linked" ? `<button class="btn btn-ghost" type="button" data-sync-playlist="${escapeHtml(pl.id)}">↺ Sync</button>` : ""}
         <button class="btn btn-primary" type="button" data-play-playlist-id="${escapeHtml(pl.id)}">▶ Reproducir todo</button>
-        <button class="btn btn-ghost" type="button" onclick="renderCollections()">← Volver</button>
+        <button class="btn btn-ghost" type="button" data-action="render-collections">← Volver</button>
       </div>
     </div>
     ${pl.items?.length ? `
@@ -5203,7 +5288,7 @@ function bindEvents() {
       $("#view-collections").innerHTML = `
         <div class="section-hdr">
           <span class="section-title">Colección: ${escapeHtml(name)}</span>
-          <button class="btn btn-ghost" type="button" onclick="renderCollections()">Volver</button>
+          <button class="btn btn-ghost" type="button" data-action="render-collections">Volver</button>
         </div>
         ${items.length ? `<div class="grid">${items.map(libraryCard).join("")}</div>` : empty("Colección vacía", "Descarga archivos usando esta colección.")}
       `;
@@ -6692,7 +6777,57 @@ function renderParty() {
   `;
 }
 
+document.addEventListener("error", (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLImageElement)) return;
+  if (target.dataset.thumbFallback === "1") {
+    fallbackThumb(target);
+  } else if (target.dataset.hideOnError === "1") {
+    target.style.display = "none";
+  }
+}, true);
+
+document.addEventListener("load", (ev) => {
+  const target = ev.target;
+  if (target instanceof HTMLImageElement && target.dataset.musicArt === "1") {
+    onMusicArtLoad(target);
+  }
+}, true);
+
 document.addEventListener("click", async (ev) => {
+  const uiThemeBtn = ev.target.closest("[data-set-theme]");
+  if (uiThemeBtn) {
+    setTheme(uiThemeBtn.dataset.setTheme);
+    return;
+  }
+
+  const uiActionBtn = ev.target.closest("[data-action]");
+  if (uiActionBtn) {
+    const act = uiActionBtn.dataset.action;
+    if (act === "library-load-more") {
+      _libraryLimit += 100;
+      renderLibrary();
+      return;
+    }
+    if (act === "history-load-more") {
+      _historyLimit += 100;
+      renderHistory();
+      return;
+    }
+    if (act === "check-app-updates") {
+      checkForAppUpdates();
+      return;
+    }
+    if (act === "retry-web-player") {
+      loadWebPlayerItem(state.player.index);
+      return;
+    }
+    if (act === "render-collections") {
+      renderCollections();
+      return;
+    }
+  }
+
   const copyBtn = ev.target.closest("[data-party-copy]");
   if (copyBtn) {
     const text = copyBtn.dataset.partyCopy || "";

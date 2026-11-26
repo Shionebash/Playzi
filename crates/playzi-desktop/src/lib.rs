@@ -50,7 +50,7 @@ pub fn run() {
                             .status(200)
                             .header("Content-Type", cached.content_type)
                             .header("Cache-Control", "public, max-age=86400")
-                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
                             .body(cached.bytes)
                             .unwrap();
                         responder.respond(resp);
@@ -79,7 +79,7 @@ pub fn run() {
                 if method == tauri::http::Method::OPTIONS {
                     let resp = tauri::http::Response::builder()
                         .status(204)
-                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Origin", allowed_webview_origin())
                         .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
                         .header("Access-Control-Allow-Headers", "Range, Content-Type")
                         .body(Vec::new())
@@ -140,7 +140,7 @@ pub fn run() {
                                 .status(200)
                                 .header("Content-Type", "application/vnd.apple.mpegurl")
                                 .header("Content-Length", body.len().to_string())
-                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
                                 .header("Access-Control-Allow-Headers", "Range, Content-Type")
                                 .body(body)
                                 .unwrap();
@@ -149,7 +149,7 @@ pub fn run() {
                         _ => {
                             let resp = tauri::http::Response::builder()
                                 .status(400)
-                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
                                 .body(b"missing v or a parameter".to_vec())
                                 .unwrap();
                             responder.respond(resp);
@@ -167,7 +167,7 @@ pub fn run() {
                 let Some(url) = target_url else {
                     let resp = tauri::http::Response::builder()
                         .status(400)
-                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Origin", allowed_webview_origin())
                         .body(b"missing url parameter".to_vec())
                         .unwrap();
                     responder.respond(resp);
@@ -187,7 +187,7 @@ pub fn run() {
                             .status(proxied.status)
                             .header("Content-Type", proxied.content_type)
                             .header("Content-Length", proxied.bytes.len().to_string())
-                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
                             .header("Access-Control-Allow-Headers", "Range, Content-Type")
                             .header(
                                 "Access-Control-Expose-Headers",
@@ -205,7 +205,7 @@ pub fn run() {
                     Err(err) => {
                         let resp = tauri::http::Response::builder()
                             .status(502)
-                            .header("Access-Control-Allow-Origin", "*")
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
                             .body(err.to_string().into_bytes())
                             .unwrap();
                         responder.respond(resp);
@@ -488,4 +488,15 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Playzi desktop application");
+}
+
+fn allowed_webview_origin() -> &'static str {
+    #[cfg(windows)]
+    {
+        "http://tauri.localhost"
+    }
+    #[cfg(not(windows))]
+    {
+        "tauri://localhost"
+    }
 }

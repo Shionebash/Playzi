@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Playzi",
-  "version": "1.2.2",
+  "version": "1.2.5",
   "identifier": "com.playzi.desktop",
   "build": {
     "frontendDist": "dist"
@@ -20,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: http://playzi-thumb.localhost playzi-thumb://localhost https://i.ytimg.com https://lh3.googleusercontent.com https://yt3.ggpht.com https://yt3.googleusercontent.com https://*.ytimg.com https://*.ggpht.com https://*.googleusercontent.com; media-src 'self' blob: http://playzi-stream.localhost playzi-stream://localhost https://*.googlevideo.com; connect-src 'self' ipc: http://ipc.localhost http://playzi-stream.localhost playzi-stream://localhost http://playzi-thumb.localhost playzi-thumb://localhost https://fonts.googleapis.com https://fonts.gstatic.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

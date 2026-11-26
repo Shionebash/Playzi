@@ -246,7 +246,7 @@ def _playlists_from_ytmusicapi(playlists: list[dict[str, Any]]) -> list[dict[str
     return items
 
 
-def music_playlist_queue(playlist_id: str, limit: int = 100) -> dict[str, Any]:
+def music_playlist_queue(playlist_id: str, limit: int | None = None) -> dict[str, Any]:
     """Resolve a YouTube Music playlist/mix into playable queue items."""
     ytmusic = _ytmusic_client(prefer_auth=True)
     errors: list[str] = []
@@ -262,7 +262,7 @@ def music_playlist_queue(playlist_id: str, limit: int = 100) -> dict[str, Any]:
 
     if not tracks:
         try:
-            data = ytmusic.get_watch_playlist(playlistId=playlist_id, limit=limit)
+            data = ytmusic.get_watch_playlist(playlistId=playlist_id, limit=limit or 50)
             title = data.get("title") or title
             tracks = data.get("tracks") or []
         except Exception as exc:

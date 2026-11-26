@@ -614,9 +614,7 @@ impl PlayerManager {
         audio_only: bool,
     ) -> Result<ResolvedStreamInfo> {
         let trimmed = url.trim();
-        if trimmed.is_empty() {
-            return Err(CoreError::Validation("URL is required".into()));
-        }
+        validate_http_url(trimmed)?;
         let cfg = self.config.snapshot();
         let qual = quality
             .filter(|q| !q.trim().is_empty())
@@ -689,12 +687,16 @@ impl PlayerManager {
     }
 
     /// Resolves playlist entries cleanly via `yt-dlp --flat-playlist --dump-single-json`.
-    pub async fn resolve_playlist(&self, url: &str, limit: usize) -> Result<Vec<PlaylistItem>> {
+    /// Pass `limit: None` to fetch all entries in the playlist without a cap.
+    pub async fn resolve_playlist(
+        &self,
+        url: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<PlaylistItem>> {
         let trimmed = url.trim();
-        if trimmed.is_empty() {
-            return Err(CoreError::Validation("Playlist URL is required".into()));
-        }
-        let raw = self.run_ytdlp_json(trimmed, true, Some(limit.max(1))).await?;
+        validate_http_url(trimmed)?;
+        let playlist_end = limit.map(|l| l.max(1));
+        let raw = self.run_ytdlp_json(trimmed, true, playlist_end).await?;
         Ok(parse_ytdlp_playlist_json(&raw, trimmed))
     }
 
@@ -888,8 +890,29 @@ fn build_ytdlp_json_args(
         args.push(cf.to_string_lossy().to_string());
     }
 
+    args.push("--".to_string());
     args.push(url.to_string());
     args
+}
+
+/// Validates that a string is a safe `http://` or `https://` URL with a non-empty host
+/// (blocking CLI flag injection via leading `-` and non-HTTP schemes like `file://`).
+pub fn validate_http_url(raw: &str) -> Result<Url> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return Err(CoreError::Validation("URL inválida".into()));
+    }
+    let parsed = Url::parse(trimmed)
+        .map_err(|_| CoreError::Validation("URL inválida".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CoreError::Validation(
+            "Solo se permiten URLs http:// o https://".into(),
+        ));
+    }
+    if parsed.host_str().map(|h| h.is_empty()).unwrap_or(true) {
+        return Err(CoreError::Validation("URL sin host válido".into()));
+    }
+    Ok(parsed)
 }
 
 /// Builds a `yt-dlp` format selector matching `backend/player.py`.
@@ -1014,6 +1037,7 @@ fn build_mpv_args_with_ytdlp(
             args.push(format!("--ytdl-raw-options-append=cookies={}", cf.display()));
         }
     }
+    args.push("--".to_string());
     args.push(target.to_string());
     args
 }
@@ -1038,6 +1062,7 @@ pub fn build_vlc_args(
     if let Some(meta_title) = title.map(str::trim).filter(|s| !s.is_empty()) {
         args.push(format!("--meta-title={meta_title}"));
     }
+    args.push("--".to_string());
     args.push(target.to_string());
     args
 }
@@ -1144,6 +1169,7 @@ fn resolve_vlc_stream_urls(
     quality: &str,
     audio_only: bool,
 ) -> Result<(String, Option<String>)> {
+    validate_http_url(url)?;
     let run_once = |cf: Option<&Path>| -> Result<(String, Option<String>)> {
         let mut cmd = StdCommand::new(ytdlp_bin);
         cmd.arg("--no-warnings")
@@ -1165,7 +1191,8 @@ fn resolve_vlc_stream_urls(
         if let Some(cookie) = cf {
             cmd.arg("--cookies").arg(cookie);
         }
-        cmd.arg(url)
+        cmd.arg("--")
+            .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1981,6 +2008,31 @@ pub fn rewrite_m3u8_playlist(body: &str, base_url: &str, proxy_prefix: &str) -> 
     out
 }
 
+fn is_allowed_stream_proxy_host(parsed: &Url) -> bool {
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+    // Reject raw IP literals (prevents loopback/LAN/metadata SSRF).
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || (host.starts_with('[') && host.ends_with(']'))
+    {
+        return false;
+    }
+    const ALLOWED_EXACT: &[&str] = &[
+        "googlevideo.com",
+        "youtube.com",
+        "ytimg.com",
+        "ggpht.com",
+        "googleusercontent.com",
+    ];
+    ALLOWED_EXACT
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
 /// Fetches an upstream media URL or HLS playlist for the `playzi-stream://` custom protocol.
 pub async fn fetch_proxied_stream(
     client: &reqwest::Client,
@@ -1988,11 +2040,12 @@ pub async fn fetch_proxied_stream(
     range_header: Option<&str>,
     proxy_prefix: &str,
 ) -> Result<ProxiedStreamResponse> {
-    let trimmed = raw_url.trim();
-    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
-        return Err(CoreError::Validation("Invalid stream proxy URL".into()));
+    let parsed = validate_http_url(raw_url)?;
+    if !is_allowed_stream_proxy_host(&parsed) {
+        return Err(CoreError::Validation(
+            "Host no permitido para el proxy de stream".into(),
+        ));
     }
-    let parsed = Url::parse(trimmed)?;
     let mut req = client.get(parsed).header("Accept", "*/*");
     if let Some(range) = range_header.filter(|r| !r.trim().is_empty()) {
         req = req.header("Range", range);
@@ -2002,6 +2055,12 @@ pub async fn fetch_proxied_stream(
         .send()
         .await
         .map_err(|err| CoreError::External(format!("Stream proxy request failed: {err}")))?;
+
+    if !is_allowed_stream_proxy_host(resp.url()) {
+        return Err(CoreError::Validation(
+            "Redirección a host no permitido en el proxy de stream".into(),
+        ));
+    }
 
     let status = resp.status().as_u16();
     let final_url = resp.url().to_string();

@@ -48,6 +48,17 @@ pub struct UserProfile {
     pub user_id: String,
     pub display_name: String,
     pub google_account_name: String,
+    pub auth_token: String,
+}
+
+impl UserProfile {
+    pub fn public_json(&self) -> Value {
+        serde_json::json!({
+            "userId": self.user_id,
+            "displayName": self.display_name,
+            "googleAccountName": self.google_account_name,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

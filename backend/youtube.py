@@ -18,8 +18,18 @@ _CACHE_TTL = 300
 _CACHE_MAX = 50
 
 
+from urllib.parse import urlparse
+
+
 def is_youtube_url(value: str) -> bool:
-    return bool(YOUTUBE_RE.search(value or ""))
+    try:
+        parsed = urlparse((value or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be"
 
 
 def _entry_to_item(entry: dict[str, Any]) -> dict[str, Any]:

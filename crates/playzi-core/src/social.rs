@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use url::Url;
 
 use crate::config::ConfigStore;
@@ -242,6 +244,9 @@ struct SocialRuntimeState {
     incoming_join_requests: Vec<RoomJoinRequestItem>,
     published_room: Option<PublishedRoomInfo>,
     outbound_tx: Option<mpsc::UnboundedSender<Value>>,
+    /// Tracks outgoing room join requests (host_user_id -> requested_at) so unsolicited
+    /// `room_join_approved` events from the hub cannot force a zero-click auto-join.
+    pending_join_requests: std::collections::HashMap<String, std::time::Instant>,
 }
 
 struct SocialManagerInner {
@@ -511,8 +516,10 @@ impl SocialManager {
                 let endpoint = format!("{detected}/api/social");
                 let _ = client
                     .post(&endpoint)
+                    .header("X-Playzi-Auth", &profile.auth_token)
                     .json(&json!({
                         "userId": profile.user_id,
+                        "authToken": profile.auth_token,
                         "displayName": profile.display_name,
                         "googleAccountName": profile.google_account_name,
                         "action": "disconnect",
@@ -561,9 +568,17 @@ impl SocialManager {
         to_user_id: &str,
         room_code: Option<&str>,
     ) -> Result<()> {
+        let target_id = to_user_id.trim().to_uppercase();
+        if !target_id.is_empty() {
+            let mut rt = self.inner.runtime.write().await;
+            let now = std::time::Instant::now();
+            rt.pending_join_requests
+                .retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(600));
+            rt.pending_join_requests.insert(target_id.clone(), now);
+        }
         self.send_hub_message(json!({
             "type": "room_join_request",
-            "toUserId": to_user_id.trim().to_uppercase(),
+            "toUserId": target_id,
             "roomCode": room_code.unwrap_or("").trim().to_uppercase(),
         }))
         .await
@@ -651,8 +666,10 @@ impl SocialManager {
 
                     let initial_res = http_client
                         .post(&social_endpoint)
+                        .header("X-Playzi-Auth", &profile.auth_token)
                         .json(&json!({
                             "userId": profile.user_id,
+                            "authToken": profile.auth_token,
                             "displayName": profile.display_name,
                             "googleAccountName": profile.google_account_name,
                             "action": "sync",
@@ -758,8 +775,10 @@ impl SocialManager {
                                     .unwrap_or_else(|_| profile.clone());
                                 let resp = http_client
                                     .post(&social_endpoint)
+                                    .header("X-Playzi-Auth", &current_profile.auth_token)
                                     .json(&json!({
                                         "userId": current_profile.user_id,
+                                        "authToken": current_profile.auth_token,
                                         "displayName": current_profile.display_name,
                                         "googleAccountName": current_profile.google_account_name,
                                         "action": action,
@@ -783,8 +802,10 @@ impl SocialManager {
                                 };
                                 let resp = http_client
                                     .post(&social_endpoint)
+                                    .header("X-Playzi-Auth", &current_profile.auth_token)
                                     .json(&json!({
                                         "userId": current_profile.user_id,
+                                        "authToken": current_profile.auth_token,
                                         "displayName": current_profile.display_name,
                                         "googleAccountName": current_profile.google_account_name,
                                         "action": "sync",
@@ -848,9 +869,28 @@ impl SocialManager {
                     .append_pair("displayName", &profile.display_name)
                     .append_pair("googleAccountName", &profile.google_account_name);
 
+                let mut ws_req = match url.as_str().into_client_request() {
+                    Ok(req) => req,
+                    Err(e) => {
+                        {
+                            let mut rt = manager.inner.runtime.write().await;
+                            rt.connected = false;
+                            rt.last_error = format!("Solicitud WS de Hub inválida: {e}");
+                        }
+                        manager.emit_snapshot().await;
+                        if reconnect_rx.changed().await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if let Ok(val) = HeaderValue::from_str(&profile.auth_token) {
+                    ws_req.headers_mut().insert("X-Playzi-Auth", val);
+                }
+
                 let connect_res = tokio::time::timeout(
                     Duration::from_secs(12),
-                    tokio_tungstenite::connect_async(url.as_str()),
+                    tokio_tungstenite::connect_async(ws_req),
                 )
                 .await;
 
@@ -1089,7 +1129,8 @@ impl SocialManager {
                     .get("hostUserId")
                     .and_then(Value::as_str)
                     .unwrap_or("")
-                    .to_string();
+                    .trim()
+                    .to_uppercase();
                 let host_display_name = val
                     .get("hostDisplayName")
                     .and_then(Value::as_str)
@@ -1104,15 +1145,50 @@ impl SocialManager {
                     .get("inviteUrl")
                     .and_then(Value::as_str)
                     .unwrap_or("")
+                    .trim()
                     .to_string();
-                if !invite_url.is_empty() {
-                    let _ = self.inner.events_tx.send(SocialEvent::JoinApproved {
-                        host_user_id,
-                        host_display_name,
-                        room_code,
-                        invite_url,
-                    });
+
+                let (has_pending, configured_hub) = {
+                    let mut rt = self.inner.runtime.write().await;
+                    let now = std::time::Instant::now();
+                    rt.pending_join_requests
+                        .retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(600));
+                    let matched = rt.pending_join_requests.remove(&host_user_id).is_some();
+                    (matched, rt.hub_url.clone())
+                };
+
+                if !has_pending || invite_url.is_empty() {
+                    return;
                 }
+
+                // Restrict auto-join target to the configured hub host or Cloudflare quick tunnel.
+                let is_trusted_invite = Url::parse(&invite_url)
+                    .ok()
+                    .filter(|u| matches!(u.scheme(), "http" | "https" | "ws" | "wss"))
+                    .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                    .map(|invite_host| {
+                        let hub_host = normalize_hub_http_base(&configured_hub)
+                            .and_then(|b| Url::parse(&b).ok())
+                            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+                        hub_host.as_deref() == Some(invite_host.as_str())
+                            || invite_host.ends_with(".trycloudflare.com")
+                    })
+                    .unwrap_or(false);
+
+                if !is_trusted_invite {
+                    self.emit_notice(
+                        "error",
+                        "Se bloqueó una redirección de sala hacia un servidor no confiable.",
+                    );
+                    return;
+                }
+
+                let _ = self.inner.events_tx.send(SocialEvent::JoinApproved {
+                    host_user_id,
+                    host_display_name,
+                    room_code,
+                    invite_url,
+                });
             }
             "notice" => {
                 let level = val.get("level").and_then(Value::as_str).unwrap_or("info");

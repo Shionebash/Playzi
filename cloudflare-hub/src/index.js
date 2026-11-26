@@ -3,7 +3,7 @@
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, X-Playzi-Auth, X-Playzi-Host-Secret",
 };
 
 function jsonResponse(data, status = 200) {
@@ -27,6 +27,23 @@ function safeSend(ws, obj) {
   } catch (_) {
     return false;
   }
+}
+
+async function hashSecret(raw) {
+  const bytes = new TextEncoder().encode(String(raw || ""));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function timingSafeEqualStr(a, b) {
+  const sa = String(a || "");
+  const sb = String(b || "");
+  if (sa.length !== sb.length || sa.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < sa.length; i += 1) {
+    diff |= sa.charCodeAt(i) ^ sb.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 export default {
@@ -75,6 +92,7 @@ export class PartyRoom {
     this.ctx = ctx;
     this.env = env;
     this.hostSocket = null;
+    this.hostSecretHash = null;
     this.guests = new Map(); // connId -> WebSocket
   }
 
@@ -86,12 +104,33 @@ export class PartyRoom {
     const url = new URL(request.url);
     const role = String(url.searchParams.get("role") || "guest").toLowerCase();
 
+    let hostSecretHash = null;
+    if (role === "host") {
+      const rawSecret = String(
+        request.headers.get("X-Playzi-Host-Secret")
+        || url.searchParams.get("hostSecret")
+        || ""
+      ).trim();
+      if (rawSecret.length < 16) {
+        return jsonResponse({ error: "Missing or invalid hostSecret" }, 401);
+      }
+      hostSecretHash = await hashSecret(rawSecret);
+      if (
+        this.hostSocket
+        && this.hostSocket.readyState === 1
+        && this.hostSecretHash
+        && !timingSafeEqualStr(this.hostSecretHash, hostSecretHash)
+      ) {
+        return jsonResponse({ error: "Forbidden: invalid hostSecret" }, 403);
+      }
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
 
     if (role === "host") {
-      this.attachHost(server);
+      this.attachHost(server, hostSecretHash);
     } else {
       this.attachGuest(server);
     }
@@ -99,13 +138,29 @@ export class PartyRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  attachHost(ws) {
-    if (this.hostSocket && this.hostSocket !== ws) {
-      try {
-        this.hostSocket.close(1000, "Replaced by new host connection");
-      } catch (_) {}
+  attachHost(ws, secretHash) {
+    if (this.hostSocket && this.hostSocket !== ws && this.hostSocket.readyState === 1) {
+      if (this.hostSecretHash && timingSafeEqualStr(this.hostSecretHash, secretHash)) {
+        const prev = this.hostSocket;
+        this.hostSocket = ws;
+        this.hostSecretHash = secretHash;
+        try {
+          prev.close(1000, "Host reconnected");
+        } catch (_) {}
+      } else {
+        safeSend(ws, {
+          type: "room_closed",
+          reason: "La sala ya tiene un anfitrión conectado.",
+        });
+        try {
+          ws.close(4003, "Room already has an active host");
+        } catch (_) {}
+        return;
+      }
+    } else {
+      this.hostSocket = ws;
+      this.hostSecretHash = secretHash;
     }
-    this.hostSocket = ws;
 
     ws.addEventListener("message", (event) => {
       let msg;
@@ -150,6 +205,7 @@ export class PartyRoom {
     const onHostClose = () => {
       if (this.hostSocket !== ws) return;
       this.hostSocket = null;
+      this.hostSecretHash = null;
       const closeMsg = JSON.stringify({
         type: "room_closed",
         reason: "El host cerró la sesión.",
@@ -221,6 +277,7 @@ export class SocialHub {
     this.env = env;
     this.loaded = false;
     this.users = {}; // userId -> { userId, displayName, googleAccountName, updatedAt }
+    this.authTokens = {}; // userId -> sha256(authToken)
     this.friendships = {}; // userId -> string[]
     this.friendRequests = []; // { id, fromUserId, fromDisplayName, fromGoogleAccountName, toUserId, createdAt }
     this.sockets = new Map(); // userId -> Set<WebSocket>
@@ -230,12 +287,14 @@ export class SocialHub {
 
   async ensureLoaded() {
     if (this.loaded) return;
-    const [users, friendships, friendRequests] = await Promise.all([
+    const [users, authTokens, friendships, friendRequests] = await Promise.all([
       this.ctx.storage.get("users"),
+      this.ctx.storage.get("authTokens"),
       this.ctx.storage.get("friendships"),
       this.ctx.storage.get("friendRequests"),
     ]);
     this.users = users && typeof users === "object" ? users : {};
+    this.authTokens = authTokens && typeof authTokens === "object" ? authTokens : {};
     this.friendships = friendships && typeof friendships === "object" ? friendships : {};
     this.friendRequests = Array.isArray(friendRequests) ? friendRequests : [];
     this.loaded = true;
@@ -244,6 +303,7 @@ export class SocialHub {
   async persist() {
     await this.ctx.storage.put({
       users: this.users,
+      authTokens: this.authTokens,
       friendships: this.friendships,
       friendRequests: this.friendRequests,
     });
@@ -301,7 +361,13 @@ export class SocialHub {
         googleAccountName: "",
       };
       const online = this.isOnline(fid);
-      const room = online ? this.rooms.get(fid) || null : null;
+      const rawRoom = online ? this.rooms.get(fid) || null : null;
+      const room = rawRoom
+        ? {
+            ...rawRoom,
+            inviteUrl: rawRoom.roomAccess === "open" ? (rawRoom.inviteUrl || "") : "",
+          }
+        : null;
       return {
         userId: fid,
         displayName: profile.displayName || fid,
@@ -373,6 +439,27 @@ export class SocialHub {
     if (!userId) {
       return jsonResponse({ error: "Missing userId" }, 400);
     }
+
+    const rawAuthToken = String(
+      request.headers.get("X-Playzi-Auth")
+      || url.searchParams.get("authToken")
+      || ""
+    ).trim();
+    if (rawAuthToken.length < 16) {
+      return jsonResponse({ error: "Missing or invalid authToken" }, 401);
+    }
+    const tokenHash = await hashSecret(rawAuthToken);
+    const storedHash = Object.prototype.hasOwnProperty.call(this.authTokens, userId)
+      ? this.authTokens[userId]
+      : null;
+    if (storedHash) {
+      if (!timingSafeEqualStr(storedHash, tokenHash)) {
+        return jsonResponse({ error: "Invalid authToken for userId" }, 403);
+      }
+    } else {
+      this.authTokens[userId] = tokenHash;
+    }
+
     const displayName = String(url.searchParams.get("displayName") || userId)
       .trim()
       .slice(0, 48) || userId;
@@ -644,6 +731,11 @@ export class SocialHub {
         safeSend(ws, { type: "notice", level: "error", message: "Faltan datos para enviar la invitación." });
         return;
       }
+      const myFriends = Array.isArray(this.friendships[userId]) ? this.friendships[userId] : [];
+      if (!myFriends.includes(toUserId)) {
+        safeSend(ws, { type: "notice", level: "error", message: "Solo puedes invitar a usuarios que estén en tu lista de amigos." });
+        return;
+      }
       if (!this.isOnline(toUserId)) {
         safeSend(ws, { type: "notice", level: "error", message: "Tu amigo no está conectado en este momento." });
         return;
@@ -762,7 +854,7 @@ export class SocialHub {
       const me = this.users[userId] || { userId, displayName: userId };
       const myRoom = this.rooms.get(userId);
       const roomMatches = Boolean(myRoom && (!req.roomCode || myRoom.roomCode === req.roomCode));
-      const inviteUrl = roomMatches ? String(msg.inviteUrl || myRoom.inviteUrl || "").trim() : "";
+      const inviteUrl = roomMatches ? String(myRoom.inviteUrl || "").trim() : "";
 
       if (accept && roomMatches && inviteUrl) {
         this.sendToUser(req.fromUserId, {

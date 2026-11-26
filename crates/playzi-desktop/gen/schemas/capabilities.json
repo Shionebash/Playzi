@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default desktop capabilities for Playzi main and Google auth windows","local":true,"windows":["main","auth-google"],"permissions":["core:default","core:event:default","core:window:default"]}}
+{"default":{"identifier":"default","description":"Default desktop capabilities for Playzi main window","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:window:default"]}}

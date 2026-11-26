@@ -607,10 +607,11 @@ impl YtMusicClient {
     }
 
     /// Fetches items for a YouTube Music mix (`RD...`) or playlist (`VL...`, `PL...`, `OLAK...`).
+    /// Pass `limit: None` to fetch all tracks in a playlist without an artificial cap.
     pub async fn fetch_mix_or_playlist_items(
         &self,
         url_or_id: &str,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<MediaItem>> {
         let playlist_id = crate::youtube::extract_playlist_id_from_url(url_or_id)
             .unwrap_or_else(|| url_or_id.trim().to_string());
@@ -619,6 +620,7 @@ impl YtMusicClient {
         }
 
         if playlist_id.starts_with("RD") {
+            let mix_limit = limit.unwrap_or(50).max(1);
             let seed_vid = crate::youtube::extract_video_id(url_or_id).or_else(|| {
                 if playlist_id.len() == 13 && playlist_id.starts_with("RD") {
                     Some(playlist_id[2..].to_string())
@@ -637,7 +639,7 @@ impl YtMusicClient {
                 payload["videoId"] = Value::String(vid.to_string());
             }
             if let Ok(data) = self.post_innertube("next", payload).await {
-                let mut items = parse_music_next_items(&data, limit.max(1));
+                let mut items = parse_music_next_items(&data, mix_limit);
                 if !items.is_empty() {
                     self.enrich_missing_durations(&mut items).await;
                     return Ok(items);
@@ -645,7 +647,7 @@ impl YtMusicClient {
             }
         }
 
-        self.fetch_playlist_songs(&playlist_id).await
+        self.fetch_playlist_songs_with_limit(&playlist_id, limit).await
     }
 
     /// Enriches any stored `music_recommendations` in `StateStore` that are still missing duration.
@@ -715,8 +717,18 @@ impl YtMusicClient {
         Ok(playlists)
     }
 
-    /// Fetches songs in a YouTube Music playlist by playlist ID.
+    /// Fetches all songs in a YouTube Music playlist by playlist ID (following continuations).
     pub async fn fetch_playlist_songs(&self, playlist_id: &str) -> Result<Vec<MediaItem>> {
+        self.fetch_playlist_songs_with_limit(playlist_id, None).await
+    }
+
+    /// Fetches songs in a YouTube Music playlist by playlist ID, following continuation pages
+    /// until all songs are collected or `limit` (if `Some`) is reached.
+    pub async fn fetch_playlist_songs_with_limit(
+        &self,
+        playlist_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<MediaItem>> {
         let clean = playlist_id.trim();
         if clean.is_empty() {
             return Err(CoreError::Validation("Empty playlist ID".into()));
@@ -726,8 +738,51 @@ impl YtMusicClient {
         } else {
             format!("VL{clean}")
         };
-        let data = self.browse(&browse_id).await?;
-        let mut items = parse_music_items(&data, 100);
+        let mut data = self.browse(&browse_id).await?;
+        let mut items: Vec<MediaItem> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+
+        let target_limit = limit.unwrap_or(usize::MAX);
+        // Safety ceiling against malformed/infinite server loops (~50,000 tracks at 100/page).
+        const MAX_PAGES: usize = 500;
+
+        for page_idx in 0..MAX_PAGES {
+            let page_items = parse_playlist_page_items(&data, page_idx == 0);
+            let mut added_this_page = 0usize;
+            for item in page_items {
+                if seen_ids.insert(item.id.clone()) {
+                    items.push(item);
+                    added_this_page += 1;
+                    if items.len() >= target_limit {
+                        break;
+                    }
+                }
+            }
+
+            if items.len() >= target_limit {
+                break;
+            }
+
+            let Some(token) = extract_playlist_continuation(&data, page_idx == 0) else {
+                break;
+            };
+            if !seen_tokens.insert(token.clone()) {
+                break;
+            }
+            if page_idx > 0 && added_this_page == 0 {
+                break;
+            }
+
+            match self
+                .post_innertube("browse", json!({ "continuation": token }))
+                .await
+            {
+                Ok(next_data) => data = next_data,
+                Err(_) => break,
+            }
+        }
+
         self.enrich_missing_durations(&mut items).await;
         Ok(items)
     }
@@ -1079,6 +1134,59 @@ fn extract_music_continuation(data: &Value) -> Option<String> {
     })
 }
 
+/// Parses playlist tracks from a YouTube Music browse page, preferring the dedicated
+/// playlist shelf container so unrelated recommendation carousels at the bottom are skipped.
+fn parse_playlist_page_items(data: &Value, is_first_page: bool) -> Vec<MediaItem> {
+    let containers: Vec<&Value> = if is_first_page {
+        walk_renderers(data, "musicPlaylistShelfRenderer")
+    } else {
+        let mut c = walk_renderers(data, "musicPlaylistShelfContinuation");
+        c.extend(walk_renderers(data, "appendContinuationItemsAction"));
+        c
+    };
+
+    if !containers.is_empty() {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for container in containers {
+            for item in parse_music_items(container, usize::MAX) {
+                if seen.insert(item.id.clone()) {
+                    out.push(item);
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    parse_music_items(data, usize::MAX)
+}
+
+/// Extracts the continuation token for a YouTube Music playlist page, scoping to the
+/// playlist shelf/continuation container first so unrelated shelves are not followed.
+fn extract_playlist_continuation(data: &Value, is_first_page: bool) -> Option<String> {
+    let containers: Vec<&Value> = if is_first_page {
+        walk_renderers(data, "musicPlaylistShelfRenderer")
+    } else {
+        let mut c = walk_renderers(data, "musicPlaylistShelfContinuation");
+        c.extend(walk_renderers(data, "appendContinuationItemsAction"));
+        c
+    };
+
+    for container in &containers {
+        if let Some(tok) = extract_music_continuation(container) {
+            return Some(tok);
+        }
+    }
+
+    if containers.is_empty() {
+        extract_music_continuation(data)
+    } else {
+        None
+    }
+}
+
 fn extract_music_channel_url(node: &Value) -> Option<String> {
     match node {
         Value::Object(map) => {
@@ -1164,5 +1272,72 @@ fn first_nested_thumbnail(node: &Value) -> Option<String> {
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn playlist_page_parsing_scopes_to_playlist_shelf_and_ignores_cap() {
+        let mut shelf_contents = Vec::new();
+        for i in 0..120 {
+            shelf_contents.push(json!({
+                "musicResponsiveListItemRenderer": {
+                    "playlistItemData": { "videoId": format!("vid{i:08}") },
+                    "flexColumns": [
+                        { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": format!("Track {i}") }] } } },
+                        { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Artist" }] } } }
+                    ]
+                }
+            }));
+        }
+        shelf_contents.push(json!({
+            "continuationItemRenderer": {
+                "continuationEndpoint": {
+                    "continuationCommand": { "token": "PAGE_2_TOKEN" }
+                }
+            }
+        }));
+
+        let data = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "secondaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "musicPlaylistShelfRenderer": {
+                                        "contents": shelf_contents
+                                    }
+                                },
+                                {
+                                    "musicCarouselShelfRenderer": {
+                                        "contents": [
+                                            {
+                                                "musicTwoRowItemRenderer": {
+                                                    "navigationEndpoint": { "watchEndpoint": { "videoId": "unrelated999" } },
+                                                    "title": { "runs": [{ "text": "Suggested Track" }] }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let items = parse_playlist_page_items(&data, true);
+        assert_eq!(items.len(), 120);
+        assert!(!items.iter().any(|i| i.id == "unrelated999"));
+        assert_eq!(
+            extract_playlist_continuation(&data, true).as_deref(),
+            Some("PAGE_2_TOKEN")
+        );
     }
 }

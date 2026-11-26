@@ -338,10 +338,27 @@ export async function kvDel(key) {
 export function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Playzi-Auth, X-Playzi-Host-Secret");
   res.setHeader("Cache-Control", "no-store");
 }
 
 export function normalizeUserId(raw) {
   return String(raw || "").trim().toUpperCase();
+}
+
+export async function hashSecret(raw) {
+  const bytes = new TextEncoder().encode(String(raw || ""));
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function timingSafeEqualStr(a, b) {
+  const sa = String(a || "");
+  const sb = String(b || "");
+  if (sa.length !== sb.length || sa.length === 0) return false;
+  let diff = 0;
+  for (let i = 0; i < sa.length; i += 1) {
+    diff |= sa.charCodeAt(i) ^ sb.charCodeAt(i);
+  }
+  return diff === 0;
 }

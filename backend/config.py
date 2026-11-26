@@ -147,10 +147,13 @@ def _write_env_file(values: dict[str, str]) -> None:
         "VOLUME_NORMALIZATION",
         "SHOW_SHORTS",
     ]
-    lines = [f"{key}={values[key]}" for key in order if key in values]
+    def _clean(raw: str) -> str:
+        return str(raw).replace("\r", "").replace("\n", "").replace("\0", "").strip()
+
+    lines = [f"{_clean(key)}={_clean(values[key])}" for key in order if key in values]
     for key, value in values.items():
         if key not in order:
-            lines.append(f"{key}={value}")
+            lines.append(f"{_clean(key)}={_clean(value)}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

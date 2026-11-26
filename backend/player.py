@@ -21,7 +21,8 @@ def play(target: str, player: str | None = None, title: str | None = None, thumb
     exe = config.MPV_PATH if selected == "mpv" else config.VLC_PATH if selected == "vlc" else None
     if not exe:
         raise HTTPException(status_code=400, detail="Reproductor no soportado")
-    if not target.startswith("http"):
+    is_http = target.startswith("http://") or target.startswith("https://")
+    if not is_http:
         path = Path(target).resolve()
         if not path.exists():
             raise HTTPException(status_code=404, detail="Archivo no encontrado")
@@ -64,22 +65,23 @@ def _player_args(exe: str, selected: str, target: str) -> list[str]:
                 f"--script-opts=ytdl_hook-ytdl_path={ytdlp_path}",
                 "--ytdl-format",
                 _format_selector(quality=config.PLAYBACK_QUALITY),
+                "--",
                 target,
             ]
-        return [exe, target]
+        return [exe, "--", target]
     if selected == "vlc" and is_youtube_url(target):
         if _is_playlist_url(target):
             playlist = (
                 f"http://{config.APP_HOST}:{config.APP_PORT}/api/playlist.m3u"
                 f"?url={quote(target, safe='')}&quality={quote(config.PLAYBACK_QUALITY or 'best', safe='')}"
             )
-            return [exe, "--network-caching=2500", playlist]
+            return [exe, "--network-caching=2500", "--", playlist]
         local_stream = (
             f"http://{config.APP_HOST}:{config.APP_PORT}/api/stream"
             f"?url={quote(target, safe='')}&quality={quote(config.PLAYBACK_QUALITY or 'best', safe='')}"
         )
-        return [exe, "--network-caching=2500", local_stream]
-    return [exe, target]
+        return [exe, "--network-caching=2500", "--", local_stream]
+    return [exe, "--", target]
 
 
 def _resolve_vlc_stream(url: str, quality: str | None = None) -> dict[str, Any]:

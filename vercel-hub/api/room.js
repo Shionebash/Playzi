@@ -1,10 +1,15 @@
 // Playzi Watch Party HTTP Relay on Vercel Serverless Functions.
 // Bridges host and guest JSON control/sync messages via a lightweight per-room queue.
 
-import { kvGetJson, kvSetJson, setCors } from "../lib/store.js";
+import { hashSecret, kvGetJson, kvSetJson, setCors, timingSafeEqualStr } from "../lib/store.js";
 
 const ROOM_TTL_SECS = 120; // 2 min idle expiry (refreshed on every host_poll)
 const GUEST_STALE_MS = 25_000;
+const SAFE_KEY_RE = /^[a-zA-Z0-9_-]{1,80}$/;
+
+function hasOwnSafeKey(obj, key) {
+  return Boolean(obj && typeof key === "string" && SAFE_KEY_RE.test(key) && Object.prototype.hasOwnProperty.call(obj, key));
+}
 
 function roomKey(code) {
   return `playzi:room:v1:${String(code || "").trim().toUpperCase()}`;
@@ -16,6 +21,7 @@ function emptyRoom(code) {
     seq: 0,
     closed: false,
     hostLastSeenMs: 0,
+    hostSecretHash: "",
     guests: {},       // connId -> { lastSeenMs }
     hostInbox: [],    // [{ seq, event }]  (relayOpen, relayMessage, relayClose)
     guestInboxes: {}, // connId -> [{ seq, payload }]
@@ -52,70 +58,102 @@ export default async function handler(req, res) {
     const room = (await kvGetJson(key, null)) || emptyRoom(code);
     pruneGuests(room);
 
-    if (action === "host_poll") {
-      room.closed = false;
-      room.hostLastSeenMs = Date.now();
-      const since = Number(body.since || 0);
-      const events = room.hostInbox.filter((e) => e.seq > since);
-      // Optionally enqueue outgoing host messages in the same round-trip
-      const outgoing = Array.isArray(body.messages) ? body.messages : [];
-      for (const item of outgoing) {
-        const target = String(item?.relayTo || "");
-        const payload = String(item?.payload || "");
-        if (target && payload && room.guests[target]) {
-          room.seq += 1;
-          if (!room.guestInboxes[target]) room.guestInboxes[target] = [];
-          room.guestInboxes[target].push({ seq: room.seq, payload });
-          if (room.guestInboxes[target].length > 120) {
-            room.guestInboxes[target] = room.guestInboxes[target].slice(-120);
+    if (action === "host_poll" || action === "host_send" || action === "host_close") {
+      const rawHostSecret = String(req.headers["x-playzi-host-secret"] || body.hostSecret || "").trim();
+      if (rawHostSecret.length < 16) {
+        return res.status(401).json({ error: "Missing or invalid hostSecret" });
+      }
+      const secretHash = await hashSecret(rawHostSecret);
+      const hostActive =
+        !room.closed &&
+        Number(room.hostLastSeenMs || 0) > 0 &&
+        (Date.now() - Number(room.hostLastSeenMs || 0)) <= GUEST_STALE_MS;
+
+      if (action === "host_poll") {
+        if (room.hostSecretHash && hostActive) {
+          if (!timingSafeEqualStr(room.hostSecretHash, secretHash)) {
+            return res.status(403).json({ error: "Invalid hostSecret" });
+          }
+        } else {
+          room.hostSecretHash = secretHash;
+        }
+        room.closed = false;
+        room.hostLastSeenMs = Date.now();
+        const since = Number(body.since || 0);
+        const events = room.hostInbox.filter((e) => e.seq > since);
+        // Optionally enqueue outgoing host messages in the same round-trip
+        const outgoing = Array.isArray(body.messages) ? body.messages : [];
+        for (const item of outgoing) {
+          const target = String(item?.relayTo || "");
+          const payload = String(item?.payload || "");
+          if (target && payload && hasOwnSafeKey(room.guests, target)) {
+            room.seq += 1;
+            if (!hasOwnSafeKey(room.guestInboxes, target)) room.guestInboxes[target] = [];
+            room.guestInboxes[target].push({ seq: room.seq, payload });
+            if (room.guestInboxes[target].length > 120) {
+              room.guestInboxes[target] = room.guestInboxes[target].slice(-120);
+            }
           }
         }
+        await kvSetJson(key, room, ROOM_TTL_SECS);
+        return res.status(200).json({
+          ok: true,
+          seq: room.seq,
+          events: events.map((e) => e.event),
+        });
       }
-      await kvSetJson(key, room, ROOM_TTL_SECS);
-      return res.status(200).json({
-        ok: true,
-        seq: room.seq,
-        events: events.map((e) => e.event),
-      });
-    }
 
-    if (action === "host_send") {
-      room.closed = false;
-      room.hostLastSeenMs = Date.now();
-      const outgoing = Array.isArray(body.messages)
-        ? body.messages
-        : (body.relayTo ? [{ relayTo: body.relayTo, payload: body.payload }] : []);
-      for (const item of outgoing) {
-        const target = String(item?.relayTo || "");
-        const payload = String(item?.payload || "");
-        if (target && payload && room.guests[target]) {
-          room.seq += 1;
-          if (!room.guestInboxes[target]) room.guestInboxes[target] = [];
-          room.guestInboxes[target].push({ seq: room.seq, payload });
-          if (room.guestInboxes[target].length > 120) {
-            room.guestInboxes[target] = room.guestInboxes[target].slice(-120);
+      if (action === "host_send") {
+        if (!room.hostSecretHash || !timingSafeEqualStr(room.hostSecretHash, secretHash)) {
+          return res.status(403).json({ error: "Invalid hostSecret" });
+        }
+        room.closed = false;
+        room.hostLastSeenMs = Date.now();
+        const outgoing = Array.isArray(body.messages)
+          ? body.messages
+          : (body.relayTo ? [{ relayTo: body.relayTo, payload: body.payload }] : []);
+        for (const item of outgoing) {
+          const target = String(item?.relayTo || "");
+          const payload = String(item?.payload || "");
+          if (target && payload && hasOwnSafeKey(room.guests, target)) {
+            room.seq += 1;
+            if (!hasOwnSafeKey(room.guestInboxes, target)) room.guestInboxes[target] = [];
+            room.guestInboxes[target].push({ seq: room.seq, payload });
+            if (room.guestInboxes[target].length > 120) {
+              room.guestInboxes[target] = room.guestInboxes[target].slice(-120);
+            }
           }
         }
+        await kvSetJson(key, room, ROOM_TTL_SECS);
+        return res.status(200).json({ ok: true, seq: room.seq });
       }
-      await kvSetJson(key, room, ROOM_TTL_SECS);
-      return res.status(200).json({ ok: true, seq: room.seq });
-    }
 
-    if (action === "host_close") {
-      room.closed = true;
-      room.hostLastSeenMs = 0;
-      const closePayload = JSON.stringify({
-        type: "room_closed",
-        reason: "El host cerró la sesión",
-      });
-      for (const cid of Object.keys(room.guests || {})) {
-        room.seq += 1;
-        if (!room.guestInboxes[cid]) room.guestInboxes[cid] = [];
-        room.guestInboxes[cid].push({ seq: room.seq, payload: closePayload });
+      if (action === "host_close") {
+        if (room.hostSecretHash) {
+          if (!timingSafeEqualStr(room.hostSecretHash, secretHash)) {
+            return res.status(403).json({ error: "Invalid hostSecret" });
+          }
+        } else if (hostActive) {
+          return res.status(403).json({ error: "Invalid hostSecret" });
+        } else {
+          return res.status(200).json({ ok: true, closed: true });
+        }
+        room.closed = true;
+        room.hostLastSeenMs = 0;
+        room.hostSecretHash = "";
+        const closePayload = JSON.stringify({
+          type: "room_closed",
+          reason: "El host cerró la sesión",
+        });
+        for (const cid of Object.keys(room.guests || {})) {
+          room.seq += 1;
+          if (!room.guestInboxes[cid]) room.guestInboxes[cid] = [];
+          room.guestInboxes[cid].push({ seq: room.seq, payload: closePayload });
+        }
+        room.guests = {};
+        await kvSetJson(key, room, 60);
+        return res.status(200).json({ ok: true, closed: true });
       }
-      room.guests = {};
-      await kvSetJson(key, room, 60);
-      return res.status(200).json({ ok: true, closed: true });
     }
 
     if (action === "guest_join") {
@@ -130,7 +168,7 @@ export default async function handler(req, res) {
           error: "La sesión ya no existe o el host cerró la sala.",
         });
       }
-      const connId = String(body.connId || `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+      const connId = `g_${globalThis.crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
       room.guests[connId] = { lastSeenMs: Date.now() };
       room.guestInboxes[connId] = [];
       room.seq += 1;
@@ -151,7 +189,7 @@ export default async function handler(req, res) {
         Number(room.hostLastSeenMs || 0) > 0 &&
         (Date.now() - Number(room.hostLastSeenMs || 0)) <= GUEST_STALE_MS;
       if (!hostOnline) {
-        if (connId && room.guests[connId]) {
+        if (connId && hasOwnSafeKey(room.guests, connId)) {
           delete room.guests[connId];
           delete room.guestInboxes[connId];
           await kvSetJson(key, room, 60);
@@ -163,12 +201,12 @@ export default async function handler(req, res) {
           messages: [],
         });
       }
-      if (!connId || !room.guests[connId]) {
+      if (!connId || !hasOwnSafeKey(room.guests, connId)) {
         return res.status(404).json({ error: "Guest connection not found", roomClosed: true });
       }
       room.guests[connId].lastSeenMs = Date.now();
       const since = Number(body.since || 0);
-      const msgs = (room.guestInboxes[connId] || []).filter((m) => m.seq > since);
+      const msgs = (hasOwnSafeKey(room.guestInboxes, connId) ? room.guestInboxes[connId] : []).filter((m) => m.seq > since);
       const outgoing = Array.isArray(body.messages) ? body.messages : [];
       for (const payload of outgoing) {
         room.seq += 1;
@@ -191,7 +229,7 @@ export default async function handler(req, res) {
 
     if (action === "guest_send") {
       const connId = String(body.connId || "").trim();
-      if (!connId || !room.guests[connId]) {
+      if (!connId || !hasOwnSafeKey(room.guests, connId)) {
         return res.status(404).json({ error: "Guest connection not found" });
       }
       room.guests[connId].lastSeenMs = Date.now();
@@ -207,7 +245,7 @@ export default async function handler(req, res) {
 
     if (action === "guest_leave") {
       const connId = String(body.connId || "").trim();
-      if (connId && room.guests[connId]) {
+      if (connId && hasOwnSafeKey(room.guests, connId)) {
         delete room.guests[connId];
         delete room.guestInboxes[connId];
         room.seq += 1;

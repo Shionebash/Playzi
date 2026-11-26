@@ -188,9 +188,7 @@ impl DownloadManager {
     /// Spawns a Tokio task gated by `tokio::sync::Semaphore`.
     pub fn start_download(&self, req: DownloadRequest) -> Result<Value> {
         let url = req.url.trim().to_string();
-        if url.is_empty() {
-            return Err(CoreError::Validation("Download URL cannot be empty".into()));
-        }
+        crate::player::validate_http_url(&url)?;
 
         let current = self.state.read()?;
         if let Some(active) = current.downloads.iter().find(|j| {
@@ -415,6 +413,7 @@ impl DownloadManager {
             args.push(cf.to_string_lossy().to_string());
         }
 
+        args.push("--".to_string());
         args.push(url.to_string());
         args
     }
@@ -479,11 +478,8 @@ impl DownloadManager {
 
         // For YouTube, try unauthenticated web_safari/default first to avoid SABR-only
         // account restrictions that drop formats; fall back to cookies when sign-in is required.
-        let first_cookie = if is_youtube {
-            None
-        } else {
-            cookie_file.as_deref()
-        };
+        // Never send YouTube cookies to non-YouTube domains.
+        let first_cookie: Option<&Path> = None;
         let first_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, first_cookie);
         let mut outcome = self.run_ytdlp_once(&job_id, &first_args, &mut cancel_rx).await;
 

@@ -20,7 +20,7 @@ use playzi_core::party::{
 };
 use playzi_core::player::{PlayRequest, PlayerControlCommand};
 use playzi_core::playlists::{
-    add_item, create_playlist, delete_playlist, get_playlist, import_playlist_items,
+    add_item, create_playlist, delete_playlist, get_playlist, import_or_update_playlist_items,
     list_playlists, remove_item, rename_playlist, reorder_items, sync_playlist_items,
 };
 use playzi_core::youtube::{delete_channel, extract_video_id, list_channels, list_feed};
@@ -494,6 +494,10 @@ pub async fn dispatch_api_request(
                 .and_then(Value::as_str)
                 .unwrap_or("copy")
                 .to_string();
+            let force_new = body
+                .get("forceNew")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if url.is_empty() {
                 return Err("URL de playlist requerida".into());
             }
@@ -503,7 +507,7 @@ pub async fn dispatch_api_request(
             } else {
                 "youtube"
             };
-            let items = resolve_playlist_or_mix_for_api(runtime, &url, 150).await?;
+            let items = resolve_playlist_or_mix_for_api(runtime, &url, None).await?;
             if items.is_empty() {
                 return Err("No se encontraron videos o canciones en la playlist/mix".into());
             }
@@ -526,7 +530,7 @@ pub async fn dispatch_api_request(
                         "Playlist importada".to_string()
                     }
                 });
-            let created = import_playlist_items(
+            let outcome = import_or_update_playlist_items(
                 &runtime.state,
                 &name,
                 source,
@@ -534,9 +538,15 @@ pub async fn dispatch_api_request(
                 &pid,
                 &mode,
                 items,
+                force_new,
             )
             .map_err(|e| e.to_string())?;
-            serde_json::to_value(created).map_err(|e| e.to_string())
+            let mut val = serde_json::to_value(&outcome.playlist).map_err(|e| e.to_string())?;
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("updated".into(), Value::Bool(outcome.updated));
+                obj.insert("addedCount".into(), Value::from(outcome.added_count));
+            }
+            Ok(val)
         }
         ("GET", "/api/radio") => {
             let url = query.get("url").map(String::as_str).unwrap_or("");
@@ -943,13 +953,14 @@ pub async fn dispatch_api_request(
             let limit = body
                 .get("limit")
                 .and_then(Value::as_u64)
-                .unwrap_or(100) as usize;
+                .filter(|v| *v > 0)
+                .map(|v| v as usize);
             let items = resolve_playlist_or_mix_for_api(runtime, &url, limit).await?;
             Ok(json!({ "items": items, "requiresLogin": false }))
         }
         ("GET", "/api/profile") => {
             let prof = ensure_user_profile(&runtime.state).map_err(|e| e.to_string())?;
-            serde_json::to_value(prof).map_err(|e| e.to_string())
+            Ok(prof.public_json())
         }
         ("POST", "/api/profile") => {
             let req: ProfileUpdateRequest = serde_json::from_value(body)
@@ -959,7 +970,7 @@ pub async fn dispatch_api_request(
                 .social
                 .send_profile_update(&prof.display_name, &prof.google_account_name)
                 .await;
-            serde_json::to_value(prof).map_err(|e| e.to_string())
+            Ok(prof.public_json())
         }
         ("GET", "/api/friends") => {
             let items = list_friends(&runtime.state).map_err(|e| e.to_string())?;
@@ -1387,7 +1398,7 @@ async fn dispatch_dynamic_routes(
                         return Err("Solo las playlists vinculadas se pueden sincronizar".into());
                     }
                     let items =
-                        resolve_playlist_or_mix_for_api(runtime, &current.external_url, 150)
+                        resolve_playlist_or_mix_for_api(runtime, &current.external_url, None)
                             .await?;
                     let pid = extract_playlist_id(&current.external_url);
                     let source = if current.external_url.contains("music.youtube.com") {
@@ -1405,7 +1416,7 @@ async fn dispatch_dynamic_routes(
                     let is_playlist_url = raw_url.contains("list=")
                         && (!raw_url.contains("watch?v=") || extract_playlist_id(raw_url).starts_with("RD"));
                     if is_playlist_url {
-                        let resolved = resolve_playlist_or_mix_for_api(runtime, raw_url, 100).await?;
+                        let resolved = resolve_playlist_or_mix_for_api(runtime, raw_url, None).await?;
                         if resolved.is_empty() {
                             return Err("No se encontraron videos o canciones en la playlist/mix".into());
                         }
@@ -1469,7 +1480,7 @@ fn extract_playlist_id(url_or_id: &str) -> String {
 async fn resolve_playlist_or_mix_for_api(
     runtime: &AppRuntime,
     url: &str,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Result<Vec<Value>, String> {
     let clean_url = url.trim();
     if clean_url.is_empty() {
@@ -1486,7 +1497,7 @@ async fn resolve_playlist_or_mix_for_api(
     if is_music && !pid.is_empty() {
         if let Ok(ytm) = runtime.build_ytmusic_client() {
             if let Ok(ytm_items) = ytm
-                .fetch_mix_or_playlist_items(clean_url, limit.min(100))
+                .fetch_mix_or_playlist_items(clean_url, limit)
                 .await
             {
                 if ytm_items.len() > 1 || (!is_mix && !ytm_items.is_empty()) {
@@ -1504,6 +1515,7 @@ async fn resolve_playlist_or_mix_for_api(
 
     // 2. Try YouTube InnerTube /next for RD mixes (now derives seed videoId from RD<vid>).
     if is_mix {
+        let mix_limit = limit.unwrap_or(50).min(100);
         let snap = runtime.config.snapshot();
         let configured = if snap.cookies_file.trim().is_empty() {
             None
@@ -1513,7 +1525,7 @@ async fn resolve_playlist_or_mix_for_api(
         let jar = runtime.cookie_store().load_jar(configured).ok();
         if let Ok(mix_items) = runtime
             .youtube
-            .fetch_mix_items_with_cookies(clean_url, limit.min(50), jar.as_ref())
+            .fetch_mix_items_with_cookies(clean_url, mix_limit, jar.as_ref())
             .await
         {
             if mix_items.len() > 1 {
@@ -1529,7 +1541,12 @@ async fn resolve_playlist_or_mix_for_api(
     }
 
     // 3. Fallback to yt-dlp --flat-playlist.
-    let mut vals: Vec<Value> = match runtime.player.resolve_playlist(clean_url, limit).await {
+    let ytdlp_limit = if is_mix {
+        Some(limit.unwrap_or(50))
+    } else {
+        limit
+    };
+    let mut vals: Vec<Value> = match runtime.player.resolve_playlist(clean_url, ytdlp_limit).await {
         Ok(items) => items
             .into_iter()
             .filter_map(|i| serde_json::to_value(i).ok())
@@ -1544,6 +1561,7 @@ async fn resolve_playlist_or_mix_for_api(
 
     // 4. For mixes, never settle for 0 or 1 item — expand via radio from the seed video.
     if is_mix && vals.len() <= 1 {
+        let radio_limit = limit.unwrap_or(35).min(50);
         let seed_url = vals
             .first()
             .and_then(|v| v.get("url").and_then(Value::as_str))
@@ -1554,7 +1572,7 @@ async fn resolve_playlist_or_mix_for_api(
                     .map(|vid| format!("https://www.youtube.com/watch?v={vid}"))
             });
         if let Some(seed) = seed_url {
-            if let Ok(radio_items) = runtime.youtube.fetch_radio_items(&seed, limit.min(35)).await {
+            if let Ok(radio_items) = runtime.youtube.fetch_radio_items(&seed, radio_limit).await {
                 let mut seen: std::collections::HashSet<String> = vals
                     .iter()
                     .filter_map(|v| v.get("url").and_then(Value::as_str).map(ToString::to_string))

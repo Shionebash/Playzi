@@ -75,17 +75,124 @@ def remove_item(playlist_id: str, item_url: str) -> None:
     flush_state()
 
 
-def import_playlist(url: str, mode: str = "copy") -> dict[str, Any]:
+def _normalize_external_id(url: str = "", external_id: str = "") -> str:
+    raw = (external_id or "").strip()
+    if not raw and url:
+        parsed = urlparse(url.strip())
+        raw = parse_qs(parsed.query).get("list", [""])[0].strip()
+    if raw.startswith("VL") and len(raw) > 2:
+        return raw[2:]
+    return raw
+
+
+def _item_dedup_key(item: dict[str, Any]) -> str | None:
+    vid = str(item.get("id") or "").strip()
+    if vid:
+        return f"id:{vid}"
+    url = str(item.get("url") or "").strip()
+    if url:
+        parsed = urlparse(url)
+        qvid = parse_qs(parsed.query).get("v", [""])[0].strip()
+        if qvid:
+            return f"id:{qvid}"
+        return f"url:{url}"
+    return None
+
+
+def _playlist_matches(pl: dict[str, Any], norm_id: str, clean_url: str) -> bool:
+    existing_url = str(pl.get("externalUrl") or "").strip()
+    existing_id = _normalize_external_id(existing_url, str(pl.get("externalId") or ""))
+    if norm_id and existing_id and existing_id == norm_id:
+        return True
+    return bool(clean_url and existing_url and existing_url.lower() == clean_url.lower())
+
+
+def import_playlist(url: str, mode: str = "copy", force_new: bool = False) -> dict[str, Any]:
     if mode not in {"copy", "linked"}:
         raise ValueError("Modo de importacion invalido")
-    resolved = _resolve_external_playlist(url)
+    clean_url = url.strip()
+    resolved = _resolve_external_playlist(clean_url)
+    norm_id = _normalize_external_id(clean_url, resolved.get("externalId", ""))
     now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    if not force_new and (norm_id or clean_url):
+        updated_pl: dict[str, Any] | None = None
+        added_count = 0
+
+        def mutate_existing(data: dict[str, Any]) -> None:
+            nonlocal updated_pl, added_count
+            for pl in data.get("playlists", []):
+                if _playlist_matches(pl, norm_id, clean_url):
+                    merged = list(pl.get("items") or [])
+                    seen = {k for k in (_item_dedup_key(i) for i in merged) if k}
+                    for item in resolved["items"]:
+                        key = _item_dedup_key(item)
+                        if key and key not in seen:
+                            seen.add(key)
+                            merged.append(item)
+                            added_count += 1
+                    pl.update({
+                        "source": resolved["source"],
+                        "externalUrl": clean_url,
+                        "externalId": norm_id or resolved.get("externalId", ""),
+                        "importMode": mode,
+                        "lastSync": now,
+                        "thumbnail": resolved.get("thumbnail") or pl.get("thumbnail", ""),
+                        "items": merged,
+                    })
+                    _refresh_playlist_meta(pl)
+                    updated_pl = _normalize_playlist(pl)
+                    break
+            if updated_pl is not None:
+                found_summary = False
+                updated_summaries = []
+                for imp in data.get("importedPlaylists", []):
+                    if imp.get("id") == updated_pl["id"]:
+                        updated_summaries.append({
+                            **imp,
+                            "name": updated_pl["name"],
+                            "source": updated_pl["source"],
+                            "externalUrl": updated_pl["externalUrl"],
+                            "importMode": updated_pl["importMode"],
+                            "lastSync": now,
+                            "itemCount": updated_pl["itemCount"],
+                            "thumbnail": updated_pl["thumbnail"],
+                        })
+                        found_summary = True
+                    else:
+                        updated_summaries.append(imp)
+                if not found_summary:
+                    updated_summaries.insert(0, {
+                        "id": updated_pl["id"],
+                        "name": updated_pl["name"],
+                        "source": updated_pl["source"],
+                        "externalUrl": updated_pl["externalUrl"],
+                        "importMode": updated_pl["importMode"],
+                        "lastSync": now,
+                        "itemCount": updated_pl["itemCount"],
+                        "thumbnail": updated_pl["thumbnail"],
+                    })
+                data["importedPlaylists"] = updated_summaries
+
+        update_state(mutate_existing)
+        if updated_pl is not None:
+            flush_state()
+            add_history_event({
+                "action": "sync",
+                "source": updated_pl["source"],
+                "url": clean_url,
+                "title": updated_pl["name"],
+                "thumbnail": updated_pl["thumbnail"],
+                "date": now,
+            })
+            return {**updated_pl, "updated": True, "addedCount": added_count}
+
     playlist = {
         "id": str(uuid.uuid4()),
         "name": resolved["title"],
         "source": resolved["source"],
-        "externalUrl": url,
-        "externalId": resolved.get("externalId", ""),
+        "externalUrl": clean_url,
+        "externalId": norm_id or resolved.get("externalId", ""),
         "importMode": mode,
         "lastSync": now,
         "itemCount": len(resolved["items"]),
@@ -112,12 +219,12 @@ def import_playlist(url: str, mode: str = "copy") -> dict[str, Any]:
     add_history_event({
         "action": "import",
         "source": playlist["source"],
-        "url": url,
+        "url": clean_url,
         "title": playlist["name"],
         "thumbnail": playlist["thumbnail"],
         "date": now,
     })
-    return playlist
+    return {**playlist, "updated": False, "addedCount": len(playlist["items"])}
 
 
 def sync_playlist(playlist_id: str) -> dict[str, Any]:
@@ -202,7 +309,7 @@ def _resolve_external_playlist(url: str) -> dict[str, Any]:
         try:
             from .ytmusic import music_playlist_queue
 
-            data = music_playlist_queue(query["list"][0], limit=150)
+            data = music_playlist_queue(query["list"][0], limit=None)
             items = data.get("items") or []
             if items:
                 return {
@@ -219,7 +326,6 @@ def _resolve_external_playlist(url: str) -> dict[str, Any]:
         "quiet": True,
         "skip_download": True,
         "extract_flat": "in_playlist",
-        "playlistend": 150,
         "ignoreerrors": True,
         **javascript_runtime_opts(),
     }

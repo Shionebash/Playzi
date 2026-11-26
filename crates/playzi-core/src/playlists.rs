@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::error::{CoreError, Result};
 use crate::state::StateStore;
+use crate::youtube::{extract_playlist_id_from_url, extract_video_id};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -92,6 +93,84 @@ pub fn get_playlist(store: &StateStore, playlist_id: &str) -> Result<Option<Play
         .map(normalize_playlist))
 }
 
+/// Normalizes a playlist external ID by extracting `list=` from URLs and stripping a leading
+/// YouTube Music `VL` browse prefix (e.g. `VLPL123` -> `PL123`) so equivalent playlists match.
+pub fn normalize_playlist_external_id(external_url: &str, external_id: &str) -> String {
+    let raw = if !external_id.trim().is_empty() {
+        external_id.trim().to_string()
+    } else if let Some(from_url) = extract_playlist_id_from_url(external_url) {
+        from_url
+    } else {
+        String::new()
+    };
+    if let Some(stripped) = raw.strip_prefix("VL") {
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+    raw
+}
+
+fn item_dedup_key(item: &Value) -> Option<String> {
+    if let Some(id) = item.get("id").and_then(Value::as_str).map(str::trim) {
+        if !id.is_empty() {
+            return Some(format!("id:{id}"));
+        }
+    }
+    if let Some(url) = item.get("url").and_then(Value::as_str).map(str::trim) {
+        if !url.is_empty() {
+            if let Some(vid) = extract_video_id(url) {
+                return Some(format!("id:{vid}"));
+            }
+            return Some(format!("url:{url}"));
+        }
+    }
+    None
+}
+
+fn playlist_matches_external(pl: &Value, norm_id: &str, clean_url: &str) -> bool {
+    let existing_url = pl
+        .get("externalUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let existing_id = pl
+        .get("externalId")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let existing_norm_id = normalize_playlist_external_id(existing_url, existing_id);
+    if !norm_id.is_empty() && !existing_norm_id.is_empty() && existing_norm_id == norm_id {
+        return true;
+    }
+    !clean_url.is_empty() && !existing_url.is_empty() && existing_url.eq_ignore_ascii_case(clean_url)
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportPlaylistOutcome {
+    pub playlist: Playlist,
+    pub updated: bool,
+    pub added_count: usize,
+}
+
+pub fn find_matching_playlist(
+    store: &StateStore,
+    external_url: &str,
+    external_id: &str,
+) -> Result<Option<Playlist>> {
+    let clean_url = external_url.trim();
+    let norm_id = normalize_playlist_external_id(clean_url, external_id);
+    if norm_id.is_empty() && clean_url.is_empty() {
+        return Ok(None);
+    }
+    let data = store.read()?;
+    Ok(data
+        .playlists
+        .iter()
+        .find(|pl| playlist_matches_external(pl, &norm_id, clean_url))
+        .map(normalize_playlist))
+}
+
 pub fn import_playlist_items(
     store: &StateStore,
     name: &str,
@@ -101,27 +180,148 @@ pub fn import_playlist_items(
     mode: &str,
     items: Vec<Value>,
 ) -> Result<Playlist> {
+    let outcome = import_or_update_playlist_items(
+        store,
+        name,
+        source,
+        external_url,
+        external_id,
+        mode,
+        items,
+        true,
+    )?;
+    Ok(outcome.playlist)
+}
+
+pub fn import_or_update_playlist_items(
+    store: &StateStore,
+    name: &str,
+    source: &str,
+    external_url: &str,
+    external_id: &str,
+    mode: &str,
+    items: Vec<Value>,
+    force_new: bool,
+) -> Result<ImportPlaylistOutcome> {
     let clean_mode = match mode.trim() {
         "copy" | "linked" => mode.trim(),
         _ => return Err(CoreError::Validation("Modo de importacion invalido".into())),
     };
+    let clean_url = external_url.trim();
+    let norm_id = normalize_playlist_external_id(clean_url, external_id);
+    let clean_source = if source.trim().is_empty() {
+        "youtube"
+    } else {
+        source.trim()
+    };
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    if !force_new && (!norm_id.is_empty() || !clean_url.is_empty()) {
+        let mut updated_pl: Option<Playlist> = None;
+        let mut added_count = 0usize;
+        store.update(|data| {
+            for pl in &mut data.playlists {
+                if playlist_matches_external(pl, &norm_id, clean_url) {
+                    let mut merged: Vec<Value> = pl
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut seen: HashSet<String> =
+                        merged.iter().filter_map(item_dedup_key).collect();
+                    for item in &items {
+                        if let Some(key) = item_dedup_key(item) {
+                            if seen.insert(key) {
+                                merged.push(item.clone());
+                                added_count += 1;
+                            }
+                        }
+                    }
+                    let thumb = first_thumb(&merged);
+                    if let Some(obj) = pl.as_object_mut() {
+                        obj.insert("source".into(), Value::String(clean_source.to_string()));
+                        if !clean_url.is_empty() {
+                            obj.insert("externalUrl".into(), Value::String(clean_url.to_string()));
+                        }
+                        if !norm_id.is_empty() {
+                            obj.insert("externalId".into(), Value::String(norm_id.clone()));
+                        }
+                        obj.insert("importMode".into(), Value::String(clean_mode.to_string()));
+                        obj.insert("lastSync".into(), Value::String(now.clone()));
+                        if !thumb.is_empty() {
+                            obj.insert("thumbnail".into(), Value::String(thumb));
+                        }
+                        obj.insert("items".into(), Value::Array(merged));
+                    }
+                    refresh_playlist_meta_value(pl);
+                    updated_pl = Some(normalize_playlist(pl));
+                    break;
+                }
+            }
+            if let Some(ref pl) = updated_pl {
+                let mut found_summary = false;
+                for imp in &mut data.imported_playlists {
+                    if imp.get("id").and_then(Value::as_str) == Some(pl.id.as_str()) {
+                        if let Some(obj) = imp.as_object_mut() {
+                            obj.insert("name".into(), Value::String(pl.name.clone()));
+                            obj.insert("source".into(), Value::String(pl.source.clone()));
+                            obj.insert("externalUrl".into(), Value::String(pl.external_url.clone()));
+                            obj.insert("importMode".into(), Value::String(pl.import_mode.clone()));
+                            obj.insert("lastSync".into(), Value::String(now.clone()));
+                            obj.insert("itemCount".into(), Value::from(pl.item_count));
+                            if !pl.thumbnail.is_empty() {
+                                obj.insert("thumbnail".into(), Value::String(pl.thumbnail.clone()));
+                            }
+                        }
+                        found_summary = true;
+                        break;
+                    }
+                }
+                if !found_summary {
+                    data.imported_playlists.insert(
+                        0,
+                        serde_json::json!({
+                            "id": pl.id,
+                            "name": pl.name,
+                            "source": pl.source,
+                            "externalUrl": pl.external_url,
+                            "importMode": pl.import_mode,
+                            "lastSync": now,
+                            "itemCount": pl.item_count,
+                            "thumbnail": pl.thumbnail,
+                        }),
+                    );
+                }
+            }
+            Ok(())
+        })?;
+
+        if let Some(playlist) = updated_pl {
+            return Ok(ImportPlaylistOutcome {
+                playlist,
+                updated: true,
+                added_count,
+            });
+        }
+    }
+
     let clean_name = if name.trim().is_empty() {
         "Playlist importada"
     } else {
         name.trim()
     };
-    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let thumb = first_thumb(&items);
+    let added_count = items.len();
     let playlist = Playlist {
         id: Uuid::new_v4().to_string(),
         name: clean_name.to_string(),
-        source: if source.trim().is_empty() {
-            "youtube".to_string()
+        source: clean_source.to_string(),
+        external_url: clean_url.to_string(),
+        external_id: if norm_id.is_empty() {
+            external_id.trim().to_string()
         } else {
-            source.trim().to_string()
+            norm_id
         },
-        external_url: external_url.trim().to_string(),
-        external_id: external_id.trim().to_string(),
         import_mode: clean_mode.to_string(),
         last_sync: now.clone(),
         item_count: items.len(),
@@ -146,7 +346,11 @@ pub fn import_playlist_items(
         data.imported_playlists.insert(0, summary);
         Ok(())
     })?;
-    Ok(playlist)
+    Ok(ImportPlaylistOutcome {
+        playlist,
+        updated: false,
+        added_count,
+    })
 }
 
 pub fn sync_playlist_items(
@@ -158,6 +362,7 @@ pub fn sync_playlist_items(
     resolved_items: Vec<Value>,
 ) -> Result<Playlist> {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let norm_id = normalize_playlist_external_id("", external_id);
     let mut synced: Option<Playlist> = None;
     store.update(|data| {
         for pl in &mut data.playlists {
@@ -167,14 +372,10 @@ pub fn sync_playlist_items(
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let mut seen: HashSet<String> = merged
-                    .iter()
-                    .filter_map(|i| i.get("url").and_then(Value::as_str).map(ToString::to_string))
-                    .collect();
+                let mut seen: HashSet<String> = merged.iter().filter_map(item_dedup_key).collect();
                 for item in &resolved_items {
-                    let url_opt = item.get("url").and_then(Value::as_str);
-                    if let Some(u) = url_opt {
-                        if seen.insert(u.to_string()) {
+                    if let Some(key) = item_dedup_key(item) {
+                        if seen.insert(key) {
                             merged.push(item.clone());
                         }
                     }
@@ -187,8 +388,8 @@ pub fn sync_playlist_items(
                     if !source.trim().is_empty() {
                         obj.insert("source".into(), Value::String(source.trim().to_string()));
                     }
-                    if !external_id.trim().is_empty() {
-                        obj.insert("externalId".into(), Value::String(external_id.trim().to_string()));
+                    if !norm_id.is_empty() {
+                        obj.insert("externalId".into(), Value::String(norm_id.clone()));
                     }
                     obj.insert("lastSync".into(), Value::String(now.clone()));
                     if !thumb.is_empty() {
@@ -368,4 +569,97 @@ pub fn reorder_items(store: &StateStore, playlist_id: &str, urls: &[String]) -> 
         refresh_playlist_meta_value(pl);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reimport_recognizes_existing_playlist_and_merges_without_duplicates() {
+        let dir = tempdir().unwrap();
+        let store = StateStore::new(dir.path().join("state.json"));
+
+        let initial_items = vec![
+            json!({
+                "id": "vid00000001",
+                "title": "Song 1",
+                "url": "https://music.youtube.com/watch?v=vid00000001"
+            }),
+            json!({
+                "id": "vid00000002",
+                "title": "Song 2",
+                "url": "https://music.youtube.com/watch?v=vid00000002"
+            }),
+        ];
+
+        let first = import_or_update_playlist_items(
+            &store,
+            "My Playlist",
+            "music",
+            "https://music.youtube.com/playlist?list=PLabc123",
+            "VLPLabc123",
+            "copy",
+            initial_items,
+            false,
+        )
+        .unwrap();
+        assert!(!first.updated);
+        assert_eq!(first.added_count, 2);
+        assert_eq!(first.playlist.item_count, 2);
+        assert_eq!(first.playlist.external_id, "PLabc123");
+
+        // Re-import the same playlist with youtube.com URL and one overlapping + one new track
+        let reimport_items = vec![
+            json!({
+                "title": "Song 2",
+                "url": "https://www.youtube.com/watch?v=vid00000002"
+            }),
+            json!({
+                "id": "vid00000003",
+                "title": "Song 3",
+                "url": "https://music.youtube.com/watch?v=vid00000003"
+            }),
+        ];
+        let second = import_or_update_playlist_items(
+            &store,
+            "Playlist PLabc123",
+            "music",
+            "https://www.youtube.com/playlist?list=PLabc123",
+            "PLabc123",
+            "linked",
+            reimport_items,
+            false,
+        )
+        .unwrap();
+        assert!(second.updated);
+        assert_eq!(second.playlist.id, first.playlist.id);
+        assert_eq!(second.playlist.name, "My Playlist");
+        assert_eq!(second.playlist.import_mode, "linked");
+        assert_eq!(second.added_count, 1);
+        assert_eq!(second.playlist.item_count, 3);
+        assert_eq!(list_playlists(&store).unwrap().len(), 1);
+
+        // Explicitly forcing a new copy should create a second playlist
+        let forced = import_or_update_playlist_items(
+            &store,
+            "Copy 2",
+            "music",
+            "https://music.youtube.com/playlist?list=PLabc123",
+            "PLabc123",
+            "copy",
+            vec![json!({
+                "id": "vid00000001",
+                "title": "Song 1",
+                "url": "https://music.youtube.com/watch?v=vid00000001"
+            })],
+            true,
+        )
+        .unwrap();
+        assert!(!forced.updated);
+        assert_ne!(forced.playlist.id, first.playlist.id);
+        assert_eq!(list_playlists(&store).unwrap().len(), 2);
+    }
 }

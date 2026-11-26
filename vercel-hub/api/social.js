@@ -1,7 +1,16 @@
 // Playzi Social Hub on Vercel Serverless Functions (HTTP polling transport).
 // Supports mutual friends, friend requests, online presence, open rooms, invites, and join requests.
 
-import { kvDel, kvGetJson, kvMGetJson, kvSetJson, normalizeUserId, setCors } from "../lib/store.js";
+import {
+  hashSecret,
+  kvDel,
+  kvGetJson,
+  kvMGetJson,
+  kvSetJson,
+  normalizeUserId,
+  setCors,
+  timingSafeEqualStr,
+} from "../lib/store.js";
 
 const STATE_KEY = "playzi:social:state:v1";
 const PRESENCE_TTL_SECS = 35;
@@ -12,6 +21,15 @@ const ROOM_STARTUP_GRACE_MS = 12_000;
 const NON_RELAY_ROOM_TTL_MS = 45_000;
 const INVITE_TTL_MS = 10 * 60_000;
 const JOIN_REQ_TTL_MS = 3 * 60_000;
+const SAFE_KEY_RE = /^[a-zA-Z0-9_-]{1,80}$/;
+
+function hasOwnSafeKey(obj, key) {
+  return Boolean(obj && typeof key === "string" && SAFE_KEY_RE.test(key) && Object.prototype.hasOwnProperty.call(obj, key));
+}
+
+function randomId(prefix) {
+  return `${prefix}_${globalThis.crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+}
 
 function presenceKey(uid) {
   return `playzi:presence:v1:${uid}`;
@@ -28,6 +46,7 @@ function relayRoomKey(code) {
 function emptySocialState() {
   return {
     profiles: {},        // userId -> { userId, displayName, googleAccountName }
+    authTokens: {},      // userId -> sha256(authToken)
     friends: {},         // userId -> [friendUserId]
     friendRequests: {},  // id -> { id, fromUserId, fromDisplayName, toUserId, toDisplayName, createdAt }
     rooms: {},           // legacy fallback map (auto-migrated/cleaned to per-user keys)
@@ -282,6 +301,7 @@ export default async function handler(req, res) {
 
     const st = (await kvGetJson(STATE_KEY, null)) || emptySocialState();
     if (!st.profiles) st.profiles = {};
+    if (!st.authTokens) st.authTokens = {};
     if (!st.friends) st.friends = {};
     if (!st.friendRequests) st.friendRequests = {};
     if (!st.rooms) st.rooms = {};
@@ -290,6 +310,20 @@ export default async function handler(req, res) {
     if (!st.inbox) st.inbox = {};
 
     let stateDirty = false;
+
+    const rawAuthToken = String(req.headers["x-playzi-auth"] || body.authToken || "").trim();
+    if (rawAuthToken.length < 16) {
+      return res.status(401).json({ error: "Missing or invalid authToken" });
+    }
+    const tokenHash = await hashSecret(rawAuthToken);
+    if (hasOwnSafeKey(st.authTokens, uid)) {
+      if (!timingSafeEqualStr(st.authTokens[uid], tokenHash)) {
+        return res.status(403).json({ error: "Invalid authToken for userId" });
+      }
+    } else {
+      st.authTokens[uid] = tokenHash;
+      stateDirty = true;
+    }
 
     const prevProf = st.profiles[uid] || {};
     const nextDisplayName = (action === "profile_update" && msg.displayName !== undefined
@@ -395,7 +429,7 @@ export default async function handler(req, res) {
             (r) => r.fromUserId === uid && r.toUserId === targetId,
           );
           if (!exists) {
-            const id = `fr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            const id = randomId("fr");
             st.friendRequests[id] = {
               id,
               fromUserId: uid,
@@ -464,12 +498,14 @@ export default async function handler(req, res) {
       const targetRoom = roomMap.get(targetId) || null;
       if (!targetId || !roomCode || !inviteUrl) {
         notice = { level: "error", message: "Faltan datos para enviar la invitación." };
+      } else if (!areFriends(st, uid, targetId)) {
+        notice = { level: "error", message: "Solo puedes invitar a usuarios que estén en tu lista de amigos." };
       } else if (!onlineMap.get(targetId)) {
         notice = { level: "error", message: "Tu amigo no está conectado en este momento." };
       } else if (targetRoom?.roomCode && String(targetRoom.roomCode).toUpperCase() !== roomCode) {
         notice = { level: "error", message: `${st.profiles[targetId]?.displayName || targetId} está en una sesión activa.` };
       } else {
-        const id = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const id = randomId("inv");
         const invite = {
           id,
           fromUserId: uid,
@@ -494,7 +530,7 @@ export default async function handler(req, res) {
         stateDirty = true;
       }
     } else if (action === "room_invite_dismiss") {
-      if (msg.inviteId && st.roomInvites[msg.inviteId]?.toUserId === uid) {
+      if (hasOwnSafeKey(st.roomInvites, msg.inviteId) && st.roomInvites[msg.inviteId]?.toUserId === uid) {
         delete st.roomInvites[msg.inviteId];
         stateDirty = true;
       }
@@ -525,7 +561,7 @@ export default async function handler(req, res) {
         if (duplicate) {
           notice = { level: "info", message: "Ya enviaste una solicitud para unirte a esta sala." };
         } else {
-          const id = `jr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const id = randomId("jr");
           const jrPublic = {
             id,
             fromUserId: uid,
@@ -553,7 +589,7 @@ export default async function handler(req, res) {
         }
       }
     } else if (action === "room_join_respond" || action === "room_join_response") {
-      const jr = st.joinRequests[msg.requestId];
+      const jr = hasOwnSafeKey(st.joinRequests, msg.requestId) ? st.joinRequests[msg.requestId] : null;
       const targetHost = jr ? (jr.toUserId || jr.hostUserId) : "";
       if (jr && targetHost === uid) {
         delete st.joinRequests[jr.id];
@@ -561,7 +597,7 @@ export default async function handler(req, res) {
         const accept = msg.accept !== undefined ? Boolean(msg.accept) : Boolean(msg.approved);
         const activeRoom = roomMap.get(uid) || null;
         const roomMatches = Boolean(activeRoom && (!jr.roomCode || activeRoom.roomCode === jr.roomCode));
-        const inviteUrl = roomMatches ? String(msg.inviteUrl || activeRoom.inviteUrl || "").trim() : "";
+        const inviteUrl = roomMatches ? String(activeRoom.inviteUrl || "").trim() : "";
         if (accept && roomMatches && inviteUrl) {
           pushInbox(st, jr.fromUserId, {
             type: "room_join_approved",

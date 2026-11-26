@@ -1130,9 +1130,19 @@ pub fn delete_channel(store: &StateStore, channel_id: &str) -> Result<()> {
 }
 
 pub fn is_youtube_url(value: &str) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)(youtube\.com|youtu\.be|music\.youtube\.com)").unwrap());
-    re.is_match(value)
+    let trimmed = value.trim();
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
 }
 
 pub fn extract_video_id(value: &str) -> Option<String> {
