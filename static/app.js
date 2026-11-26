@@ -36,6 +36,7 @@ const state = {
     shuffle: false,
     repeat: "none",
     autoplay: localStorage.getItem("playzi-autoplay") !== "0",
+    ambientLight: localStorage.getItem("playzi-ambient-light") !== "0",
     _originalQueue: [],
     _listenerAbort: null,
     _loadingId: 0,
@@ -229,8 +230,36 @@ function normalizeThumbUrl(url) {
   return value;
 }
 
-function thumbSrc(url) {
+function upgradeThumbUrl(url, preferMaxRes = false) {
   const normalized = normalizeThumbUrl(url);
+  if (!normalized) return "";
+  // Upgrade tiny YouTube Music / Google Photos square thumbnails (e.g. =w120-h120-l90-rj)
+  if (/googleusercontent\.com\//i.test(normalized)) {
+    const target = preferMaxRes ? 800 : 544;
+    const upgradedWH = normalized.replace(/=w(\d+)-h(\d+)([^&]*)$/i, (match, w, h, tail) => {
+      const wn = Number(w);
+      const hn = Number(h);
+      if (wn === hn && wn > 0 && wn < target) {
+        return `=w${target}-h${target}${tail}`;
+      }
+      return match;
+    });
+    if (upgradedWH !== normalized) return upgradedWH;
+    return normalized.replace(/=s(\d+)([^&]*)$/i, (match, s, tail) => {
+      const sn = Number(s);
+      if (sn > 0 && sn < target) return `=s${target}${tail}`;
+      return match;
+    });
+  }
+  // For large player covers, prefer maxresdefault.jpg over hqdefault/mqdefault/sddefault
+  if (preferMaxRes && /ytimg\.com\/vi\/[A-Za-z0-9_-]{11}\//i.test(normalized)) {
+    return normalized.replace(/\/(hqdefault|mqdefault|sddefault|default)\.jpg(\?.*)?$/i, "/maxresdefault.jpg");
+  }
+  return normalized;
+}
+
+function thumbSrc(url, preferMaxRes = false) {
+  const normalized = upgradeThumbUrl(url, preferMaxRes);
   if (!normalized) return "";
   if (normalized.startsWith("/") && !normalized.startsWith("//")) return normalized;
   if (IS_TAURI) {
@@ -275,25 +304,52 @@ function streamMasterProxyUrl(videoUrl, audioUrl, meta = null) {
 }
 
 function thumbAttrs(url, eager = false) {
-  const rawUrl = normalizeThumbUrl(url);
-  return `src="${escapeHtml(thumbSrc(rawUrl))}" data-thumb-url="${escapeHtml(rawUrl)}" alt="" loading="${eager ? "eager" : "lazy"}" referrerpolicy="no-referrer" onerror="fallbackThumb(this)"`;
+  const rawUrl = upgradeThumbUrl(url, false);
+  const origUrl = normalizeThumbUrl(url);
+  return `src="${escapeHtml(thumbSrc(rawUrl))}" data-thumb-url="${escapeHtml(rawUrl)}" data-thumb-orig="${escapeHtml(origUrl)}" alt="" loading="${eager ? "eager" : "lazy"}" referrerpolicy="no-referrer" onerror="fallbackThumb(this)"`;
 }
 
 function fallbackThumb(img) {
   const raw = normalizeThumbUrl(img.dataset.thumbUrl || "");
-  if (raw.includes("/hqdefault.jpg")) {
-    const next = raw.replace("/hqdefault.jpg", "/mqdefault.jpg");
-    img.dataset.thumbUrl = next;
-    img.src = thumbSrc(next);
+  const orig = normalizeThumbUrl(img.dataset.thumbOrig || "");
+  const steps = [
+    ["/maxresdefault.jpg", "/sddefault.jpg"],
+    ["/sddefault.jpg", "/hqdefault.jpg"],
+    ["/hqdefault.jpg", "/mqdefault.jpg"],
+    ["/mqdefault.jpg", "/default.jpg"],
+  ];
+  for (const [from, to] of steps) {
+    if (raw.includes(from)) {
+      const next = raw.replace(from, to);
+      img.dataset.thumbUrl = next;
+      img.src = thumbSrc(next, false);
+      return;
+    }
+  }
+  if (orig && orig !== raw) {
+    img.dataset.thumbUrl = orig;
+    img.dataset.thumbOrig = "";
+    img.src = thumbSrc(orig, false);
     return;
   }
-  if (raw.includes("/mqdefault.jpg")) {
-    const next = raw.replace("/mqdefault.jpg", "/default.jpg");
-    img.dataset.thumbUrl = next;
-    img.src = thumbSrc(next);
+  if (img.id === "musicArt") {
+    img.style.display = "none";
+    const f = document.getElementById("musicArtFallback");
+    if (f) f.style.display = "";
+    _ambientClear();
     return;
   }
   img.remove();
+}
+
+function onMusicArtLoad(img) {
+  const raw = normalizeThumbUrl(img.dataset.thumbUrl || "");
+  // YouTube returns a 120x90 grey placeholder with HTTP 200 when maxresdefault.jpg does not exist
+  if (raw.includes("/maxresdefault.jpg") && img.naturalWidth > 0 && img.naturalWidth <= 120) {
+    fallbackThumb(img);
+    return;
+  }
+  _ambientDrawImage(img);
 }
 
 function isUrl(value) {
@@ -321,6 +377,7 @@ function _formatTime(sec) {
 }
 
 function _destroyPlayer() {
+  _ambientStop();
   if (state.player._listenerAbort) {
     state.player._listenerAbort.abort();
     state.player._listenerAbort = null;
@@ -370,6 +427,7 @@ function setView(view) {
     view = "home";
   }
   if (state.view === "watch" && view !== "watch") {
+    _ambientStop();
     if (state.player.current) {
       // keep player alive — show mini player
       _showMiniPlayer();
@@ -384,6 +442,7 @@ function setView(view) {
   $(`#view-${view}`).classList.remove("hidden");
   $$(".nav-item[data-view]").forEach((el) => el.classList.toggle("active", el.dataset.view === view));
   render();
+  if (view === "watch") _syncAmbientState();
   _ensurePartyViewPolling();
   if (view === "party") {
     _syncPartyViewNow();
@@ -429,8 +488,178 @@ const PLAYER_ICONS = {
   headphones: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 14v-3a9 9 0 0 1 18 0v3"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3Z"/><path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3Z"/></svg>`,
   external: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>`,
   back: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>`,
+  ambient: (s = 14) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>`,
   musicNote: (s = 56) => `<svg class="pz-ico" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3" fill="currentColor"/><circle cx="18" cy="16" r="3" fill="currentColor"/></svg>`,
 };
+
+// ── Low-power Ambient Light Engine (32x18 video @ 5fps, 0-CPU static draw for music) ──
+const _ambient = {
+  timer: null,
+  corsBlocked: false,
+  hasDrawnFrame: false,
+  fallbackThumbKey: "",
+};
+
+function _ambientPrefersReducedMotion() {
+  return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+
+function _ambientIsEnabled() {
+  return Boolean(state.player.ambientLight) && !_ambientPrefersReducedMotion();
+}
+
+function _ambientClear() {
+  const canvas = document.getElementById("ambientCanvas");
+  if (!canvas) return;
+  canvas.classList.remove("is-active");
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    ctx.globalAlpha = 1;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+  _ambient.hasDrawnFrame = false;
+  _ambient.fallbackThumbKey = "";
+}
+
+function _ambientStop() {
+  if (_ambient.timer) {
+    clearInterval(_ambient.timer);
+    _ambient.timer = null;
+  }
+}
+
+function _ambientDrawImage(img) {
+  const canvas = document.getElementById("ambientCanvas");
+  if (!canvas) return;
+  if (!_ambientIsEnabled() || !img || !img.complete || img.naturalWidth === 0) {
+    canvas.classList.remove("is-active");
+    return;
+  }
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) return;
+  try {
+    ctx.globalAlpha = 1;
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    canvas.classList.add("is-active");
+    _ambient.hasDrawnFrame = true;
+  } catch (_) {
+    canvas.classList.remove("is-active");
+  }
+}
+
+function _ambientDrawStaticThumb(url) {
+  const canvas = document.getElementById("ambientCanvas");
+  if (!canvas || !_ambientIsEnabled() || !url) return;
+  const src = thumbSrc(url, false);
+  if (!src || _ambient.fallbackThumbKey === src) {
+    if (_ambient.hasDrawnFrame) canvas.classList.add("is-active");
+    return;
+  }
+  _ambient.fallbackThumbKey = src;
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.onload = () => {
+    if (_ambient.fallbackThumbKey === src && _ambientIsEnabled()) {
+      _ambientDrawImage(img);
+    }
+  };
+  img.src = src;
+}
+
+function _ambientTickVideo(immediate = false) {
+  const canvas = document.getElementById("ambientCanvas");
+  if (!canvas || !_ambientIsEnabled()) {
+    _ambientStop();
+    if (canvas) canvas.classList.remove("is-active");
+    return;
+  }
+  if (state.view !== "watch" || document.hidden || document.fullscreenElement || state.player.native?.active) {
+    _ambientStop();
+    return;
+  }
+  const player = state.player.vjs;
+  const video = player && !player.isDisposed() ? _getVideoMediaEl(player) : document.getElementById("webPlayerVideo");
+  if (!video || video.readyState < 2 || video.videoWidth === 0) return;
+  if (_ambient.corsBlocked) {
+    _ambientStop();
+    _ambientDrawStaticThumb(state.player.current?.thumbnail);
+    return;
+  }
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) return;
+  try {
+    ctx.globalAlpha = (immediate || !_ambient.hasDrawnFrame) ? 1 : 0.22;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    _ambient.hasDrawnFrame = true;
+    canvas.classList.add("is-active");
+  } catch (_) {
+    // Graceful fallback to static thumbnail if stream host blocks canvas read
+    _ambient.corsBlocked = true;
+    _ambientStop();
+    _ambientDrawStaticThumb(state.player.current?.thumbnail);
+  }
+}
+
+function _syncAmbientState() {
+  const canvas = document.getElementById("ambientCanvas");
+  if (!canvas) {
+    _ambientStop();
+    return;
+  }
+  if (!_ambientIsEnabled() || state.view !== "watch" || document.hidden || document.fullscreenElement || state.player.native?.active) {
+    _ambientStop();
+    if (!_ambientIsEnabled()) canvas.classList.remove("is-active");
+    return;
+  }
+  const useMusicLayout = state.player.sourceContext === "music" || state.player.audioOnly;
+  if (useMusicLayout) {
+    _ambientStop();
+    const artEl = document.getElementById("musicArt");
+    if (artEl && artEl.style.display !== "none" && artEl.complete && artEl.naturalWidth > 0) {
+      _ambientDrawImage(artEl);
+    } else if (state.player.current?.thumbnail) {
+      _ambientDrawStaticThumb(state.player.current.thumbnail);
+    }
+    return;
+  }
+  const player = state.player.vjs;
+  const video = player && !player.isDisposed() ? _getVideoMediaEl(player) : document.getElementById("webPlayerVideo");
+  if (!video) {
+    _ambientStop();
+    return;
+  }
+  if (_ambient.corsBlocked) {
+    _ambientStop();
+    _ambientDrawStaticThumb(state.player.current?.thumbnail);
+    return;
+  }
+  if (video.readyState >= 2 && video.videoWidth > 0) {
+    _ambientTickVideo(!_ambient.hasDrawnFrame);
+  } else if (state.player.current?.thumbnail) {
+    _ambientDrawStaticThumb(state.player.current.thumbnail);
+  }
+  if (!video.paused && !video.ended) {
+    if (!_ambient.timer) {
+      _ambient.timer = setInterval(() => _ambientTickVideo(false), 200);
+    }
+  } else {
+    _ambientStop();
+  }
+}
+
+function toggleAmbientLight() {
+  state.player.ambientLight = !state.player.ambientLight;
+  localStorage.setItem("playzi-ambient-light", state.player.ambientLight ? "1" : "0");
+  document.querySelectorAll("#toggleAmbientLight").forEach((btn) => {
+    btn.classList.toggle("btn-player-ctrl-on", state.player.ambientLight);
+    btn.setAttribute("aria-pressed", state.player.ambientLight ? "true" : "false");
+    btn.title = state.player.ambientLight ? "Modo ambiente: activo" : "Modo ambiente: inactivo";
+  });
+  _syncAmbientState();
+}
+
+document.addEventListener("visibilitychange", _syncAmbientState);
+document.addEventListener("fullscreenchange", _syncAmbientState);
 
 function _volIconSvg(vol, muted = false, size = 18) {
   if (muted || vol <= 0) return PLAYER_ICONS.volMute(size);
@@ -1975,10 +2204,13 @@ function _videoLayoutHtml() {
     <div id="watch-party-bar"></div>
     <div class="watch-layout watch-layout--video">
       <div class="watch-main">
-        <div class="watch-video-wrap">
-          <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline crossorigin="anonymous"></video>
-          <div id="webPlayerOverlay" class="player-overlay" style="display:none">
-            <div class="player-overlay-spinner"></div>
+        <div class="watch-video-stage">
+          <canvas id="ambientCanvas" class="ambient-canvas" width="32" height="18" aria-hidden="true"></canvas>
+          <div class="watch-video-wrap">
+            <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline crossorigin="anonymous"></video>
+            <div id="webPlayerOverlay" class="player-overlay" style="display:none">
+              <div class="player-overlay-spinner"></div>
+            </div>
           </div>
         </div>
         <div id="watch-info"></div>
@@ -1993,10 +2225,12 @@ function _musicLayoutHtml() {
     <div id="watch-party-bar"></div>
     <div class="watch-layout watch-layout--music">
       <div class="watch-main watch-main--music">
+        <canvas id="ambientCanvas" class="ambient-canvas ambient-canvas--music" width="24" height="24" aria-hidden="true"></canvas>
         <div class="music-player-card">
           <div class="music-art-wrap">
-            <img id="musicArt" class="music-art" src="" alt="" style="display:none"
-              onerror="this.style.display='none';var f=document.getElementById('musicArtFallback');if(f)f.style.display=''">
+            <img id="musicArt" class="music-art" src="" alt="" crossorigin="anonymous" referrerpolicy="no-referrer" style="display:none"
+              onload="onMusicArtLoad(this)"
+              onerror="fallbackThumb(this)">
             <div class="music-art-fallback" id="musicArtFallback">${PLAYER_ICONS.musicNote(58)}</div>
           </div>
           <div id="musicTitle" class="music-title">...</div>
@@ -2024,6 +2258,7 @@ function _musicLayoutHtml() {
           </div>
           <div class="music-actions">
             <span id="musicFollow"></span>
+            <button class="btn btn-ghost btn-with-ico ${state.player.ambientLight ? "btn-player-ctrl-on" : ""}" type="button" id="toggleAmbientLight" aria-pressed="${state.player.ambientLight ? "true" : "false"}" title="${state.player.ambientLight ? "Modo ambiente: activo" : "Modo ambiente: inactivo"}">${PLAYER_ICONS.ambient(14)}<span>Ambiente</span></button>
             <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="audio">${PLAYER_ICONS.download(14)}<span>Descargar</span></button>
             <button class="btn btn-ghost btn-with-ico" type="button" id="toggleAudioOnly">${PLAYER_ICONS.headphones(14)}<span>Solo audio</span></button>
             <button class="btn btn-ghost btn-with-ico" type="button" id="playerExternal">${PLAYER_ICONS.external(14)}<span>Abrir externo</span></button>
@@ -2047,6 +2282,10 @@ function renderWatch() {
     : Boolean(root.querySelector(".watch-layout--video") && document.getElementById("webPlayerVideo"));
 
   if (!hasCorrectLayout) {
+    _ambientStop();
+    _ambient.hasDrawnFrame = false;
+    _ambient.corsBlocked = false;
+    _ambient.fallbackThumbKey = "";
     // Abort any existing listeners before rebuilding DOM
     if (state.player._listenerAbort) {
       state.player._listenerAbort.abort();
@@ -2096,8 +2335,9 @@ function _updateVideoOverlay(error = "") {
   if (!overlay) return;
   if (state.player.loading && !error) {
     const thumb = state.player.current?.thumbnail;
-    overlay.style.backgroundImage = thumb ? `url("${thumbSrc(thumb)}")` : "";
+    overlay.style.backgroundImage = thumb ? `url("${thumbSrc(thumb, true)}")` : "";
     overlay.style.display = "flex";
+    if (thumb) _ambientDrawStaticThumb(thumb);
   } else {
     overlay.style.display = "none";
   }
@@ -2143,6 +2383,7 @@ function _updateVideoMeta(error = "") {
       ${_playerCtrlsHtml()}
       <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="video">${PLAYER_ICONS.download(14)}<span>Descargar</span></button>
       <button class="btn btn-ghost btn-with-ico" type="button" data-watch-download="audio">${PLAYER_ICONS.headphones(14)}<span>Audio</span></button>
+      <button class="btn btn-ghost btn-with-ico ${state.player.ambientLight ? "btn-player-ctrl-on" : ""}" type="button" id="toggleAmbientLight" aria-pressed="${state.player.ambientLight ? "true" : "false"}" title="${state.player.ambientLight ? "Modo ambiente: activo" : "Modo ambiente: inactivo"}">${PLAYER_ICONS.ambient(14)}<span>Ambiente</span></button>
       <button class="btn btn-ghost btn-with-ico" type="button" id="toggleAudioOnly">${PLAYER_ICONS.headphones(14)}<span>Solo audio</span></button>
       <button class="btn btn-ghost btn-with-ico" type="button" id="playerExternal">${PLAYER_ICONS.external(14)}<span>Abrir externo</span></button>
       <button class="btn btn-ghost btn-with-ico" type="button" id="watchBack">${PLAYER_ICONS.back(14)}<span>Volver</span></button>
@@ -2223,12 +2464,25 @@ function _updateMusicMeta(error = "") {
   if (artEl) {
     const thumb = item?.thumbnail;
     if (thumb) {
-      artEl.src = thumbSrc(thumb);
+      const origUrl = normalizeThumbUrl(thumb);
+      const hdUrl = upgradeThumbUrl(origUrl, true);
+      const targetSrc = thumbSrc(hdUrl, false);
+      if (artEl.dataset.thumbOrig !== origUrl || !artEl.getAttribute("src")) {
+        artEl.dataset.thumbUrl = hdUrl;
+        artEl.dataset.thumbOrig = origUrl;
+        artEl.src = targetSrc;
+      } else if (artEl.complete && artEl.naturalWidth > 0) {
+        _ambientDrawImage(artEl);
+      }
       artEl.style.display = "block";
       if (artFallback) artFallback.style.display = "none";
     } else {
+      artEl.removeAttribute("src");
+      artEl.dataset.thumbUrl = "";
+      artEl.dataset.thumbOrig = "";
       artEl.style.display = "none";
       if (artFallback) artFallback.style.display = "";
+      _ambientClear();
     }
   }
 
@@ -2896,7 +3150,7 @@ function _updateMediaSession() {
     title: item.title || "",
     artist: item.channel || "",
     artwork: item.thumbnail
-      ? [{ src: thumbSrc(item.thumbnail), sizes: "480x360", type: "image/jpeg" }]
+      ? [{ src: thumbSrc(item.thumbnail, true), sizes: "544x544", type: "image/jpeg" }]
       : [],
   });
   const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
@@ -3499,16 +3753,31 @@ async function ensureVideoPlayer() {
     toast(msg);
     _updateWatchMeta(msg);
   });
-  player.on("ended", () => { _onTrackEnded(); });
+  player.on("ended", () => {
+    _ambientStop();
+    _onTrackEnded();
+  });
   player.on("timeupdate", () => { _maybePrefetchNextItem(player.currentTime()); });
   player.on("play", () => {
     _resumeVideoAudioGraph(player);
     _onLocalMediaEvent("play");
+    _syncAmbientState();
   });
-  player.on("pause", () => { _onLocalMediaEvent("pause"); });
-  player.on("seeked", () => { _onLocalMediaEvent("seeked"); });
+  player.on("pause", () => {
+    _onLocalMediaEvent("pause");
+    _syncAmbientState();
+  });
+  player.on("seeked", () => {
+    _onLocalMediaEvent("seeked");
+    _ambientTickVideo(true);
+  });
   player.on("ratechange", () => { _onLocalMediaEvent("ratechange"); });
-  player.on("loadstart", () => { _applySavedVolumeToVideo(player); });
+  player.on("loadstart", () => {
+    _applySavedVolumeToVideo(player);
+    _ambient.corsBlocked = false;
+    _ambient.hasDrawnFrame = false;
+  });
+  player.on("loadeddata", () => { _ambientTickVideo(true); });
   player.on("loadedmetadata", () => { _applySavedVolumeToVideo(player); });
   // Restore / persist volume without letting startup events overwrite localStorage
   player.ready(() => {
@@ -5076,6 +5345,9 @@ function bindEvents() {
       else if (action === "seek-fwd") await sendNativePlayerControl({ action: "seek", seconds: 10, relative: true });
       else if (action === "mute") await sendNativePlayerControl({ action: "setMute", muted: !state.player.native?.muted });
       else if (action === "stop") await sendNativePlayerControl({ action: "stop" });
+    }
+    if (ev.target.closest("#toggleAmbientLight")) {
+      toggleAmbientLight();
     }
     if (ev.target.closest("#toggleAudioOnly")) {
       state.player.audioOnly = !state.player.audioOnly;

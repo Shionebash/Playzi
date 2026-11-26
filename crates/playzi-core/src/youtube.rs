@@ -1980,23 +1980,75 @@ pub(crate) fn text_from_node(node: Option<&Value>) -> Option<String> {
     None
 }
 
+pub(crate) fn upgrade_thumbnail_url(url: &str) -> String {
+    let normalized = if url.starts_with("//") {
+        format!("https:{url}")
+    } else {
+        url.to_string()
+    };
+
+    // Upgrade tiny YouTube Music / Google Photos square thumbnails (e.g. =w120-h120-l90-rj)
+    // to HD (=w544-h544...) while preserving any trailing flags.
+    if normalized.contains("googleusercontent.com/") {
+        if let Some(eq_idx) = normalized.rfind('=') {
+            let prefix = &normalized[..eq_idx];
+            let suffix = &normalized[eq_idx + 1..];
+            if let Some(rest) = suffix.strip_prefix('w') {
+                let w_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !w_digits.is_empty() {
+                    let after_w = &rest[w_digits.len()..];
+                    if let Some(after_h_prefix) = after_w.strip_prefix("-h") {
+                        let h_digits: String = after_h_prefix
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if !h_digits.is_empty() {
+                            let tail = &after_h_prefix[h_digits.len()..];
+                            if let (Ok(w), Ok(h)) = (w_digits.parse::<u32>(), h_digits.parse::<u32>()) {
+                                if w == h && w < 544 {
+                                    return format!("{prefix}=w544-h544{tail}");
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(rest) = suffix.strip_prefix('s') {
+                let s_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !s_digits.is_empty() {
+                    let tail = &rest[s_digits.len()..];
+                    if let Ok(size) = s_digits.parse::<u32>() {
+                        if size > 0 && size < 544 {
+                            return format!("{prefix}=s544{tail}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    normalized
+}
+
 pub(crate) fn last_thumbnail_url(node: Option<&Value>) -> Option<String> {
     let node = node?;
     let thumbs = node
         .get("thumbnails")
         .and_then(Value::as_array)
         .or_else(|| node.as_array())?;
-    thumbs
-        .last()
-        .and_then(|t| t.get("url"))
-        .and_then(Value::as_str)
-        .map(|s| {
-            if s.starts_with("//") {
-                format!("https:{s}")
-            } else {
-                s.to_string()
-            }
+    let best = thumbs
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.get("url").and_then(Value::as_str).is_some())
+        .max_by_key(|(idx, t)| {
+            let w = t.get("width").and_then(Value::as_u64).unwrap_or(0);
+            let h = t.get("height").and_then(Value::as_u64).unwrap_or(0);
+            (w.max(h), *idx)
         })
+        .map(|(_, t)| t)
+        .or_else(|| thumbs.last())?;
+    best.get("url")
+        .and_then(Value::as_str)
+        .map(upgrade_thumbnail_url)
 }
 
 pub(crate) fn walk_renderers<'a>(node: &'a Value, renderer_name: &str) -> Vec<&'a Value> {
@@ -2547,5 +2599,37 @@ mod tests {
         assert_eq!(mixes[0].id, "RDMM");
         assert_eq!(mixes[0].result_type.as_deref(), Some("mix"));
         assert_eq!(mixes[0].url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDMM");
+    }
+
+    #[test]
+    fn upgrades_low_res_music_thumbnails_and_picks_largest() {
+        assert_eq!(
+            upgrade_thumbnail_url("https://lh3.googleusercontent.com/abc=w120-h120-l90-rj"),
+            "https://lh3.googleusercontent.com/abc=w544-h544-l90-rj"
+        );
+        assert_eq!(
+            upgrade_thumbnail_url("https://lh3.googleusercontent.com/abc=s88-c-k-no-rj"),
+            "https://lh3.googleusercontent.com/abc=s544-c-k-no-rj"
+        );
+        assert_eq!(
+            upgrade_thumbnail_url("https://lh3.googleusercontent.com/abc=w800-h800-l90-rj"),
+            "https://lh3.googleusercontent.com/abc=w800-h800-l90-rj"
+        );
+        // Non-square thumbnails keep their original aspect ratio
+        assert_eq!(
+            upgrade_thumbnail_url("https://lh3.googleusercontent.com/abc=w320-h180-l90-rj"),
+            "https://lh3.googleusercontent.com/abc=w320-h180-l90-rj"
+        );
+
+        let node = json!({
+            "thumbnails": [
+                {"url": "https://lh3.googleusercontent.com/xyz=w226-h226-l90-rj", "width": 226, "height": 226},
+                {"url": "https://lh3.googleusercontent.com/xyz=w60-h60-l90-rj", "width": 60, "height": 60}
+            ]
+        });
+        assert_eq!(
+            last_thumbnail_url(Some(&node)).as_deref(),
+            Some("https://lh3.googleusercontent.com/xyz=w544-h544-l90-rj")
+        );
     }
 }
