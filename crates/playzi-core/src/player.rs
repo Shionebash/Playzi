@@ -1983,16 +1983,70 @@ pub fn build_hls_master_playlist_with_meta(
     )
 }
 
+/// Detects YouTube muxed HLS (`itag 91..96`) trailing segments that start at or after the end of
+/// the video track (`sgovp` `dur`) so they contain only trailing AAC audio packets and 0 video
+/// packets. Video.js VHS (`checkForIllegalMediaSwitch`) treats such a segment in a muxed video
+/// playlist as a fatal `playlistExclusionDuration: Infinity` error ("Playback cannot continue").
+fn is_youtube_muxed_audio_only_tail_segment(
+    seg_url: &str,
+    extinf_secs: Option<f64>,
+    is_last_vod_segment: bool,
+) -> bool {
+    let lower = seg_url.to_ascii_lowercase();
+    if !lower.contains("sgovp/") || !lower.contains("sgoap/") {
+        return false;
+    }
+
+    // Extract video track duration from `sgovp/...dur%3D<secs>` or `dur=<secs>`.
+    let video_dur_ms = lower.find("sgovp/").and_then(|pos| {
+        let rest = &lower[pos + 6..];
+        let seg = rest.split('/').next()?;
+        let dur_part = seg
+            .find("dur%3d")
+            .map(|i| &seg[i + 6..])
+            .or_else(|| seg.find("dur=").map(|i| &seg[i + 4..]))?;
+        let num_str: String = dur_part
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        num_str.parse::<f64>().ok().map(|s| s * 1000.0)
+    });
+
+    // Extract segment start offset from `/begin/<ms>/`.
+    let begin_ms = lower.find("/begin/").and_then(|pos| {
+        let rest = &lower[pos + 7..];
+        let num_str = rest.split('/').next()?;
+        num_str.parse::<f64>().ok()
+    });
+
+    if let (Some(v_ms), Some(b_ms)) = (video_dur_ms, begin_ms) {
+        if b_ms + 1.0 >= v_ms {
+            return true;
+        }
+    }
+
+    // Fallback: if this is the final VOD segment of a YouTube muxed playlist and is sub-250ms,
+    // it is an audio-overhang tail with 0 video frames.
+    is_last_vod_segment && extinf_secs.is_some_and(|d| d < 0.25)
+}
+
+fn parse_extinf_duration(line: &str) -> Option<f64> {
+    let rest = line.trim().strip_prefix("#EXTINF:")?;
+    let dur_str = rest.split(',').next()?.trim();
+    dur_str.parse::<f64>().ok()
+}
+
 /// Rewrites every segment URI and `URI="..."` tag attribute inside an HLS `.m3u8` playlist
 /// so WebView2 fetches all sub-playlists and media segments through `playzi-stream://` without CORS errors.
+/// Also strips YouTube muxed HLS trailing audio-only tail segments that trigger fatal VHS decode switches.
 pub fn rewrite_m3u8_playlist(body: &str, base_url: &str, proxy_prefix: &str) -> String {
     let base = Url::parse(base_url).ok();
-    let resolve = |raw: &str| -> String {
+    let resolve_abs = |raw: &str| -> String {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return String::new();
         }
-        let abs = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             trimmed.to_string()
         } else if let Some(b) = &base {
             b.join(trimmed)
@@ -2000,12 +2054,59 @@ pub fn rewrite_m3u8_playlist(body: &str, base_url: &str, proxy_prefix: &str) -> 
                 .unwrap_or_else(|_| trimmed.to_string())
         } else {
             trimmed.to_string()
-        };
+        }
+    };
+    let resolve = |raw: &str| -> String {
+        let abs = resolve_abs(raw);
+        if abs.is_empty() {
+            return String::new();
+        }
         encode_proxy_url(proxy_prefix, &abs)
     };
 
+    let raw_lines: Vec<&str> = body.lines().collect();
+    let is_vod = raw_lines
+        .iter()
+        .any(|l| l.trim().eq_ignore_ascii_case("#EXT-X-ENDLIST"));
+    let media_uri_indices: Vec<usize> = raw_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, l)| {
+            let t = l.trim();
+            (!t.is_empty() && !t.starts_with('#')).then_some(idx)
+        })
+        .collect();
+    let last_media_idx = if is_vod && media_uri_indices.len() >= 2 {
+        media_uri_indices.last().copied()
+    } else {
+        None
+    };
+
+    // Identify line indices to drop (trailing audio-only segment URI + its preceding #EXTINF).
+    let mut skip_lines = std::collections::HashSet::new();
+    if media_uri_indices.len() >= 2 {
+        for &uri_idx in &media_uri_indices {
+            let abs_uri = resolve_abs(raw_lines[uri_idx]);
+            let prev_extinf_idx = (0..uri_idx)
+                .rev()
+                .find(|&i| !raw_lines[i].trim().is_empty())
+                .filter(|&i| raw_lines[i].trim().starts_with("#EXTINF:"));
+            let extinf_secs = prev_extinf_idx.and_then(|i| parse_extinf_duration(raw_lines[i]));
+            let is_last_vod = last_media_idx == Some(uri_idx);
+            if is_youtube_muxed_audio_only_tail_segment(&abs_uri, extinf_secs, is_last_vod) {
+                skip_lines.insert(uri_idx);
+                if let Some(ext_idx) = prev_extinf_idx {
+                    skip_lines.insert(ext_idx);
+                }
+            }
+        }
+    }
+
     let mut out = String::with_capacity(body.len() + 512);
-    for line in body.lines() {
+    for (idx, line) in raw_lines.into_iter().enumerate() {
+        if skip_lines.contains(&idx) {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             out.push('\n');
@@ -3145,5 +3246,29 @@ mod tests {
             extract_url_expire("https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/96/playlist/index.m3u8"),
             None
         );
+    }
+
+    #[test]
+    fn rewrite_m3u8_playlist_drops_youtube_muxed_audio_only_tail_segment() {
+        let body = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-VERSION:3\n",
+            "#EXT-X-PLAYLIST-TYPE:VOD\n",
+            "#EXT-X-TARGETDURATION:7\n",
+            "#EXTINF:6.133333,\n",
+            "https://rr2.googlevideo.com/videoplayback/itag/96/sgoap/dur%3D254.931%3Bitag%3D140/sgovp/dur%3D254.866%3Bitag%3D137/begin/248733/len/6133/file/seg.ts\n",
+            "#EXTINF:0.065,\n",
+            "https://rr2.googlevideo.com/videoplayback/itag/96/sgoap/dur%3D254.931%3Bitag%3D140/sgovp/dur%3D254.866%3Bitag%3D137/begin/254866/len/65/file/seg.ts\n",
+            "#EXT-X-ENDLIST\n"
+        );
+        let rewritten = rewrite_m3u8_playlist(
+            body,
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/96/playlist/index.m3u8",
+            "http://playzi-stream.localhost/",
+        );
+        assert!(rewritten.contains("begin%2F248733"));
+        assert!(!rewritten.contains("begin%2F254866"));
+        assert!(!rewritten.contains("#EXTINF:0.065,"));
+        assert!(rewritten.contains("#EXT-X-ENDLIST"));
     }
 }
