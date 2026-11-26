@@ -33,6 +33,7 @@ FFMPEG_PATH = _str_env("FFMPEG_PATH", "ffmpeg")
 AUDIO_FORMAT = _str_env("AUDIO_FORMAT", "opus").lower()
 YTDLP_SEARCH_LIMIT = int(_str_env("YTDLP_SEARCH_LIMIT", "12"))
 PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
+VOLUME_NORMALIZATION = _str_env("VOLUME_NORMALIZATION", "true").lower() in ("1", "true", "yes", "on")
 COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
 COOKIES_FILE = _str_env("COOKIES_FILE", "")
 SHOW_SHORTS = _str_env("SHOW_SHORTS", "false").lower() in ("1", "true", "yes", "on")
@@ -57,7 +58,7 @@ def update_config(values: dict) -> dict:
 
 
 def _update_config_locked(values: dict) -> dict:
-    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, COOKIES_BROWSER, COOKIES_FILE, SHOW_SHORTS
+    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, VOLUME_NORMALIZATION, COOKIES_BROWSER, COOKIES_FILE, SHOW_SHORTS
 
     env_values = _read_env_file()
     old_cookies_browser = COOKIES_BROWSER
@@ -71,6 +72,7 @@ def _update_config_locked(values: dict) -> dict:
         "audioFormat": "AUDIO_FORMAT",
         "searchLimit": "YTDLP_SEARCH_LIMIT",
         "playbackQuality": "PLAYBACK_QUALITY",
+        "volumeNormalization": "VOLUME_NORMALIZATION",
         "cookiesBrowser": "COOKIES_BROWSER",
         "cookiesFile": "COOKIES_FILE",
         "showShorts": "SHOW_SHORTS",
@@ -101,6 +103,7 @@ def _update_config_locked(values: dict) -> dict:
     AUDIO_FORMAT = _str_env("AUDIO_FORMAT", "opus").lower()
     YTDLP_SEARCH_LIMIT = int(_str_env("YTDLP_SEARCH_LIMIT", "12"))
     PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
+    VOLUME_NORMALIZATION = _str_env("VOLUME_NORMALIZATION", "true").lower() in ("1", "true", "yes", "on")
     COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
     COOKIES_FILE = _str_env("COOKIES_FILE", "")
     SHOW_SHORTS = _str_env("SHOW_SHORTS", "false").lower() in ("1", "true", "yes", "on")
@@ -141,6 +144,7 @@ def _write_env_file(values: dict[str, str]) -> None:
         "AUDIO_FORMAT",
         "YTDLP_SEARCH_LIMIT",
         "PLAYBACK_QUALITY",
+        "VOLUME_NORMALIZATION",
         "SHOW_SHORTS",
     ]
     lines = [f"{key}={values[key]}" for key in order if key in values]
@@ -167,6 +171,7 @@ def public_config() -> dict:
         "audioFormat": AUDIO_FORMAT,
         "searchLimit": YTDLP_SEARCH_LIMIT,
         "playbackQuality": PLAYBACK_QUALITY,
+        "volumeNormalization": VOLUME_NORMALIZATION,
         "cookiesBrowser": COOKIES_BROWSER,
         "cookiesFile": COOKIES_FILE,
         "showShorts": SHOW_SHORTS,

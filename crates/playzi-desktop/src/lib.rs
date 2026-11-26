@@ -346,11 +346,18 @@ pub fn run() {
                             }
                             let req = playzi_core::party::JoinSessionRequest {
                                 invite: invite_url,
-                                room_code: Some(room_code),
+                                room_code: Some(room_code.clone()),
                             };
                             match party_for_discord.join_session(req).await {
                                 Ok(_) => {
                                     social_for_discord.force_clear_room_presence().await;
+                                    let _ = app_discord.emit(
+                                        "discord-notice",
+                                        serde_json::json!({
+                                            "level": "ok",
+                                            "message": format!("Conectado a la sala {room_code} desde Discord."),
+                                        }),
+                                    );
                                 }
                                 Err(err) => {
                                     let _ = app_discord.emit(

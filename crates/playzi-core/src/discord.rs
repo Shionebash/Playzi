@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, RwLock, broadcast, mpsc};
+use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::config::ConfigStore;
@@ -80,7 +81,11 @@ pub enum DiscordEvent {
 
 enum OutboundCmd {
     SetActivity(Option<Value>),
-    RespondJoinRequest { user_id: String, accept: bool },
+    RespondJoinRequest {
+        user_id: String,
+        accept: bool,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
     Disconnect,
 }
 
@@ -94,6 +99,9 @@ struct DiscordInner {
     party: Option<PartyRoomSnapshot>,
     pending_join_requests: Vec<DiscordJoinRequest>,
     last_sent_activity: Option<Value>,
+    last_sent_start_ms: Option<i64>,
+    has_sent_activity: bool,
+    registered_client_id: String,
     invite_active: bool,
     outbound_tx: Option<mpsc::UnboundedSender<OutboundCmd>>,
     shutdown: bool,
@@ -111,6 +119,9 @@ impl Default for DiscordInner {
             party: None,
             pending_join_requests: Vec::new(),
             last_sent_activity: None,
+            last_sent_start_ms: None,
+            has_sent_activity: false,
+            registered_client_id: String::new(),
             invite_active: false,
             outbound_tx: None,
             shutdown: false,
@@ -199,6 +210,8 @@ impl DiscordManager {
             }
             guard.invite_active = false;
             guard.last_sent_activity = None;
+            guard.last_sent_start_ms = None;
+            guard.has_sent_activity = false;
             guard.pending_join_requests.clear();
         } else {
             self.sync_activity_now().await;
@@ -232,28 +245,56 @@ impl DiscordManager {
         }
 
         let tx_opt = {
-            let mut guard = self.inner.write().await;
-            guard.pending_join_requests.retain(|r| r.user_id != uid);
+            let guard = self.inner.read().await;
             guard.outbound_tx.clone()
         };
 
         let Some(tx) = tx_opt else {
+            {
+                let mut guard = self.inner.write().await;
+                guard.pending_join_requests.retain(|r| r.user_id != uid);
+            }
             self.emit_state().await;
             return Err(CoreError::External(
                 "Discord no está conectado en este momento.".to_string(),
             ));
         };
 
+        let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(OutboundCmd::RespondJoinRequest {
-            user_id: uid,
+            user_id: uid.clone(),
             accept,
+            reply: reply_tx,
         })
         .map_err(|_| CoreError::External("No se pudo enviar la respuesta a Discord.".to_string()))?;
+
+        let ipc_result = match tokio::time::timeout(Duration::from_secs(6), reply_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err("Discord cerró la conexión antes de responder.".to_string()),
+            Err(_) => Err("Tiempo agotado esperando confirmación de Discord.".to_string()),
+        };
+
+        {
+            let mut guard = self.inner.write().await;
+            guard.pending_join_requests.retain(|r| r.user_id != uid);
+            if let Err(ref err) = ipc_result {
+                guard.last_error = err.clone();
+            } else {
+                guard.last_error.clear();
+            }
+        }
 
         let snap = self.status().await;
         let _ = self.events.send(DiscordEvent::State {
             snapshot: snap.clone(),
         });
+
+        if let Err(err) = ipc_result {
+            return Err(CoreError::External(format!(
+                "Discord rechazó la respuesta de invitación: {err}"
+            )));
+        }
+
         Ok(snap)
     }
 
@@ -302,10 +343,19 @@ impl DiscordManager {
         guard.invite_active = invite_active;
 
         let comparable = strip_timestamps(&activity);
-        if guard.last_sent_activity == comparable && activity.is_some() {
-            // Still update if timestamps shifted significantly or just let it pass on explicit events
+        let start_ms = extract_start_timestamp_ms(&activity);
+        if should_skip_activity_update(
+            guard.has_sent_activity,
+            &guard.last_sent_activity,
+            guard.last_sent_start_ms,
+            &comparable,
+            start_ms,
+        ) {
+            return;
         }
         guard.last_sent_activity = comparable;
+        guard.last_sent_start_ms = start_ms;
+        guard.has_sent_activity = true;
         if let Some(tx) = guard.outbound_tx.as_ref() {
             let _ = tx.send(OutboundCmd::SetActivity(activity));
         }
@@ -354,6 +404,8 @@ impl DiscordManager {
                         guard.invite_active = false;
                         guard.outbound_tx = None;
                         guard.last_sent_activity = None;
+                        guard.last_sent_start_ms = None;
+                        guard.has_sent_activity = false;
                         guard.user_id.clear();
                         guard.username.clear();
                         guard.global_name.clear();
@@ -432,13 +484,32 @@ impl DiscordManager {
             .unwrap_or("")
             .to_string();
 
+        // Register discord-<client_id> URI scheme once per client ID so Discord can route
+        // "Ask to Join" / "Join" launches to this Playzi executable.
+        let needs_register = {
+            let mut guard = self.inner.write().await;
+            if guard.registered_client_id != client_id {
+                guard.registered_client_id = client_id.to_string();
+                true
+            } else {
+                false
+            }
+        };
+        if needs_register {
+            let cid = client_id.to_string();
+            let _ = tokio::task::spawn_blocking(move || register_discord_uri_scheme(&cid)).await;
+        }
+
         // 3. Subscribe to invite & join request events
+        let mut subscribe_nonces: HashMap<String, &'static str> = HashMap::new();
         for evt in ["ACTIVITY_JOIN", "ACTIVITY_JOIN_REQUEST", "ACTIVITY_INVITE"] {
+            let nonce = Uuid::new_v4().to_string();
+            subscribe_nonces.insert(nonce.clone(), evt);
             let sub = json!({
                 "cmd": "SUBSCRIBE",
                 "evt": evt,
                 "args": {},
-                "nonce": Uuid::new_v4().to_string(),
+                "nonce": nonce,
             });
             write_ipc_frame(&mut writer, OP_FRAME, &sub)
                 .await
@@ -455,11 +526,15 @@ impl DiscordManager {
             guard.last_error.clear();
             guard.outbound_tx = Some(outbound_tx);
             guard.last_sent_activity = None;
+            guard.last_sent_start_ms = None;
+            guard.has_sent_activity = false;
         }
         self.sync_activity_now().await;
         self.emit_state().await;
 
         let pid = std::process::id();
+        let mut pending_replies: HashMap<String, oneshot::Sender<std::result::Result<(), String>>> =
+            HashMap::new();
 
         loop {
             tokio::select! {
@@ -481,22 +556,26 @@ impl DiscordManager {
                                 .await
                                 .map_err(|e| format!("Error enviando SET_ACTIVITY: {e}"))?;
                         }
-                        OutboundCmd::RespondJoinRequest { user_id, accept } => {
+                        OutboundCmd::RespondJoinRequest { user_id, accept, reply } => {
                             let cmd_name = if accept {
                                 "SEND_ACTIVITY_JOIN_INVITE"
                             } else {
                                 "CLOSE_ACTIVITY_REQUEST"
                             };
+                            let nonce = Uuid::new_v4().to_string();
                             let payload = json!({
                                 "cmd": cmd_name,
                                 "args": {
                                     "user_id": user_id,
                                 },
-                                "nonce": Uuid::new_v4().to_string(),
+                                "nonce": nonce,
                             });
-                            write_ipc_frame(&mut writer, OP_FRAME, &payload)
-                                .await
-                                .map_err(|e| format!("Error enviando {cmd_name}: {e}"))?;
+                            if let Err(e) = write_ipc_frame(&mut writer, OP_FRAME, &payload).await {
+                                let msg = format!("Error enviando {cmd_name}: {e}");
+                                let _ = reply.send(Err(msg.clone()));
+                                return Err(msg);
+                            }
+                            pending_replies.insert(nonce, reply);
                         }
                         OutboundCmd::Disconnect => {
                             break;
@@ -519,7 +598,7 @@ impl DiscordManager {
                             return Err(msg.to_string());
                         }
                         OP_FRAME => {
-                            self.handle_incoming_frame(&val).await;
+                            self.handle_incoming_frame(&val, &mut pending_replies, &mut subscribe_nonces).await;
                         }
                         _ => {}
                     }
@@ -530,12 +609,61 @@ impl DiscordManager {
         Ok(())
     }
 
-    async fn handle_incoming_frame(&self, val: &Value) {
+    async fn handle_incoming_frame(
+        &self,
+        val: &Value,
+        pending_replies: &mut HashMap<String, oneshot::Sender<std::result::Result<(), String>>>,
+        subscribe_nonces: &mut HashMap<String, &'static str>,
+    ) {
         let evt = val.get("evt").and_then(Value::as_str).unwrap_or("");
+        let nonce = val.get("nonce").and_then(Value::as_str).unwrap_or("");
+
+        if !nonce.is_empty()
+            && let Some(waiter) = pending_replies.remove(nonce)
+        {
+            if evt == "ERROR" {
+                let code = val
+                    .pointer("/data/code")
+                    .and_then(Value::as_i64)
+                    .map(|c| format!(" (código {c})"))
+                    .unwrap_or_default();
+                let msg = val
+                    .pointer("/data/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Error de Discord RPC");
+                let _ = waiter.send(Err(format!("{msg}{code}")));
+            } else {
+                let _ = waiter.send(Ok(()));
+            }
+            return;
+        }
+
+        if !nonce.is_empty()
+            && let Some(sub_evt) = subscribe_nonces.remove(nonce)
+        {
+            if evt == "ERROR" {
+                // ACTIVITY_INVITE may require OAuth scopes on some Discord builds; ignore silently
+                // so it doesn't clobber status or block ACTIVITY_JOIN / ACTIVITY_JOIN_REQUEST.
+                if sub_evt != "ACTIVITY_INVITE" {
+                    let msg = val
+                        .pointer("/data/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Error suscribiendo eventos de Discord");
+                    {
+                        let mut guard = self.inner.write().await;
+                        guard.last_error = format!("{sub_evt}: {msg}");
+                    }
+                    self.emit_state().await;
+                }
+            }
+            return;
+        }
+
         match evt {
             "ACTIVITY_JOIN" => {
                 let secret = val
                     .pointer("/data/secret")
+                    .or_else(|| val.pointer("/args/secret"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if let Some((room_code, invite_url)) = decode_join_secret(secret) {
@@ -663,6 +791,109 @@ fn strip_timestamps(activity: &Option<Value>) -> Option<Value> {
     Some(cloned)
 }
 
+fn extract_start_timestamp_ms(activity: &Option<Value>) -> Option<i64> {
+    activity
+        .as_ref()?
+        .pointer("/timestamps/start")
+        .and_then(Value::as_i64)
+}
+
+fn should_skip_activity_update(
+    has_sent: bool,
+    last_comparable: &Option<Value>,
+    last_start_ms: Option<i64>,
+    next_comparable: &Option<Value>,
+    next_start_ms: Option<i64>,
+) -> bool {
+    if !has_sent || last_comparable != next_comparable {
+        return false;
+    }
+    match (last_start_ms, next_start_ms) {
+        (None, None) => true,
+        (Some(prev), Some(curr)) => (curr - prev).abs() < 3_000,
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn register_discord_uri_scheme(client_id: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let cid = client_id.trim();
+    if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe_str = exe.to_string_lossy().to_string();
+    let base_key = format!(r"HKCU\Software\Classes\discord-{cid}");
+    let icon_key = format!(r"{base_key}\DefaultIcon");
+    let cmd_key = format!(r"{base_key}\shell\open\command");
+    let desc = format!("URL:Run game {cid} protocol");
+    let open_cmd = format!("\"{exe_str}\" \"%1\"");
+
+    let ops: [(&str, Option<&str>, &str); 4] = [
+        (&base_key, None, &desc),
+        (&base_key, Some("URL Protocol"), ""),
+        (&icon_key, None, &exe_str),
+        (&cmd_key, None, &open_cmd),
+    ];
+
+    for (key, value_name, data) in ops {
+        let mut cmd = std::process::Command::new("reg.exe");
+        cmd.arg("add").arg(key);
+        match value_name {
+            Some(name) => {
+                cmd.arg("/v").arg(name);
+            }
+            None => {
+                cmd.arg("/ve");
+            }
+        }
+        cmd.arg("/t").arg("REG_SZ").arg("/d").arg(data).arg("/f");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.output();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn register_discord_uri_scheme(client_id: &str) {
+    let cid = client_id.trim();
+    if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let apps_dir = std::path::PathBuf::from(home).join(".local/share/applications");
+    if std::fs::create_dir_all(&apps_dir).is_err() {
+        return;
+    }
+    let desktop_name = format!("discord-{cid}.desktop");
+    let desktop_path = apps_dir.join(&desktop_name);
+    let content = format!(
+        "[Desktop Entry]\nName=Playzi\nExec=\"{}\" %u\nType=Application\nNoDisplay=true\nCategories=AudioVideo;\nMimeType=x-scheme-handler/discord-{cid};\n",
+        exe.to_string_lossy()
+    );
+    if std::fs::write(&desktop_path, content).is_ok() {
+        let _ = std::process::Command::new("xdg-mime")
+            .args([
+                "default",
+                &desktop_name,
+                &format!("x-scheme-handler/discord-{cid}"),
+            ])
+            .output();
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn register_discord_uri_scheme(_client_id: &str) {}
+
 fn clamp_discord_text(input: &str, max_chars: usize) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -695,9 +926,9 @@ pub fn encode_join_secret(room_code: &str, invite_url: &str) -> Option<String> {
     } else if let Some(rest) = url.strip_prefix("ws://") {
         format!("w|{rest}")
     } else if let Some(rest) = url.strip_prefix("https://") {
-        format!("s|{rest}")
+        format!("h|{rest}")
     } else if let Some(rest) = url.strip_prefix("http://") {
-        format!("w|{rest}")
+        format!("p|{rest}")
     } else {
         format!("r|{url}")
     };
@@ -729,6 +960,8 @@ pub fn decode_join_secret(secret: &str) -> Option<(String, String)> {
     let invite_url = match scheme_tag {
         "s" => format!("wss://{host_part}"),
         "w" => format!("ws://{host_part}"),
+        "h" => format!("https://{host_part}"),
+        "p" => format!("http://{host_part}"),
         "r" => host_part.to_string(),
         _ => return None,
     };
@@ -994,6 +1227,35 @@ mod tests {
                 "ws://192.168.1.50:8766/ws?room=XYZ999".to_string()
             ))
         );
+
+        let s3 = encode_join_secret(
+            "RM77AB",
+            "https://playzi-vercel-hub.vercel.app/api/room?room=RM77AB",
+        )
+        .expect("should encode https vercel relay url");
+        assert!(s3.len() <= MAX_JOIN_SECRET_BYTES);
+        assert_eq!(
+            decode_join_secret(&s3),
+            Some((
+                "RM77AB".to_string(),
+                "https://playzi-vercel-hub.vercel.app/api/room?room=RM77AB".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn activity_dedup_skips_ticks_but_sends_secret_and_seek_changes() {
+        let base = Some(json!({ "details": "Video", "secrets": { "join": "pz1|AAA|w|192.168.1.2:8766/ws" } }));
+        let updated = Some(json!({ "details": "Video", "secrets": { "join": "pz1|AAA|h|playzi-vercel-hub.vercel.app/api/room?room=AAA" } }));
+
+        // First send is never skipped
+        assert!(!should_skip_activity_update(false, &None, None, &base, Some(10_000)));
+        // Same payload with minor timestamp jitter (<3s) is skipped
+        assert!(should_skip_activity_update(true, &base, Some(10_000), &base, Some(10_800)));
+        // Seek (>3s shift) is sent
+        assert!(!should_skip_activity_update(true, &base, Some(10_000), &base, Some(15_000)));
+        // Join secret upgrade (LAN -> Vercel public URL) is always sent
+        assert!(!should_skip_activity_update(true, &base, Some(10_000), &updated, Some(10_200)));
     }
 
     #[test]

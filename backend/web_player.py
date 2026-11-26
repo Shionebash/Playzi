@@ -23,6 +23,62 @@ from .ytdlp_opts import javascript_runtime_opts
 logger = logging.getLogger(__name__)
 
 
+_LOUDNESS_CACHE: dict[str, float | None] = {}
+_LOUDNESS_LOCK = threading.Lock()
+_VIDEO_ID_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
+_LOUDNESS_DB_RE = re.compile(r'"loudnessDb"\s*:\s*(-?\d+(?:\.\d+)?)')
+_PERCEPTUAL_LOUDNESS_RE = re.compile(r'"perceptualLoudnessDb"\s*:\s*(-?\d+(?:\.\d+)?)')
+
+
+def _extract_video_id(url: str, info: dict[str, Any] | None = None) -> str | None:
+    if info and isinstance(info.get("id"), str) and len(info["id"]) == 11:
+        return info["id"]
+    m = _VIDEO_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _fetch_loudness_db(url: str, info: dict[str, Any] | None = None) -> float | None:
+    if info:
+        raw_val = info.get("loudnessDb")
+        if raw_val is None:
+            raw_val = info.get("loudness_db")
+        if isinstance(raw_val, (int, float)) and -60.0 <= float(raw_val) <= 30.0:
+            return float(raw_val)
+    vid = _extract_video_id(url, info)
+    if not vid:
+        return None
+    with _LOUDNESS_LOCK:
+        if vid in _LOUDNESS_CACHE:
+            return _LOUDNESS_CACHE[vid]
+    val: float | None = None
+    try:
+        resp = httpx.get(
+            f"https://www.youtube.com/watch?v={vid}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=4.0,
+            follow_redirects=True,
+        )
+        if resp.status_code == 200:
+            m = _LOUDNESS_DB_RE.search(resp.text)
+            if m:
+                parsed = float(m.group(1))
+                if -60.0 <= parsed <= 30.0:
+                    val = parsed
+            else:
+                pm = _PERCEPTUAL_LOUDNESS_RE.search(resp.text)
+                if pm:
+                    parsed = float(pm.group(1)) + 14.0
+                    if -60.0 <= parsed <= 30.0:
+                        val = parsed
+    except Exception:
+        val = None
+    with _LOUDNESS_LOCK:
+        if len(_LOUDNESS_CACHE) >= 512:
+            _LOUDNESS_CACHE.clear()
+        _LOUDNESS_CACHE[vid] = val
+    return val
+
+
 def player_info(url: str, quality: str | None = None) -> dict[str, Any]:
     info = _extract_info(url)
     video, audio = _select_formats(info, quality)
@@ -34,6 +90,7 @@ def player_info(url: str, quality: str | None = None) -> dict[str, Any]:
         "video": _public_format(video),
         "audio": _public_format(audio),
         "availableQualities": _available_qualities(info),
+        "loudnessDb": _fetch_loudness_db(url, info),
         "manifestUrl": f"/api/player/manifest.mpd?url={quote(url, safe='')}&quality={quote(quality or config.PLAYBACK_QUALITY or 'best', safe='')}",
     }
 
@@ -530,6 +587,7 @@ def audio_info(url: str) -> dict[str, Any]:
         "duration": float(info.get("duration") or audio.get("duration") or 0),
         "proxyUrl": _proxy_url(audio),
         "contentType": _mime(audio),
+        "loudnessDb": _fetch_loudness_db(url, info),
     }
 
 

@@ -1879,6 +1879,13 @@ function renderConfig() {
         <input class="form-input" name="cookiesFile" value="${escapeHtml(c.cookiesFile || "")}" placeholder="C:\\ruta\\cookies.txt">
       </label>
       <label class="config-toggle">
+        <input type="checkbox" name="volumeNormalization" ${c.volumeNormalization !== false ? "checked" : ""}>
+        <div>
+          <div class="config-toggle-title">Normalizar volumen (estilo YouTube)</div>
+          <div class="config-toggle-sub">Nivela automáticamente canciones y videos muy fuertes usando la referencia de sonoridad de YouTube (-14 LUFS) para mantener un volumen parejo.</div>
+        </div>
+      </label>
+      <label class="config-toggle">
         <input type="checkbox" name="showShorts" ${c.showShorts ? "checked" : ""}>
         <div>
           <div class="config-toggle-title">Mostrar sección de YouTube Shorts</div>
@@ -1902,7 +1909,7 @@ function renderConfig() {
             <button class="btn btn-ghost" type="button" data-discord-reconnect="1" style="padding:4px 10px;font-size:.78rem">Reconectar</button>
           </div>
         </div>
-        ${state.discord?.lastError && c.discordEnabled && !state.discord?.connected ? `<div class="muted" style="font-size:.8rem;color:#fbbf24;margin-bottom:10px">${escapeHtml(state.discord.lastError)}</div>` : ""}
+        ${state.discord?.lastError && c.discordEnabled ? `<div class="muted" style="font-size:.8rem;color:#fbbf24;margin-bottom:10px">${escapeHtml(state.discord.lastError)}</div>` : ""}
         <div style="display:flex;flex-direction:column;gap:10px">
           <label class="config-toggle">
             <input type="checkbox" name="discordEnabled" ${c.discordEnabled !== false ? "checked" : ""}>
@@ -1969,7 +1976,7 @@ function _videoLayoutHtml() {
     <div class="watch-layout watch-layout--video">
       <div class="watch-main">
         <div class="watch-video-wrap">
-          <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline></video>
+          <video id="webPlayerVideo" class="video-js vjs-default-skin vjs-big-play-centered" preload="auto" playsinline crossorigin="anonymous"></video>
           <div id="webPlayerOverlay" class="player-overlay" style="display:none">
             <div class="player-overlay-spinner"></div>
           </div>
@@ -2256,6 +2263,7 @@ function _updateMusicMeta(error = "") {
 const _VOL_KEY = "playzi-volume";
 const _MUTE_KEY = "playzi-muted";
 let _suppressVolumeSaveUntil = 0;
+const _videoAudioGraphs = new WeakMap();
 
 function _markProgrammaticVolumeApply(ms = 150) {
   _suppressVolumeSaveUntil = Math.max(_suppressVolumeSaveUntil, performance.now() + ms);
@@ -2267,8 +2275,8 @@ function _clampVolume(v, fallback = 1) {
   return Math.max(0, Math.min(1, n));
 }
 
-// Perceptual quadratic curve for the music slider so low positions
-// match human logarithmic hearing instead of sounding disproportionately loud.
+// Perceptual quadratic curve so low slider positions match human logarithmic hearing
+// consistently across both music and video players.
 function _sliderToLinearVolume(sliderVal) {
   const s = _clampVolume(sliderVal, 1);
   return Math.round(s * s * 10000) / 10000;
@@ -2277,6 +2285,63 @@ function _sliderToLinearVolume(sliderVal) {
 function _linearToSliderVolume(linearVal) {
   const g = _clampVolume(linearVal, 1);
   return Math.round(Math.sqrt(g) * 100) / 100;
+}
+
+// YouTube-style loudness normalization (attenuate-only toward -14 LUFS reference).
+// loudnessDb > 0 means the track is mastered louder than -14 LUFS, so we apply 10^(-loudnessDb / 20).
+function _isVolumeNormalizationEnabled() {
+  return state.config?.volumeNormalization !== false;
+}
+
+function _setCurrentLoudnessDb(loudnessDb) {
+  const db = Number(loudnessDb);
+  state.player.currentLoudnessDb = Number.isFinite(db) ? db : null;
+}
+
+function _getLoudnessGainFactor(loudnessDb = state.player.currentLoudnessDb) {
+  if (!_isVolumeNormalizationEnabled()) return 1;
+  const db = Number(loudnessDb);
+  if (!Number.isFinite(db) || db <= 0) return 1;
+  return Math.max(0.15, Math.min(1, Math.pow(10, -db / 20)));
+}
+
+function _getVideoMediaEl(player, fallbackEl = null) {
+  if (fallbackEl && fallbackEl.tagName === "VIDEO") return fallbackEl;
+  const techEl = player && !player.isDisposed()
+    ? player.tech?.({ IWillNotUseThisInPlugins: true })?.el?.()
+    : null;
+  if (techEl && techEl.tagName === "VIDEO") return techEl;
+  const apiEl = document.getElementById("webPlayerVideo_html5_api");
+  if (apiEl && apiEl.tagName === "VIDEO") return apiEl;
+  const rawEl = document.getElementById("webPlayerVideo");
+  return rawEl && rawEl.tagName === "VIDEO" ? rawEl : null;
+}
+
+function _ensureVideoAudioGraph(videoEl) {
+  if (!videoEl || videoEl.tagName !== "VIDEO") return null;
+  if (_videoAudioGraphs.has(videoEl)) return _videoAudioGraphs.get(videoEl);
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+  try {
+    const ctx = new AudioCtx();
+    const source = ctx.createMediaElementSource(videoEl);
+    const gain = ctx.createGain();
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    const graph = { ctx, source, gain };
+    _videoAudioGraphs.set(videoEl, graph);
+    return graph;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _resumeVideoAudioGraph(player) {
+  const videoEl = _getVideoMediaEl(player);
+  const graph = videoEl ? _videoAudioGraphs.get(videoEl) : null;
+  if (graph && graph.ctx.state === "suspended") {
+    graph.ctx.resume().catch(() => {});
+  }
 }
 
 function _getSavedVolumeState() {
@@ -2314,7 +2379,8 @@ function _syncMusicVolumeUi(volume, muted) {
 
 function _applySavedVolumeToMusic() {
   const { volume, muted } = _getSavedVolumeState();
-  const effectiveVol = muted ? 0 : volume;
+  const normGain = _getLoudnessGainFactor();
+  const effectiveVol = muted ? 0 : _clampVolume(volume * normGain, 0);
   _markProgrammaticVolumeApply();
   if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
     state.player.audioVjs.muted(muted);
@@ -2330,14 +2396,34 @@ function _applySavedVolumeToMusic() {
 
 function _applySavedVolumeToVideo(player, videoEl = null) {
   const { volume, muted } = _getSavedVolumeState();
+  const normGain = _getLoudnessGainFactor();
+  const sliderVal = _linearToSliderVolume(volume);
+  const mediaEl = _getVideoMediaEl(player, videoEl);
+  const graph = _ensureVideoAudioGraph(mediaEl);
   _markProgrammaticVolumeApply();
-  if (videoEl) {
-    videoEl.muted = muted;
-    videoEl.volume = volume;
-  }
-  if (player && !player.isDisposed()) {
-    player.muted(muted);
-    player.volume(volume);
+  if (graph) {
+    // Keep Video.js slider at the perceptual position s while the GainNode applies
+    // the second factor (s * normGain), giving total amplitude s^2 * normGain
+    // — identical to music mode without moving the Video.js volume bar per track.
+    graph.gain.gain.value = muted ? 0 : _clampVolume(sliderVal * normGain, 0);
+    if (mediaEl) {
+      mediaEl.muted = muted;
+      mediaEl.volume = sliderVal;
+    }
+    if (player && !player.isDisposed()) {
+      player.muted(muted);
+      player.volume(sliderVal);
+    }
+  } else {
+    const effectiveVol = muted ? 0 : _clampVolume(volume * normGain, 0);
+    if (mediaEl) {
+      mediaEl.muted = muted;
+      mediaEl.volume = effectiveVol;
+    }
+    if (player && !player.isDisposed()) {
+      player.muted(muted);
+      player.volume(effectiveVol);
+    }
   }
 }
 
@@ -3155,6 +3241,7 @@ async function _loadMusicItem(item, loadId) {
   const audio = _getAudioEl();
   if (!audio) return;
   state.player.current = { ...item, ...(info.item || {}) };
+  _setCurrentLoudnessDb(info.loudnessDb);
   state.player.loading = false;
   const rawSrc = info.streamUrl || info.proxyUrl || "";
   const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist");
@@ -3291,6 +3378,7 @@ async function _loadVideoItem(item, loadId) {
     const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
     if (state.player._loadingId !== loadId) return;
     state.player.current = { ...item, ...(info.item || {}) };
+    _setCurrentLoudnessDb(info.loudnessDb);
     state.player.availableQualities = Array.isArray(info.availableQualities) && info.availableQualities.length
       ? info.availableQualities
       : null;
@@ -3354,6 +3442,7 @@ async function _loadVideoItem(item, loadId) {
   if (qualityBtn) qualityBtn.update();
   const audioBtn = player.controlBar?.getChild("AudioLangButton");
   if (audioBtn) { audioBtn.show(); audioBtn.update(); }
+  _setCurrentLoudnessDb(info.loudnessDb ?? item.loudnessDb);
   _applySavedVolumeToVideo(player);
   player.src({ type: "application/dash+xml", src: info.manifestUrl });
   _applySavedVolumeToVideo(player);
@@ -3412,7 +3501,10 @@ async function ensureVideoPlayer() {
   });
   player.on("ended", () => { _onTrackEnded(); });
   player.on("timeupdate", () => { _maybePrefetchNextItem(player.currentTime()); });
-  player.on("play", () => { _onLocalMediaEvent("play"); });
+  player.on("play", () => {
+    _resumeVideoAudioGraph(player);
+    _onLocalMediaEvent("play");
+  });
   player.on("pause", () => { _onLocalMediaEvent("pause"); });
   player.on("seeked", () => { _onLocalMediaEvent("seeked"); });
   player.on("ratechange", () => { _onLocalMediaEvent("ratechange"); });
@@ -3426,7 +3518,20 @@ async function ensureVideoPlayer() {
   });
   player.on("volumechange", () => {
     if (!volumeReady || performance.now() < _suppressVolumeSaveUntil) return;
-    _saveVolumeState(player.volume(), player.muted());
+    const mediaEl = _getVideoMediaEl(player);
+    const graph = mediaEl ? _videoAudioGraphs.get(mediaEl) : null;
+    const normGain = _getLoudnessGainFactor();
+    const isMuted = player.muted();
+    if (graph) {
+      const s = _clampVolume(player.volume(), 0);
+      const linear = _sliderToLinearVolume(s);
+      _saveVolumeState(linear, isMuted || s === 0);
+      graph.gain.gain.value = (isMuted || s === 0) ? 0 : _clampVolume(s * normGain, 0);
+    } else {
+      const rawVol = _clampVolume(player.volume(), 0);
+      const unnormalized = normGain > 0 ? _clampVolume(rawVol / normGain, 1) : rawVol;
+      _saveVolumeState(unnormalized, isMuted || rawVol === 0);
+    }
   });
   _registerQualityMenu(player);
   _registerAudioMenu(player);
@@ -4504,6 +4609,7 @@ function bindEvents() {
         ffmpegPath: form.get("ffmpegPath"),
         audioFormat: form.get("audioFormat"),
         playbackQuality: form.get("playbackQuality"),
+        volumeNormalization: form.get("volumeNormalization") === "on",
         searchLimit: Number(form.get("searchLimit") || 12),
         cookiesBrowser: form.get("cookiesBrowser") || "",
         cookiesFile: form.get("cookiesFile") || "",
@@ -4516,6 +4622,10 @@ function bindEvents() {
         const savedConfig = await api.post("/api/config", submittedConfig);
         state.config = { ...submittedConfig, ...savedConfig, playbackQuality: savedConfig.playbackQuality || submittedConfig.playbackQuality };
         applyShortsVisibility();
+        _applySavedVolumeToMusic();
+        if (state.player.vjs && !state.player.vjs.isDisposed()) {
+          _applySavedVolumeToVideo(state.player.vjs);
+        }
         if (IS_TAURI) {
           await refreshNativePlayerStatus();
           _refreshDiscordStatus().catch(() => {});
@@ -6387,6 +6497,8 @@ document.addEventListener("click", async (ev) => {
 
   const discordJoinBtn = ev.target.closest("[data-discord-join-respond]");
   if (discordJoinBtn) {
+    if (discordJoinBtn.disabled) return;
+    discordJoinBtn.disabled = true;
     try {
       const accept = discordJoinBtn.dataset.accept === "1";
       const discordSnap = await api.post("/api/discord/join-respond", {
@@ -6395,7 +6507,12 @@ document.addEventListener("click", async (ev) => {
       });
       _onDiscordStateUpdate(discordSnap);
       toast(accept ? "Invitación enviada por Discord." : "Solicitud de Discord rechazada.");
-    } catch (err) { toast(err.message); }
+    } catch (err) {
+      toast(err.message);
+      _refreshDiscordStatus().catch(() => {});
+    } finally {
+      discordJoinBtn.disabled = false;
+    }
     return;
   }
 

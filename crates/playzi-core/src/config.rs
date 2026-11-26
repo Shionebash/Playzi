@@ -61,6 +61,7 @@ pub struct PublicConfig {
     pub audio_format: String,
     pub search_limit: usize,
     pub playback_quality: String,
+    pub volume_normalization: bool,
     pub cookies_browser: String,
     pub cookies_file: String,
     pub show_shorts: bool,
@@ -81,6 +82,7 @@ pub struct ConfigUpdate {
     pub audio_format: Option<String>,
     pub search_limit: Option<usize>,
     pub playback_quality: Option<String>,
+    pub volume_normalization: Option<bool>,
     pub cookies_browser: Option<String>,
     pub cookies_file: Option<String>,
     pub show_shorts: Option<bool>,
@@ -106,6 +108,7 @@ pub struct AppConfig {
     pub audio_format: String,
     pub ytdlp_search_limit: usize,
     pub playback_quality: String,
+    pub volume_normalization: bool,
     pub cookies_browser: String,
     pub cookies_file: String,
     pub show_shorts: bool,
@@ -153,6 +156,12 @@ impl AppConfig {
             .unwrap_or(12)
             .clamp(1, 100);
         let playback_quality = get("PLAYBACK_QUALITY", "best");
+        let volume_normalization = matches!(
+            get("VOLUME_NORMALIZATION", "true")
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        );
         let cookies_browser = file_map
             .get("COOKIES_BROWSER")
             .cloned()
@@ -215,6 +224,7 @@ impl AppConfig {
             audio_format,
             ytdlp_search_limit,
             playback_quality,
+            volume_normalization,
             cookies_browser,
             cookies_file,
             show_shorts,
@@ -247,6 +257,7 @@ impl AppConfig {
             audio_format: self.audio_format.clone(),
             search_limit: self.ytdlp_search_limit,
             playback_quality: self.playback_quality.clone(),
+            volume_normalization: self.volume_normalization,
             cookies_browser: self.cookies_browser.clone(),
             cookies_file: self.cookies_file.clone(),
             show_shorts: self.show_shorts,
@@ -305,6 +316,12 @@ impl ConfigStore {
             patch.search_limit.map(|n| n.clamp(1, 100).to_string()),
         );
         apply_non_empty("PLAYBACK_QUALITY", patch.playback_quality);
+        if let Some(v) = patch.volume_normalization {
+            env_map.insert(
+                "VOLUME_NORMALIZATION".to_string(),
+                if v { "true" } else { "false" }.to_string(),
+            );
+        }
 
         if let Some(v) = patch.cookies_browser {
             env_map.insert("COOKIES_BROWSER".to_string(), v.trim().to_string());

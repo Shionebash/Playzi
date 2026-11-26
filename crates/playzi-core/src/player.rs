@@ -119,6 +119,8 @@ pub struct ResolvedStreamInfo {
     pub audio_tracks: Vec<AudioTrack>,
     #[serde(default)]
     pub available_qualities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loudness_db: Option<f64>,
     pub expires_at: Option<i64>,
 }
 
@@ -230,6 +232,8 @@ pub struct PlayerManager {
     config: ConfigStore,
     ytdlp_override: Option<String>,
     stream_cache: Arc<Mutex<HashMap<String, CachedStream>>>,
+    loudness_cache: Arc<Mutex<HashMap<String, Option<f64>>>>,
+    loudness_client: reqwest::Client,
     playback: Arc<Mutex<PlaybackState>>,
     session: Arc<Mutex<ManagedSession>>,
     events: broadcast::Sender<PlayerEvent>,
@@ -238,11 +242,18 @@ pub struct PlayerManager {
 impl PlayerManager {
     pub fn new(state_store: StateStore, config: ConfigStore) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let loudness_client = reqwest::Client::builder()
+            .user_agent(DEFAULT_USER_AGENT)
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             state_store,
             config,
             ytdlp_override: None,
             stream_cache: Arc::new(Mutex::new(HashMap::new())),
+            loudness_cache: Arc::new(Mutex::new(HashMap::new())),
+            loudness_client,
             playback: Arc::new(Mutex::new(PlaybackState::default())),
             session: Arc::new(Mutex::new(ManagedSession {
                 child: None,
@@ -616,10 +627,41 @@ impl PlayerManager {
             return Ok(cached);
         }
 
-        let raw = self.run_ytdlp_json(trimmed, false, None).await?;
-        let resolved = parse_ytdlp_info_json(&raw, trimmed, qual, audio_only);
+        let (raw_res, fetched_loudness) = tokio::join!(
+            self.run_ytdlp_json(trimmed, false, None),
+            self.fetch_loudness_db(trimmed),
+        );
+        let raw = raw_res?;
+        let mut resolved = parse_ytdlp_info_json(&raw, trimmed, qual, audio_only);
+        if resolved.loudness_db.is_none() {
+            resolved.loudness_db = fetched_loudness;
+        }
         self.put_cached_stream(cache_key, resolved.clone());
         Ok(resolved)
+    }
+
+    async fn fetch_loudness_db(&self, url: &str) -> Option<f64> {
+        let vid = extract_video_id(url)?;
+        {
+            let cache = self.loudness_cache.lock().expect("loudness cache lock");
+            if let Some(cached) = cache.get(&vid) {
+                return *cached;
+            }
+        }
+        let watch_url = format!("https://www.youtube.com/watch?v={vid}");
+        let result = match self.loudness_client.get(&watch_url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(html) => parse_loudness_db_from_html(&html),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let mut cache = self.loudness_cache.lock().expect("loudness cache lock");
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(vid, result);
+        result
     }
 
     /// Resolves audio-only stream payload compatible with `/api/player/audio`.
@@ -635,6 +677,7 @@ impl PlayerManager {
             "audio": audio,
             "streamUrl": audio.url,
             "proxyUrl": audio.url,
+            "loudnessDb": info.loudness_db,
             "expiresAt": info.expires_at,
         }))
     }
@@ -1382,6 +1425,12 @@ pub fn parse_ytdlp_info_json(
         "durationText": format_duration((duration > 0.0).then_some(duration as u64)),
     });
 
+    let loudness_db = raw
+        .get("loudnessDb")
+        .or_else(|| raw.get("loudness_db"))
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && (-60.0..=30.0).contains(v));
+
     ResolvedStreamInfo {
         item,
         duration,
@@ -1392,8 +1441,42 @@ pub fn parse_ytdlp_info_json(
         hls_audio: selected_hls_audio,
         audio_tracks,
         available_qualities,
+        loudness_db,
         expires_at,
     }
+}
+
+/// Extracts YouTube's `loudnessDb` (relative to -14 LUFS) from a watch page HTML response.
+/// Falls back to `perceptualLoudnessDb + 14.0` when `loudnessDb` is absent.
+pub fn parse_loudness_db_from_html(html: &str) -> Option<f64> {
+    fn extract_json_f64(haystack: &str, key: &str) -> Option<f64> {
+        let mut search = haystack;
+        while let Some(idx) = search.find(key) {
+            let after_key = &search[idx + key.len()..];
+            let trimmed = after_key.trim_start();
+            if let Some(rest) = trimmed.strip_prefix(':') {
+                let num_start = rest.trim_start();
+                let end = num_start
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                    .unwrap_or(num_start.len());
+                if end > 0 {
+                    if let Ok(v) = num_start[..end].parse::<f64>() {
+                        if v.is_finite() && (-60.0..=30.0).contains(&v) {
+                            return Some(v);
+                        }
+                    }
+                }
+            }
+            search = &search[idx + key.len()..];
+        }
+        None
+    }
+
+    extract_json_f64(html, "\"loudnessDb\"").or_else(|| {
+        extract_json_f64(html, "\"perceptualLoudnessDb\"")
+            .map(|p| p + 14.0)
+            .filter(|v| v.is_finite() && (-60.0..=30.0).contains(v))
+    })
 }
 
 /// Parses `yt-dlp --flat-playlist --dump-single-json` output into normalized `PlaylistItem`s.
@@ -1545,14 +1628,26 @@ fn is_hls_url(url: &str) -> bool {
     lower.contains(".m3u8") || lower.contains("hls_playlist") || lower.contains("/manifest/hls")
 }
 
+fn is_drc_format(f: &StreamFormat) -> bool {
+    f.format_id.to_ascii_lowercase().ends_with("-drc")
+}
+
 fn select_best_hls_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
-    formats
+    let all_hls: Vec<&StreamFormat> = formats
         .iter()
         .filter(|f| {
             is_hls_url(&f.url)
                 && (f.vcodec.is_empty() || f.vcodec == "none")
                 && !f.ext.eq_ignore_ascii_case("mhtml")
         })
+        .collect();
+    let non_drc: Vec<&StreamFormat> = all_hls
+        .iter()
+        .copied()
+        .filter(|f| !is_drc_format(f))
+        .collect();
+    let pool = if !non_drc.is_empty() { non_drc } else { all_hls };
+    pool.into_iter()
         .max_by(|a, b| {
             let sa = a.abr.or(a.tbr).unwrap_or(0.0);
             let sb = b.abr.or(b.tbr).unwrap_or(0.0);
@@ -1714,7 +1809,15 @@ fn select_best_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
         }
     };
 
-    pool.into_iter()
+    let non_drc: Vec<&StreamFormat> = pool
+        .iter()
+        .copied()
+        .filter(|f| !is_drc_format(f))
+        .collect();
+    let final_pool = if !non_drc.is_empty() { non_drc } else { pool };
+
+    final_pool
+        .into_iter()
         .max_by(|a, b| {
             let sa = a.abr.or(a.tbr).unwrap_or(0.0);
             let sb = b.abr.or(b.tbr).unwrap_or(0.0);
@@ -2845,5 +2948,51 @@ mod tests {
         assert!(with_cookies.contains(&"--cookies".to_string()));
         assert!(with_cookies.contains(&cookies.to_string_lossy().to_string()));
         assert_eq!(with_cookies.last().map(String::as_str), Some(url));
+    }
+
+    #[test]
+    fn parse_loudness_db_extracts_loudness_and_perceptual_fallback() {
+        let html = r#"{"audioConfig":{"loudnessDb":8.7199993,"perceptualLoudnessDb":-5.28}}"#;
+        let ldb = parse_loudness_db_from_html(html).expect("should parse loudnessDb");
+        assert!((ldb - 8.7199993).abs() < 1e-5);
+
+        let neg_html = r#"{"audioConfig":{"loudnessDb": -2.5}}"#;
+        let neg = parse_loudness_db_from_html(neg_html).expect("should parse negative loudnessDb");
+        assert!((neg + 2.5).abs() < 1e-5);
+
+        let perceptual_only = r#"{"audioConfig":{"perceptualLoudnessDb":-9.5}}"#;
+        let fallback = parse_loudness_db_from_html(perceptual_only).expect("should fallback");
+        assert!((fallback - 4.5).abs() < 1e-5);
+
+        assert!(parse_loudness_db_from_html("<html>no audio config</html>").is_none());
+    }
+
+    #[test]
+    fn select_best_audio_prefers_non_drc_tracks() {
+        let raw = json!({
+            "id": "abc12345678",
+            "title": "Test",
+            "formats": [
+                {
+                    "format_id": "251-drc",
+                    "url": "https://example.com/251-drc",
+                    "ext": "webm",
+                    "vcodec": "none",
+                    "acodec": "opus",
+                    "abr": 160.0
+                },
+                {
+                    "format_id": "251",
+                    "url": "https://example.com/251",
+                    "ext": "webm",
+                    "vcodec": "none",
+                    "acodec": "opus",
+                    "abr": 130.0
+                }
+            ]
+        });
+        let info = parse_ytdlp_info_json(&raw, "https://youtu.be/abc12345678", "best", true);
+        let audio = info.audio.expect("should pick audio");
+        assert_eq!(audio.format_id, "251");
     }
 }
