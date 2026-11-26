@@ -105,12 +105,35 @@ pub fn run() {
                         .query_pairs()
                         .find(|(k, _)| k == "a")
                         .map(|(_, v)| v.into_owned());
+                    let meta = playzi_core::player::HlsMasterMeta {
+                        vcodec: u
+                            .query_pairs()
+                            .find(|(k, _)| k == "vc")
+                            .map(|(_, v)| v.into_owned()),
+                        acodec: u
+                            .query_pairs()
+                            .find(|(k, _)| k == "ac")
+                            .map(|(_, v)| v.into_owned()),
+                        width: u
+                            .query_pairs()
+                            .find(|(k, _)| k == "w")
+                            .and_then(|(_, v)| v.parse::<u32>().ok()),
+                        height: u
+                            .query_pairs()
+                            .find(|(k, _)| k == "h")
+                            .and_then(|(_, v)| v.parse::<u32>().ok()),
+                        bandwidth: u
+                            .query_pairs()
+                            .find(|(k, _)| k == "bw")
+                            .and_then(|(_, v)| v.parse::<u64>().ok()),
+                    };
                     match (video_url, audio_url) {
                         (Some(v), Some(a)) if !v.is_empty() && !a.is_empty() => {
-                            let body = playzi_core::player::build_hls_master_playlist(
+                            let body = playzi_core::player::build_hls_master_playlist_with_meta(
                                 &v,
                                 &a,
                                 &proxy_prefix,
+                                &meta,
                             )
                             .into_bytes();
                             let resp = tauri::http::Response::builder()

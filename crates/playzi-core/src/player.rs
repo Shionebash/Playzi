@@ -1572,8 +1572,11 @@ fn video_compat_tier(f: &StreamFormat) -> u8 {
     let has_audio = !f.acodec.is_empty() && f.acodec != "none";
     let vcodec = f.vcodec.to_lowercase();
     if is_hls && has_audio {
-        4
+        5
     } else if is_hls && vcodec.starts_with("avc1") {
+        4
+    } else if is_hls && (vcodec.starts_with("vp09.00") || vcodec == "vp09" || vcodec == "vp9") {
+        // Prefer 8-bit SDR VP9 (Profile 0) over 10-bit HDR VP9 (Profile 2) for universal MSE playback.
         3
     } else if is_hls && (vcodec.starts_with("vp09") || vcodec.starts_with("vp9")) {
         2
@@ -1744,6 +1747,34 @@ fn encode_proxy_url(proxy_prefix: &str, absolute_url: &str) -> String {
     format!("{proxy_prefix}?url={encoded}")
 }
 
+/// Optional stream metadata embedded into the synthetic HLS Master Playlist
+/// (`CODECS`, `RESOLUTION`, `BANDWIDTH`) so Video.js VHS configures MSE properly
+/// for fMP4 VP9/AV1 streams above 1080p.
+#[derive(Debug, Clone, Default)]
+pub struct HlsMasterMeta {
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bandwidth: Option<u64>,
+}
+
+fn sanitize_hls_codec(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 /// Builds a synthetic HLS Master Playlist combining separate video-only and audio-only HLS
 /// media playlists through the local `playzi-stream` proxy so Video.js plays both tracks together.
 pub fn build_hls_master_playlist(
@@ -1751,13 +1782,46 @@ pub fn build_hls_master_playlist(
     audio_url: &str,
     proxy_prefix: &str,
 ) -> String {
+    build_hls_master_playlist_with_meta(
+        video_url,
+        audio_url,
+        proxy_prefix,
+        &HlsMasterMeta::default(),
+    )
+}
+
+/// Builds a synthetic HLS Master Playlist with explicit `CODECS`, `RESOLUTION`, and `BANDWIDTH`
+/// attributes. Without `CODECS`, Video.js VHS falls back to probing the fMP4 `stsd` box which
+/// yields bare `vp09` (rejected by Chromium MSE), breaking 1440p/2160p playback.
+pub fn build_hls_master_playlist_with_meta(
+    video_url: &str,
+    audio_url: &str,
+    proxy_prefix: &str,
+    meta: &HlsMasterMeta,
+) -> String {
     let proxied_audio = encode_proxy_url(proxy_prefix, audio_url);
     let proxied_video = encode_proxy_url(proxy_prefix, video_url);
+    let bandwidth = meta.bandwidth.filter(|&b| b > 0).unwrap_or(5_000_000);
+
+    let mut stream_inf = format!("BANDWIDTH={bandwidth}");
+    if let (Some(w), Some(h)) = (
+        meta.width.filter(|&v| v > 0),
+        meta.height.filter(|&v| v > 0),
+    ) {
+        stream_inf.push_str(&format!(",RESOLUTION={w}x{h}"));
+    }
+    if let Some(vc) = sanitize_hls_codec(meta.vcodec.as_deref()) {
+        let ac = sanitize_hls_codec(meta.acodec.as_deref())
+            .unwrap_or_else(|| "mp4a.40.2".to_string());
+        stream_inf.push_str(&format!(",CODECS=\"{vc},{ac}\""));
+    }
+    stream_inf.push_str(",AUDIO=\"aud\"");
+
     format!(
         "#EXTM3U\n\
-         #EXT-X-VERSION:3\n\
+         #EXT-X-VERSION:6\n\
          #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"{proxied_audio}\"\n\
-         #EXT-X-STREAM-INF:BANDWIDTH=5000000,AUDIO=\"aud\"\n\
+         #EXT-X-STREAM-INF:{stream_inf}\n\
          {proxied_video}\n"
     )
 }
@@ -2474,6 +2538,26 @@ mod tests {
     }
 
     #[test]
+    fn build_hls_master_playlist_with_meta_includes_vp9_codecs_and_resolution() {
+        let master = build_hls_master_playlist_with_meta(
+            "https://manifest.googlevideo.com/v4k.m3u8",
+            "https://manifest.googlevideo.com/a.m3u8",
+            "http://playzi-stream.localhost/",
+            &HlsMasterMeta {
+                vcodec: Some("vp09.00.51.08".into()),
+                acodec: Some("none".into()),
+                width: Some(3840),
+                height: Some(2160),
+                bandwidth: Some(28_034_000),
+            },
+        );
+        assert!(master.contains("#EXT-X-VERSION:6"));
+        assert!(master.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=28034000,RESOLUTION=3840x2160,CODECS=\"vp09.00.51.08,mp4a.40.2\",AUDIO=\"aud\""
+        ));
+    }
+
+    #[test]
     fn validate_play_target_enforces_media_root_boundary() {
         let tmp = TempDir::new().unwrap();
         let media = tmp.path().join("media");
@@ -2608,12 +2692,23 @@ mod tests {
                     "width": 3840,
                     "height": 2160,
                     "tbr": 18000.0
+                },
+                {
+                    "format_id": "642",
+                    "url": "https://manifest.googlevideo.com/api/manifest/hls_playlist/vp9_2160_hdr.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "vp09.02.51.10.01.09.16.09.00",
+                    "acodec": "none",
+                    "width": 3840,
+                    "height": 2160,
+                    "tbr": 32000.0
                 }
             ]
         });
 
         let best = parse_ytdlp_info_json(&raw, "https://www.youtube.com/watch?v=hiRes123456", "best", false);
         assert_eq!(best.available_qualities, vec!["2160p", "1440p", "1080p"]);
+        // Prefers 8-bit SDR VP9 (625) over higher-bitrate 10-bit HDR VP9 (642)
         assert_eq!(best.video.as_ref().unwrap().format_id, "625");
 
         let q1440 = parse_ytdlp_info_json(&raw, "https://www.youtube.com/watch?v=hiRes123456", "1440p", false);
