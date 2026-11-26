@@ -183,6 +183,16 @@ pub fn run() {
                 .await
                 {
                     Ok(proxied) => {
+                        if proxied.status >= 400 {
+                            let host = Url::parse(&url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_string))
+                                .unwrap_or_else(|| "unknown".to_string());
+                            eprintln!(
+                                "[playzi-stream] upstream HTTP {} from {}",
+                                proxied.status, host
+                            );
+                        }
                         let mut builder = tauri::http::Response::builder()
                             .status(proxied.status)
                             .header("Content-Type", proxied.content_type)
@@ -203,6 +213,7 @@ pub fn run() {
                         responder.respond(resp);
                     }
                     Err(err) => {
+                        eprintln!("[playzi-stream] proxy error: {err}");
                         let resp = tauri::http::Response::builder()
                             .status(502)
                             .header("Access-Control-Allow-Origin", allowed_webview_origin())

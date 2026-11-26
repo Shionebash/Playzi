@@ -919,18 +919,26 @@ pub async fn dispatch_api_request(
         ("GET", "/api/player/info") => {
             let url = query.get("url").cloned().unwrap_or_default();
             let quality = query.get("quality").map(String::as_str);
+            let force_refresh = matches!(
+                query.get("refresh").map(String::as_str),
+                Some("1" | "true")
+            );
             let info = runtime
                 .player
-                .resolve_stream(&url, quality, false)
+                .resolve_stream_with_refresh(&url, quality, false, force_refresh)
                 .await
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(info).map_err(|e| e.to_string())
         }
         ("GET", "/api/player/audio") => {
             let url = query.get("url").cloned().unwrap_or_default();
+            let force_refresh = matches!(
+                query.get("refresh").map(String::as_str),
+                Some("1" | "true")
+            );
             runtime
                 .player
-                .resolve_audio(&url)
+                .resolve_audio_with_refresh(&url, force_refresh)
                 .await
                 .map_err(|e| e.to_string())
         }

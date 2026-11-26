@@ -613,6 +613,18 @@ impl PlayerManager {
         quality: Option<&str>,
         audio_only: bool,
     ) -> Result<ResolvedStreamInfo> {
+        self.resolve_stream_with_refresh(url, quality, audio_only, false)
+            .await
+    }
+
+    /// Resolves direct video/audio streams, optionally bypassing and replacing any cached entry.
+    pub async fn resolve_stream_with_refresh(
+        &self,
+        url: &str,
+        quality: Option<&str>,
+        audio_only: bool,
+        force_refresh: bool,
+    ) -> Result<ResolvedStreamInfo> {
         let trimmed = url.trim();
         validate_http_url(trimmed)?;
         let cfg = self.config.snapshot();
@@ -621,7 +633,11 @@ impl PlayerManager {
             .unwrap_or(&cfg.playback_quality);
         let cache_key = format!("{}|{}|{}", trimmed, qual, audio_only);
 
-        if let Some(cached) = self.get_cached_stream(&cache_key) {
+        if force_refresh {
+            if let Ok(mut cache) = self.stream_cache.lock() {
+                cache.remove(&cache_key);
+            }
+        } else if let Some(cached) = self.get_cached_stream(&cache_key) {
             return Ok(cached);
         }
 
@@ -664,7 +680,18 @@ impl PlayerManager {
 
     /// Resolves audio-only stream payload compatible with `/api/player/audio`.
     pub async fn resolve_audio(&self, url: &str) -> Result<Value> {
-        let info = self.resolve_stream(url, Some("audio"), true).await?;
+        self.resolve_audio_with_refresh(url, false).await
+    }
+
+    /// Resolves audio-only stream payload, optionally bypassing the stream cache.
+    pub async fn resolve_audio_with_refresh(
+        &self,
+        url: &str,
+        force_refresh: bool,
+    ) -> Result<Value> {
+        let info = self
+            .resolve_stream_with_refresh(url, Some("audio"), true, force_refresh)
+            .await?;
         let audio = info
             .audio
             .as_ref()
@@ -2046,46 +2073,84 @@ pub async fn fetch_proxied_stream(
             "Host no permitido para el proxy de stream".into(),
         ));
     }
-    let mut req = client.get(parsed).header("Accept", "*/*");
-    if let Some(range) = range_header.filter(|r| !r.trim().is_empty()) {
-        req = req.header("Range", range);
-    }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|err| CoreError::External(format!("Stream proxy request failed: {err}")))?;
+    const MAX_ATTEMPTS: usize = 3;
+    const BACKOFF_MS: [u64; 2] = [200, 500];
+    let mut attempt = 0usize;
 
-    if !is_allowed_stream_proxy_host(resp.url()) {
-        return Err(CoreError::Validation(
-            "Redirección a host no permitido en el proxy de stream".into(),
-        ));
-    }
+    let (status, final_url, content_type, content_range, accept_ranges, bytes) = loop {
+        attempt += 1;
+        let mut req = client.get(parsed.clone()).header("Accept", "*/*");
+        if let Some(range) = range_header.filter(|r| !r.trim().is_empty()) {
+            req = req.header("Range", range);
+        }
 
-    let status = resp.status().as_u16();
-    let final_url = resp.url().to_string();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let content_range = resp
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
-    let accept_ranges = resp
-        .headers()
-        .get(reqwest::header::ACCEPT_RANGES)
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(err) => {
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
+                    continue;
+                }
+                return Err(CoreError::External(format!(
+                    "Stream proxy request failed: {err}"
+                )));
+            }
+        };
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|err| CoreError::External(format!("Stream proxy body read failed: {err}")))?
-        .to_vec();
+        if !is_allowed_stream_proxy_host(resp.url()) {
+            return Err(CoreError::Validation(
+                "Redirección a host no permitido en el proxy de stream".into(),
+            ));
+        }
+
+        let status = resp.status().as_u16();
+        let retryable_status = status == 429 || (500..=504).contains(&status);
+        if retryable_status && attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
+            continue;
+        }
+
+        let final_url = resp.url().to_string();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let content_range = resp
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let accept_ranges = resp
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+
+        match resp.bytes().await {
+            Ok(b) => {
+                break (
+                    status,
+                    final_url,
+                    content_type,
+                    content_range,
+                    accept_ranges,
+                    b.to_vec(),
+                );
+            }
+            Err(err) => {
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
+                    continue;
+                }
+                return Err(CoreError::External(format!(
+                    "Stream proxy body read failed: {err}"
+                )));
+            }
+        }
+    };
 
     let looks_like_m3u8 = content_type.to_lowercase().contains("mpegurl")
         || is_hls_url(&final_url)
@@ -2166,6 +2231,17 @@ pub fn extract_url_expire(raw_url: &str) -> Option<i64> {
         if k == "expire" {
             if let Ok(ts) = v.parse::<i64>() {
                 return Some(ts);
+            }
+        }
+    }
+    if let Some(mut segments) = parsed.path_segments() {
+        while let Some(seg) = segments.next() {
+            if seg == "expire" {
+                if let Some(val) = segments.next() {
+                    if let Ok(ts) = val.parse::<i64>() {
+                        return Some(ts);
+                    }
+                }
             }
         }
     }
@@ -3053,5 +3129,21 @@ mod tests {
         let info = parse_ytdlp_info_json(&raw, "https://youtu.be/abc12345678", "best", true);
         let audio = info.audio.expect("should pick audio");
         assert_eq!(audio.format_id, "251");
+    }
+
+    #[test]
+    fn extract_url_expire_parses_query_and_hls_path_segments() {
+        assert_eq!(
+            extract_url_expire("https://rr1.googlevideo.com/videoplayback?expire=1795745495&itag=140"),
+            Some(1795745495)
+        );
+        assert_eq!(
+            extract_url_expire("https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1795745495/ei/abc/itag/96/playlist/index.m3u8"),
+            Some(1795745495)
+        );
+        assert_eq!(
+            extract_url_expire("https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/96/playlist/index.m3u8"),
+            None
+        );
     }
 }

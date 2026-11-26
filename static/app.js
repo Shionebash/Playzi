@@ -3450,12 +3450,15 @@ async function loadWebPlayerItem(index, opts = {}) {
     _partyMediaLoadingLock = true;
     _lockPartySync(1500);
   }
+  if (!opts?.isAutoRecovery) {
+    state.player._autoRecoverKey = "";
+  }
   try {
     _startYtWatchReporting(item);
     if (state.player.sourceContext === "music" || state.player.audioOnly) {
-      await _loadMusicItem(item, loadId);
+      await _loadMusicItem(item, loadId, opts);
     } else {
-      await _loadVideoItem(item, loadId);
+      await _loadVideoItem(item, loadId, opts);
     }
     if (state.player._loadingId !== loadId) {
       if (opts?.fromPartySync) _partyMediaLoadingLock = false;
@@ -3504,8 +3507,9 @@ function _getAudioEl() {
   return document.getElementById("webPlayerAudio_html5_api") || $("#webPlayerAudio");
 }
 
-async function _loadMusicItem(item, loadId) {
-  const info = await api.get(`/api/player/audio?url=${encodeURIComponent(item.url)}`);
+async function _loadMusicItem(item, loadId, opts = {}) {
+  const refreshParam = opts?.forceRefresh ? "&refresh=1" : "";
+  const info = await api.get(`/api/player/audio?url=${encodeURIComponent(item.url)}${refreshParam}`);
   if (state.player._loadingId !== loadId) return;
   const audio = _getAudioEl();
   if (!audio) return;
@@ -3535,7 +3539,24 @@ async function _loadMusicItem(item, loadId) {
       });
       state.player.audioVjs.on("error", () => {
         const err = state.player.audioVjs?.error();
-        _updateWatchMeta(err?.message || "Error al reproducir el audio.");
+        const curUrl = state.player.current?.url || "";
+        const recoverKey = `audio|${curUrl}`;
+        if (curUrl && !state.player.loading && state.player._autoRecoverKey !== recoverKey) {
+          state.player._autoRecoverKey = recoverKey;
+          const resumeTime = Number(state.player.audioVjs?.currentTime() || 0);
+          toast("Reconectando stream de audio...");
+          loadWebPlayerItem(state.player.index, {
+            forceRefresh: true,
+            isAutoRecovery: true,
+            resumeTime: Number.isFinite(resumeTime) && resumeTime > 1 ? resumeTime : 0,
+          });
+          return;
+        }
+        const rawMsg = String(err?.message || "");
+        const isVhsErr = /no available working or supported playlists|playback cannot continue/i.test(rawMsg);
+        _updateWatchMeta(isVhsErr
+          ? "La playlist HLS de audio dejó de responder o expiró. Pulsa 'Reintentar'."
+          : (rawMsg || "Error al reproducir el audio."));
       });
       state.player.audioVjs.on("timeupdate", () => {
         _maybePrefetchNextItem(state.player.audioVjs?.currentTime() || 0);
@@ -3543,6 +3564,14 @@ async function _loadMusicItem(item, loadId) {
     }
     _applySavedVolumeToMusic();
     state.player.audioVjs.src({ src: proxiedSrc, type: "application/x-mpegURL" });
+    if (opts?.resumeTime > 1) {
+      const targetTime = opts.resumeTime;
+      state.player.audioVjs.one("canplay", () => {
+        if (state.player._loadingId === loadId && state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+          state.player.audioVjs.currentTime(targetTime);
+        }
+      });
+    }
     _applySavedVolumeToMusic();
     state.player.audioVjs.play().catch(() => {});
   } else {
@@ -3632,7 +3661,7 @@ function _prefetchNextItem() {
   });
 }
 
-async function _loadVideoItem(item, loadId) {
+async function _loadVideoItem(item, loadId, opts = {}) {
   state.player.audioTracks = null;
   state.player.audioLang = null;
   state.player.availableQualities = null;
@@ -3640,11 +3669,12 @@ async function _loadVideoItem(item, loadId) {
   const rawQuality = state.config?.playbackQuality || "best";
   state.player.activeQuality = rawQuality;
   const quality = encodeURIComponent(rawQuality);
+  const refreshParam = opts?.forceRefresh ? "&refresh=1" : "";
 
   // Desktop integrated mode: play inside Playzi via Video.js + local playzi-stream:// HLS proxy.
   // External players (VLC / mpv) remain available via the "Abrir externo" button and local files.
   if (IS_TAURI) {
-    const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`);
+    const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}${refreshParam}`);
     if (state.player._loadingId !== loadId) return;
     state.player.current = { ...item, ...(info.item || {}) };
     _setCurrentLoudnessDb(info.loudnessDb);
@@ -3677,6 +3707,14 @@ async function _loadVideoItem(item, loadId) {
         : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
       _applySavedVolumeToVideo(player);
       player.src({ src: proxiedSrc, type: mimeType });
+      if (opts?.resumeTime > 1) {
+        const targetTime = opts.resumeTime;
+        player.one("canplay", () => {
+          if (state.player._loadingId === loadId && !player.isDisposed()) {
+            player.currentTime(targetTime);
+          }
+        });
+      }
       _applySavedVolumeToVideo(player);
       player.play().catch(() => {});
     } else {
@@ -3757,6 +3795,27 @@ async function ensureVideoPlayer() {
   let volumeReady = false;
   player.on("error", () => {
     const err = player.error();
+    const rawMsg = String(err?.message || "");
+    const isVhsPlaylistErr = /no available working or supported playlists|playback cannot continue/i.test(rawMsg);
+    const curUrl = state.player.current?.url || "";
+    const recoverKey = `video|${curUrl}|${state.player.activeQuality || "best"}`;
+    if (
+      IS_TAURI &&
+      curUrl &&
+      !state.player.loading &&
+      (isVhsPlaylistErr || err?.code === 2 || err?.code === 3) &&
+      state.player._autoRecoverKey !== recoverKey
+    ) {
+      state.player._autoRecoverKey = recoverKey;
+      const resumeTime = Number(player.currentTime() || 0);
+      toast("Reconectando stream...");
+      loadWebPlayerItem(state.player.index, {
+        forceRefresh: true,
+        isAutoRecovery: true,
+        resumeTime: Number.isFinite(resumeTime) && resumeTime > 1 ? resumeTime : 0,
+      });
+      return;
+    }
     const messages = {
       1: "Reproducción cancelada.",
       2: "Error de red al cargar el video. Revisa tu conexión o reintenta.",
@@ -3764,7 +3823,9 @@ async function ensureVideoPlayer() {
       4: "Formato no compatible con el reproductor web. Prueba con un reproductor externo (MPV/VLC) o baja la calidad.",
       5: "El video está cifrado y no se puede reproducir.",
     };
-    const msg = messages[err?.code] || err?.message || "Error de reproducción";
+    const msg = isVhsPlaylistErr
+      ? "La playlist HLS dejó de responder o expiró. Pulsa 'Reintentar' o prueba con otra calidad."
+      : (messages[err?.code] || rawMsg || "Error de reproducción");
     toast(msg);
     _updateWatchMeta(msg);
   });
@@ -6819,7 +6880,8 @@ document.addEventListener("click", async (ev) => {
       return;
     }
     if (act === "retry-web-player") {
-      loadWebPlayerItem(state.player.index);
+      state.player._autoRecoverKey = "";
+      loadWebPlayerItem(state.player.index, { forceRefresh: true });
       return;
     }
     if (act === "render-collections") {
