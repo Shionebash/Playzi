@@ -453,11 +453,18 @@ async function loadAll() {
   }
 }
 
+function _hasCookiesConfigured() {
+  return Boolean(
+    state.config?.cookiesBrowser
+    || state.config?.cookiesFile
+    || state.musicAuthState === "ok"
+  );
+}
+
 // On startup, silently revalidate the session against the persistent browser
 // profile. Never opens a visible browser (that's only the on-click fallback).
 async function _silentAuthRefresh() {
-  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
-  if (!hasCookies) return;
+  if (!_hasCookiesConfigured()) return;
   try {
     const resp = await api.post("/api/music/auth/refresh");
     await _pollTask(resp?.task?.id, 60);
@@ -881,7 +888,7 @@ async function _expandRecomSection(kind) {
       }
     }
   } catch (err) {
-    toast(errorText(err));
+    toast(err?.message || String(err));
   } finally {
     state.recomLoadingMore[kind] = false;
     renderRecom();
@@ -889,7 +896,7 @@ async function _expandRecomSection(kind) {
 }
 
 function renderRecom() {
-  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const hasCookies = _hasCookiesConfigured();
   const songsAll = _uniqueByUrl(state.musicRecommendations.filter((item) => !_isRecommendedMix(item)));
   const videosAll = _uniqueByUrl([
     ...state.recommendations.filter((item) => !_isRecommendedMix(item) && !_isShort(item)),
@@ -966,7 +973,7 @@ function renderShorts() {
     setView("home");
     return;
   }
-  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const hasCookies = _hasCookiesConfigured();
   const shortsAll = _uniqueByUrl([
     ...state.recommendations.filter(_isShort),
     ...state.feed.filter(_isShort),
@@ -1553,7 +1560,7 @@ async function startLoginFlow() {
 
 let _musicSyncTriggered = false;
 async function _autoTriggerMusicSync() {
-  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const hasCookies = _hasCookiesConfigured();
   if (!hasCookies || _musicSyncTriggered || state.musicAuthState === "expired") return;
   const needsRecom = !state.musicRecomLastSync && !state.syncStatus?.sections?.musicRecommendations?.running;
   const needsPlaylists = !state.musicPlaylistsLastSync && !state.syncStatus?.sections?.musicPlaylists?.running;
@@ -1593,7 +1600,7 @@ function _musicAuthBanner() {
 }
 
 function renderMusic() {
-  const hasCookies = state.config?.cookiesBrowser || state.config?.cookiesFile;
+  const hasCookies = _hasCookiesConfigured();
   const expired = state.musicAuthState === "expired";
   const local = state.library.filter((item) => item.kind === "audio" || ["MP3", "OPUS", "M4A"].includes(String(item.format || "").toUpperCase()));
   const musicMixes = _uniqueByUrl(state.musicRecommendations.filter(_isRecommendedMix));
@@ -1798,7 +1805,7 @@ async function checkForAppUpdates() {
     state.updateStatus = status;
     if (state.view === "config") renderConfig();
   } catch (err) {
-    toast(errorText(err));
+    toast(err?.message || String(err));
   }
 }
 
@@ -1858,7 +1865,7 @@ function renderConfig() {
           ).join("")}
         </select>
       </label>
-      <label>Archivo cookies.txt (alternativo; también puedes dejarlo en D:\\ytlocal\\cookies)
+      <label>Archivo cookies.txt (alternativo; también puedes dejarlo en la carpeta cookies/ de Playzi)
         <input class="form-input" name="cookiesFile" value="${escapeHtml(c.cookiesFile || "")}" placeholder="C:\\ruta\\cookies.txt">
       </label>
       <label class="config-toggle">
@@ -3993,6 +4000,18 @@ function prefetchPlayback(url, forceAudio = false) {
   _prefetchInFlight += 1;
   const isAudio = forceAudio || String(url).includes("music.youtube.com");
   const quality = encodeURIComponent(state.config?.playbackQuality || "best");
+  if (IS_TAURI) {
+    const endpoint = isAudio
+      ? `/api/player/audio?url=${encodeURIComponent(url)}`
+      : `/api/player/info?url=${encodeURIComponent(url)}&quality=${quality}`;
+    api.get(endpoint)
+      .catch(() => {
+        _prefetchedUrls.delete(url);
+        _prefetchTimestamps.delete(url);
+      })
+      .finally(() => { _prefetchInFlight -= 1; });
+    return;
+  }
   const endpoint = isAudio
     ? `/api/player/audio?url=${encodeURIComponent(url)}`
     : `/api/player/manifest.mpd?url=${encodeURIComponent(url)}&quality=${quality}`;
@@ -6485,7 +6504,7 @@ document.addEventListener("click", async (ev) => {
         const snap = await api.post("/api/social/friends/remove", { userId: uid });
         _onSocialStateUpdate(snap);
       } else {
-        const resp = await api.del(`/api/friends/${encodeURIComponent(uid)}`);
+        const resp = await api.delete(`/api/friends/${encodeURIComponent(uid)}`);
         state.friends = resp.items || [];
         renderParty();
         toast("Amigo eliminado");

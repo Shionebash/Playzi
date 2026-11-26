@@ -604,7 +604,7 @@ impl YouTubeClient {
                         .header("Referer", &referer)
                         .header("Origin", "https://www.youtube.com")
                         .header("X-Goog-AuthUser", auth_user.to_string());
-                    if let Some(auth) = jar.sapisidhash("https://www.youtube.com", chrono::Utc::now().timestamp()) {
+                    if let Some(auth) = jar.authorization_header("https://www.youtube.com", chrono::Utc::now().timestamp()) {
                         req = req.header("Authorization", auth);
                     }
                     if let Ok(resp) = req.send().await {
@@ -670,7 +670,7 @@ impl YouTubeClient {
                     .header("Referer", &referer)
                     .header("Origin", "https://www.youtube.com")
                     .header("X-Goog-AuthUser", auth_user.to_string());
-                if let Some(auth) = jar.sapisidhash("https://www.youtube.com", chrono::Utc::now().timestamp()) {
+                if let Some(auth) = jar.authorization_header("https://www.youtube.com", chrono::Utc::now().timestamp()) {
                     req = req.header("Authorization", auth);
                 }
                 if let Ok(resp) = req.send().await {

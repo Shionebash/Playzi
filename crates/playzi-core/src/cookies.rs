@@ -247,6 +247,30 @@ impl CookieJar {
         Some(compute_sapisidhash(sapisid, origin, timestamp_secs))
     }
 
+    /// Computes the full YouTube/Google InnerTube `Authorization` header value,
+    /// emitting `SAPISIDHASH` plus `SAPISID1PHASH` / `SAPISID3PHASH` when
+    /// `__Secure-1PAPISID` / `__Secure-3PAPISID` cookies are present.
+    pub fn authorization_header(&self, origin: &str, timestamp_secs: i64) -> Option<String> {
+        let host = origin_host(origin).unwrap_or("music.youtube.com");
+        let sapisid = self.get_for_host(host, "SAPISID").or_else(|| self.get("SAPISID"));
+        let p1 = self
+            .get_for_host(host, "__Secure-1PAPISID")
+            .or_else(|| self.get("__Secure-1PAPISID"));
+        let p3 = self
+            .get_for_host(host, "__Secure-3PAPISID")
+            .or_else(|| self.get("__Secure-3PAPISID"));
+
+        let primary = sapisid.or(p3).or(p1)?;
+        let mut parts = vec![compute_sapisidhash(primary, origin, timestamp_secs)];
+        if let Some(tok) = p1 {
+            parts.push(compute_sapisidhash_scheme("SAPISID1PHASH", tok, origin, timestamp_secs));
+        }
+        if let Some(tok) = p3 {
+            parts.push(compute_sapisidhash_scheme("SAPISID3PHASH", tok, origin, timestamp_secs));
+        }
+        Some(parts.join(" "))
+    }
+
     /// Builds YouTube Music authenticated InnerTube headers (`Cookie`, `Authorization`, `x-origin`, `X-Goog-AuthUser`).
     pub fn ytmusic_auth_headers(&self, origin: &str) -> Option<BTreeMap<String, String>> {
         self.ytmusic_auth_headers_for_user(origin, 0)
@@ -258,7 +282,7 @@ impl CookieJar {
         origin: &str,
         auth_user: u8,
     ) -> Option<BTreeMap<String, String>> {
-        let auth = self.sapisidhash(origin, now_unix_secs())?;
+        let auth = self.authorization_header(origin, now_unix_secs())?;
         let mut cookie_header = origin_host(origin)
             .map(|host| self.cookie_header_for_host(host))
             .unwrap_or_default();
@@ -307,12 +331,21 @@ fn is_youtube_or_google_domain(domain: &str) -> bool {
         || norm.ends_with(".ytimg.com")
 }
 
-pub fn compute_sapisidhash(sapisid: &str, origin: &str, timestamp_secs: i64) -> String {
+pub fn compute_sapisidhash_scheme(
+    scheme: &str,
+    sapisid: &str,
+    origin: &str,
+    timestamp_secs: i64,
+) -> String {
     let payload = format!("{timestamp_secs} {sapisid} {origin}");
     let mut hasher = Sha1::new();
     hasher.update(payload.as_bytes());
     let digest = hex::encode(hasher.finalize());
-    format!("SAPISIDHASH {timestamp_secs}_{digest}")
+    format!("{scheme} {timestamp_secs}_{digest}")
+}
+
+pub fn compute_sapisidhash(sapisid: &str, origin: &str, timestamp_secs: i64) -> String {
+    compute_sapisidhash_scheme("SAPISIDHASH", sapisid, origin, timestamp_secs)
 }
 
 /// Checks the first 20 lines of `path` to determine if it looks like a Netscape cookie file.
@@ -664,9 +697,15 @@ fn query_windows_registry_value(key: &str, value_name: Option<&str>) -> Option<S
 #[cfg(windows)]
 fn detect_primary_browser_windows() -> Option<BrowserCandidate> {
     let prog_id = query_windows_registry_value(
-        r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoiceLatest\ProgId",
         Some("ProgId"),
-    )?;
+    )
+    .or_else(|| {
+        query_windows_registry_value(
+            r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+            Some("ProgId"),
+        )
+    })?;
 
     let command_str = query_windows_registry_value(
         &format!(r"HKCU\Software\Classes\{prog_id}\shell\open\command"),

@@ -290,6 +290,12 @@ function Show-DepsDialog(
     $form.MinimizeBox = $false
     $form.TopMost = $true
     $form.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
+    try {
+        $exePath = Join-Path $InstallDir "playzi.exe"
+        if (Test-Path -LiteralPath $exePath) {
+            $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+        }
+    } catch {}
 
     $lblIntro = New-Object System.Windows.Forms.Label
     $lblIntro.Text = "Playzi instalara automaticamente los requisitos necesarios si faltan. Tambien puedes elegir instalar reproductores externos opcionales."

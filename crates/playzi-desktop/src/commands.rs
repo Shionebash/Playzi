@@ -192,22 +192,39 @@ async fn check_and_emit_auth(runtime: &AppRuntime, app: &AppHandle) -> Result<Va
     Ok(payload)
 }
 
-async fn try_import_cookies_from_system_browser(runtime: &AppRuntime) -> Option<String> {
+async fn try_import_cookies_from_system_browser(
+    runtime: &AppRuntime,
+) -> (Option<String>, Option<String>) {
     let cfg = runtime.config.snapshot();
     let ytdlp_bin = runtime.player.resolve_ytdlp_bin();
     let temp_dir = runtime.cookie_store().private_dir();
     let candidates = candidates_for_config(&cfg.cookies_browser);
+    let mut dpapi_or_lock_hint: Option<String> = None;
 
     for candidate in candidates {
-        if let Ok(jar) =
-            export_cookies_from_browser(&ytdlp_bin, &candidate.ytdlp_spec, &temp_dir).await
-        {
-            if jar.sapisid().is_some() && persist_cookie_jar(&jar, runtime).is_ok() {
-                return Some(candidate.label);
+        match export_cookies_from_browser(&ytdlp_bin, &candidate.ytdlp_spec, &temp_dir).await {
+            Ok(jar) => {
+                if jar.sapisid().is_some() && persist_cookie_jar(&jar, runtime).is_ok() {
+                    return (Some(candidate.label), None);
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                if dpapi_or_lock_hint.is_none()
+                    && (msg.contains("could not copy")
+                        || msg.contains("dpapi")
+                        || msg.contains("app-bound")
+                        || msg.contains("decrypt"))
+                {
+                    dpapi_or_lock_hint = Some(format!(
+                        "No se pudieron leer las cookies de {} (navegador bloqueado o cifrado por Windows). Cierra {} e intenta de nuevo, usa Firefox/Zen o importa un archivo cookies.txt en Configuración.",
+                        candidate.label, candidate.label
+                    ));
+                }
             }
         }
     }
-    None
+    (None, dpapi_or_lock_hint)
 }
 
 fn open_auth_window_inner(app: &AppHandle) -> Result<(), String> {
@@ -225,6 +242,7 @@ fn open_auth_window_inner(app: &AppHandle) -> Result<(), String> {
             }
             if try_import_cookies_from_system_browser(&runtime)
                 .await
+                .0
                 .is_some()
             {
                 if let Ok(status) = check_and_emit_auth(&runtime, &app_handle).await {
@@ -673,6 +691,23 @@ pub async fn dispatch_api_request(
             .refresh_section(SyncSection::MusicPlaylists)
             .await
             .map_err(|e| e.to_string()),
+        ("POST", "/api/music/library/refresh") => {
+            let playlists = runtime
+                .autosync
+                .refresh_section(SyncSection::MusicPlaylists)
+                .await
+                .map_err(|e| e.to_string())?;
+            let recommendations = runtime
+                .autosync
+                .refresh_section(SyncSection::MusicRecommendations)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({
+                "ok": true,
+                "playlists": playlists,
+                "recommendations": recommendations,
+            }))
+        }
         ("POST", "/api/music/playlist-songs") => {
             let url_or_id = body.get("url").and_then(Value::as_str).unwrap_or("");
             let playlist_id = extract_playlist_id(url_or_id);
@@ -700,9 +735,14 @@ pub async fn dispatch_api_request(
             let ytdlp_bin = runtime.player.resolve_ytdlp_bin();
             let ytdlp_ok = playzi_core::player::binary_exists(&ytdlp_bin);
             let mut imported_from: Option<String> = None;
+            let mut import_hint: Option<String> = None;
+            let mut attempted_import = false;
 
             if force_import && ytdlp_ok {
-                imported_from = try_import_cookies_from_system_browser(runtime).await;
+                attempted_import = true;
+                let (browser, hint) = try_import_cookies_from_system_browser(runtime).await;
+                imported_from = browser;
+                import_hint = hint;
             }
 
             let ytm = runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
@@ -716,11 +756,13 @@ pub async fn dispatch_api_request(
                 .exists()
                 || !runtime.config.snapshot().cookies_file.trim().is_empty();
             if status.state != "ok"
-                && imported_from.is_none()
+                && !attempted_import
                 && ytdlp_ok
                 && (force_import || has_saved_cookies)
             {
-                imported_from = try_import_cookies_from_system_browser(runtime).await;
+                let (browser, hint) = try_import_cookies_from_system_browser(runtime).await;
+                imported_from = browser;
+                import_hint = hint;
                 if imported_from.is_some() {
                     let refreshed_ytm =
                         runtime.build_ytmusic_client().map_err(|e| e.to_string())?;
@@ -743,7 +785,9 @@ pub async fn dispatch_api_request(
                 .map(|s| s.music_auth_user)
                 .unwrap_or(0);
             let error_msg = if status.state != "ok" && !ytdlp_ok {
-                Some("No se encontró yt-dlp instalado en el sistema. Instala yt-dlp para sincronizar cookies del navegador.")
+                Some("No se encontró yt-dlp instalado en el sistema. Instala yt-dlp para sincronizar cookies del navegador.".to_string())
+            } else if status.state != "ok" {
+                import_hint
             } else {
                 None
             };

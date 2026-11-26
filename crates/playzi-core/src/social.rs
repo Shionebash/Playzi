@@ -754,12 +754,14 @@ impl SocialManager {
                                 if action == "ping" {
                                     continue;
                                 }
+                                let current_profile = ensure_user_profile(&manager.inner.state_store)
+                                    .unwrap_or_else(|_| profile.clone());
                                 let resp = http_client
                                     .post(&social_endpoint)
                                     .json(&json!({
-                                        "userId": profile.user_id,
-                                        "displayName": profile.display_name,
-                                        "googleAccountName": profile.google_account_name,
+                                        "userId": current_profile.user_id,
+                                        "displayName": current_profile.display_name,
+                                        "googleAccountName": current_profile.google_account_name,
                                         "action": action,
                                         "payload": val,
                                     }))
@@ -773,6 +775,8 @@ impl SocialManager {
                                 }
                             }
                             _ = poll_interval.tick() => {
+                                let current_profile = ensure_user_profile(&manager.inner.state_store)
+                                    .unwrap_or_else(|_| profile.clone());
                                 let current_room = {
                                     let rt = manager.inner.runtime.read().await;
                                     rt.published_room.clone()
@@ -780,9 +784,9 @@ impl SocialManager {
                                 let resp = http_client
                                     .post(&social_endpoint)
                                     .json(&json!({
-                                        "userId": profile.user_id,
-                                        "displayName": profile.display_name,
-                                        "googleAccountName": profile.google_account_name,
+                                        "userId": current_profile.user_id,
+                                        "displayName": current_profile.display_name,
+                                        "googleAccountName": current_profile.google_account_name,
                                         "action": "sync",
                                         "hasRoomState": true,
                                         "room": current_room,

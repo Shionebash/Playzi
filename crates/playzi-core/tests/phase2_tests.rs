@@ -165,6 +165,20 @@ fn cookies_ytmusic_headers_filter_host_and_ignore_google_or_third_party_cookies(
     assert_eq!(filtered.get("AUTH"), None);
 }
 
+#[test]
+fn cookies_authorization_header_emits_3phash_and_1phash() {
+    let sample = "# Netscape HTTP Cookie File\n\
+        .youtube.com\tTRUE\t/\tTRUE\t4102444800\t__Secure-3PAPISID\tp3_tok\n\
+        .youtube.com\tTRUE\t/\tTRUE\t4102444800\t__Secure-1PAPISID\tp1_tok\n";
+    let jar = CookieJar::parse(sample);
+    let auth = jar
+        .authorization_header("https://music.youtube.com", 1700000000)
+        .unwrap();
+    assert!(auth.contains("SAPISIDHASH 1700000000_"));
+    assert!(auth.contains("SAPISID1PHASH 1700000000_"));
+    assert!(auth.contains("SAPISID3PHASH 1700000000_"));
+}
+
 #[tokio::test]
 async fn youtube_search_metadata_radio_and_channels_with_mock_innertube() {
     let base_url = spawn_mock_server(|path, _headers, body| {
