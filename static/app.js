@@ -21,6 +21,8 @@ const state = {
   musicPlaylists: [],
   musicPlaylistsLastSync: "",
   channelsLastSync: "",
+  syncingSubscriptions: false,
+  _channelsAutoSynced: false,
   musicAuthState: "",
   musicAccountName: "",
   musicLibrary: { songs: [], liked: [], albums: [], artists: [], playlists: [], history: [], lastSync: "", error: "" },
@@ -1296,33 +1298,94 @@ function _uniqueByUrl(items) {
   return result;
 }
 
+async function syncChannelSubscriptions({ silent = false } = {}) {
+  if (state.syncingSubscriptions) return;
+  state.syncingSubscriptions = true;
+  if (state.view === "channels") renderChannels();
+  try {
+    if (!silent) toast("Sincronizando suscripciones de YouTube...");
+    const res = await api.post("/api/channels/sync-subscriptions");
+    if (Array.isArray(res.items)) state.channels = res.items;
+    if (Array.isArray(res.feed)) state.feed = res.feed;
+    if (res.lastSync) state.channelsLastSync = res.lastSync;
+    if (!res.authenticated) {
+      if (!silent) {
+        toast("Inicia sesión con tu cuenta de YouTube en Configuración para sincronizar tus suscripciones.");
+      }
+    } else if (!silent) {
+      const synced = Number(res.syncedCount || 0);
+      const added = Number(res.addedCount || 0);
+      toast(
+        synced
+          ? `Suscripciones sincronizadas: ${synced} canales${added ? ` (${added} nuevos)` : ""}.`
+          : "No se encontraron suscripciones en tu cuenta de YouTube."
+      );
+    }
+  } catch (err) {
+    if (!silent) toast(err.message || "Error al sincronizar suscripciones.");
+  } finally {
+    state.syncingSubscriptions = false;
+    render();
+  }
+}
+
 function renderChannels() {
+  const hasCookies = _hasCookiesConfigured();
   const lastSync = state.channelsLastSync || "";
+  if (hasCookies && !state.channels.length && !state._channelsAutoSynced && !state.syncingSubscriptions) {
+    state._channelsAutoSynced = true;
+    queueMicrotask(() => syncChannelSubscriptions({ silent: true }));
+  }
   $("#view-channels").innerHTML = `
     <div class="section-hdr">
-      <span class="section-title">Canales ${lastSync ? `<span class="meta" style="font-size:10px;margin-left:8px">· sync: ${escapeHtml(lastSync)}</span>` : ""}</span>
-      <span class="meta">${state.channels.length} canales</span>
+      <span class="section-title">Canales seguidos ${lastSync ? `<span class="meta" style="font-size:10px;margin-left:8px">· sync: ${escapeHtml(lastSync)}</span>` : ""}</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="meta">${state.channels.length} canales</span>
+        <button class="btn btn-primary" type="button" id="syncSubscriptionsBtn" ${state.syncingSubscriptions ? "disabled" : ""}>${state.syncingSubscriptions ? "Sincronizando..." : "Sincronizar suscripciones"}</button>
+        <button class="btn btn-ghost" type="button" id="refreshAllChannels">Actualizar videos</button>
+      </div>
     </div>
+    ${!hasCookies ? `
+      <div class="url-banner" style="margin-bottom:16px">
+        <strong>⚙</strong>
+        <div style="min-width:0;flex:1">
+          <div class="url-banner-title">Conecta tu cuenta de YouTube</div>
+          <div class="url-banner-sub">Ve a Configuración para iniciar sesión y sincronizar automáticamente los canales a los que estás suscrito.</div>
+        </div>
+        <button class="btn btn-ghost" type="button" data-view-go="config">Configurar</button>
+      </div>` : syncNotice("channels")}
     <form class="inline-form" id="channelForm">
       <input class="form-input" name="url" placeholder="@canal o URL del canal" required>
       <input class="form-input" name="name" placeholder="Nombre opcional">
       <button class="btn btn-primary" type="submit">Agregar</button>
     </form>
+    ${state.channels.length ? `
     <div class="list-stack">
       ${state.channels.map((c) => {
         const count = state.feed.filter((f) => f.sourceChannelId === c.id).length;
+        const subtitle = c.handle || c.url;
+        const avatarHtml = c.thumbnail
+          ? `<img class="channel-row-avatar" src="${escapeHtml(c.thumbnail)}" alt="" loading="lazy" data-view-channel="${escapeHtml(c.id)}">`
+          : `<div class="channel-row-avatar channel-row-avatar-fallback" data-view-channel="${escapeHtml(c.id)}">${escapeHtml((c.name || "?").slice(0, 1).toUpperCase())}</div>`;
+        const subBadge = c.syncedFromYoutube ? `<span class="channel-sub-badge">Suscripción YT</span>` : "";
         return `
         <div class="row-card">
+          ${avatarHtml}
           <div class="row-main" data-view-channel="${escapeHtml(c.id)}" style="cursor:pointer" title="Ver videos del canal">
-            <strong>${escapeHtml(c.name)}</strong>
-            <span>${escapeHtml(c.url)}</span>
+            <div class="channel-row-title"><strong>${escapeHtml(c.name)}</strong>${subBadge}</div>
+            <span>${escapeHtml(subtitle)}${c.subscriberCount ? ` · ${escapeHtml(c.subscriberCount)}` : ""}</span>
             ${c.error ? `<span class="error-text">${escapeHtml(c.error)}</span>` : `<span>Última sync: ${escapeHtml(c.lastSync || "nunca")}${count ? ` · ${count} videos recientes` : ""}</span>`}
           </div>
           <button class="btn btn-ghost" type="button" data-refresh-channel="${escapeHtml(c.id)}">Actualizar</button>
           <button class="btn btn-danger" type="button" data-delete-channel="${escapeHtml(c.id)}">Eliminar</button>
         </div>`;
       }).join("")}
-    </div>
+    </div>` : empty(
+      state.syncingSubscriptions ? "Sincronizando tus suscripciones..." : "Sin canales seguidos",
+      hasCookies
+        ? "Pulsa 'Sincronizar suscripciones' para importar tus canales de YouTube o agrega uno manualmente."
+        : "Conecta tu cuenta de YouTube en Configuración o agrega un canal manualmente arriba."
+    )}
   `;
 }
 
@@ -1338,13 +1401,35 @@ function _normalizeChannelUrl(url) {
   return clean;
 }
 
+function _extractUcIdFromUrl(url) {
+  const m = String(url || "").match(/\/channel\/(UC[A-Za-z0-9_-]{10,})/i);
+  return m ? m[1].toLowerCase() : "";
+}
+
+function _extractHandleFromUrl(url) {
+  const m = String(url || "").match(/\/@([^/?#]+)/i);
+  return m ? m[1].toLowerCase() : "";
+}
+
 function findFollowedChannel(channelUrl) {
   if (!channelUrl) return null;
-  const norm = _normalizeChannelUrl(channelUrl);
-  const bare = channelUrl.replace(/\/$/, "");
-  return state.channels.find((c) => c.url === norm)
-    || state.channels.find((c) => c.url && c.url.replace(/\/videos$/, "") === bare)
-    || null;
+  const norm = _normalizeChannelUrl(channelUrl).toLowerCase();
+  const bare = channelUrl.replace(/\/$/, "").toLowerCase();
+  const targetUc = _extractUcIdFromUrl(channelUrl);
+  const targetHandle = _extractHandleFromUrl(channelUrl);
+  return state.channels.find((c) => {
+    const cu = (c.url || "").toLowerCase();
+    if (cu === norm || cu.replace(/\/videos$/, "") === bare) return true;
+    if (targetUc) {
+      const cUc = (c.channelId || _extractUcIdFromUrl(c.url)).toLowerCase();
+      if (cUc && cUc === targetUc) return true;
+    }
+    if (targetHandle) {
+      const cHandle = (c.handle || "").replace(/^@/, "").toLowerCase() || _extractHandleFromUrl(c.url);
+      if (cHandle && cHandle === targetHandle) return true;
+    }
+    return false;
+  }) || null;
 }
 
 function _followButtonHtml(channelUrl, name) {
@@ -2073,8 +2158,8 @@ function _formatUpdateStatusHtml() {
     </div>` : "";
 
   return `
-    <div class="section-hdr"><span class="section-title">Actualizaciones</span></div>
-    <div class="config-panel" style="margin-bottom:16px">
+    <div class="config-panel">
+      <div class="config-card-hdr"><span class="section-title">Actualizaciones</span></div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
         <div>
           <div style="font-weight:600;margin-bottom:4px">Playzi ${curVer}</div>
@@ -2103,120 +2188,157 @@ async function checkForAppUpdates() {
 function renderConfig() {
   const c = state.config || {};
   const playbackQuality = c.playbackQuality || "best";
+  const queuePrefetchCount = Number.isFinite(Number(c.queuePrefetchCount)) ? Number(c.queuePrefetchCount) : 1;
+  const queuePrefetchDelaySecs = Number.isFinite(Number(c.queuePrefetchDelaySecs)) ? Number(c.queuePrefetchDelaySecs) : 30;
   const curColor = document.documentElement.dataset.color || "pink";
+  const updateCardHtml = _formatUpdateStatusHtml();
   $("#view-config").innerHTML = `
-    ${_formatUpdateStatusHtml()}
-    <div class="section-hdr"><span class="section-title">Apariencia</span></div>
-    <div class="config-panel" style="margin-bottom:16px">
-      <div style="margin-bottom:16px">
-        <div class="section-title" style="margin-bottom:10px">Tema</div>
-        <div style="display:flex;gap:8px">
-          <button type="button" class="btn ${state.theme === "dark" ? "btn-primary" : "btn-ghost"}" data-set-theme="dark" style="gap:7px">${MOON_SVG} Oscuro</button>
-          <button type="button" class="btn ${state.theme === "light" ? "btn-primary" : "btn-ghost"}" data-set-theme="light" style="gap:7px">${SUN_SVG} Claro</button>
-        </div>
-      </div>
-      <div>
-        <div class="section-title" style="margin-bottom:10px">Color de acento</div>
-        <div style="display:flex;gap:14px;flex-wrap:wrap">
-          ${COLOR_PRESETS.map(([id, label]) => `
-            <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
-              <button class="color-dot${curColor === id ? " active" : ""}" data-color-preset="${id}" style="width:36px;height:36px"></button>
-              <span style="font-size:11px;color:var(--tx2)">${label}</span>
-            </div>`).join("")}
-        </div>
-      </div>
-    </div>
-    <div class="section-hdr"><span class="section-title">Configuración general</span></div>
-    <form class="config-panel edit-config" id="configForm">
-      <label>MEDIA_ROOT<input class="form-input" name="mediaRoot" value="${escapeHtml(c.mediaRoot || "")}"></label>
-      <label>Reproductor por defecto
-        <select class="form-input" name="defaultPlayer">
-          <option value="mpv" ${c.defaultPlayer === "mpv" ? "selected" : ""}>mpv</option>
-          <option value="vlc" ${c.defaultPlayer === "vlc" ? "selected" : ""}>VLC</option>
-        </select>
-      </label>
-      <label>Ruta mpv<input class="form-input" name="mpvPath" value="${escapeHtml(c.players?.mpv || "")}"></label>
-      <label>Ruta VLC<input class="form-input" name="vlcPath" value="${escapeHtml(c.players?.vlc || "")}"></label>
-      <label>Ruta ffmpeg<input class="form-input" name="ffmpegPath" value="${escapeHtml(c.ffmpeg || "")}"></label>
-      <label>Formato audio
-        <select class="form-input" name="audioFormat">
-          ${["opus", "mp3", "m4a"].map((fmt) => `<option value="${fmt}" ${c.audioFormat === fmt ? "selected" : ""}>${fmt}</option>`).join("")}
-        </select>
-      </label>
-      <label>Calidad reproduccion
-        <select class="form-input" name="playbackQuality">
-          ${["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"].map((q) => `<option value="${q}" ${playbackQuality === q ? "selected" : ""}>${q}</option>`).join("")}
-        </select>
-      </label>
-      <label>Límite búsqueda<input class="form-input" name="searchLimit" type="number" min="1" max="50" value="${escapeHtml(c.searchLimit || 12)}"></label>
-      <label>Navegador para cookies automaticas
-        <select class="form-input" name="cookiesBrowser">
-          ${["", "playzi", "zen", "firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi"].map((b) =>
-            `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Navegador predeterminado (automático)" : (b || "Ninguno")}</option>`
-          ).join("")}
-        </select>
-      </label>
-      <label>Archivo cookies.txt (alternativo; también puedes dejarlo en la carpeta cookies/ de Playzi)
-        <input class="form-input" name="cookiesFile" value="${escapeHtml(c.cookiesFile || "")}" placeholder="C:\\ruta\\cookies.txt">
-      </label>
-      <label class="config-toggle">
-        <input type="checkbox" name="volumeNormalization" ${c.volumeNormalization !== false ? "checked" : ""}>
-        <div>
-          <div class="config-toggle-title">Normalizar volumen (estilo YouTube)</div>
-          <div class="config-toggle-sub">Nivela automáticamente canciones y videos muy fuertes usando la referencia de sonoridad de YouTube (-14 LUFS) para mantener un volumen parejo.</div>
-        </div>
-      </label>
-      <label class="config-toggle">
-        <input type="checkbox" name="showShorts" ${c.showShorts ? "checked" : ""}>
-        <div>
-          <div class="config-toggle-title">Mostrar sección de YouTube Shorts</div>
-          <div class="config-toggle-sub">Por defecto los Shorts se ocultan y se separan de los videos normales. Activa esta opción para ver la sección de Shorts.</div>
-        </div>
-      </label>
-      <div style="border-top:1px solid var(--br);padding-top:14px;margin-top:6px">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;flex-wrap:wrap">
-          <div class="section-title" style="margin:0">Integración con Discord</div>
-          <div style="display:flex;align-items:center;gap:8px">
-            ${(() => {
-              const d = state.discord || {};
-              if (!c.discordEnabled) return `<span class="party-pill">Desactivado</span>`;
-              if (d.connected) {
-                const label = d.globalName || d.username || "Conectado";
-                return `<span class="party-pill party-pill--ok">Conectado: ${escapeHtml(label)}</span>`;
-              }
-              if (d.configured === false) return `<span class="party-pill party-pill--warn">No disponible</span>`;
-              return `<span class="party-pill party-pill--warn">Desconectado</span>`;
-            })()}
-            <button class="btn btn-ghost" type="button" data-discord-reconnect="1" style="padding:4px 10px;font-size:.78rem">Reconectar</button>
+    <div class="config-layout">
+      <div class="config-top-row${updateCardHtml ? "" : " config-top-row--single"}">
+        ${updateCardHtml}
+        <div class="config-panel">
+          <div class="config-card-hdr"><span class="section-title">Apariencia</span></div>
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap">
+            <div>
+              <div class="section-title" style="margin-bottom:10px">Tema</div>
+              <div style="display:flex;gap:8px">
+                <button type="button" class="btn ${state.theme === "dark" ? "btn-primary" : "btn-ghost"}" data-set-theme="dark" style="gap:7px">${MOON_SVG} Oscuro</button>
+                <button type="button" class="btn ${state.theme === "light" ? "btn-primary" : "btn-ghost"}" data-set-theme="light" style="gap:7px">${SUN_SVG} Claro</button>
+              </div>
+            </div>
+            <div>
+              <div class="section-title" style="margin-bottom:10px">Color de acento</div>
+              <div style="display:flex;gap:14px;flex-wrap:wrap">
+                ${COLOR_PRESETS.map(([id, label]) => `
+                  <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
+                    <button class="color-dot${curColor === id ? " active" : ""}" data-color-preset="${id}" style="width:36px;height:36px"></button>
+                    <span style="font-size:11px;color:var(--tx2)">${label}</span>
+                  </div>`).join("")}
+              </div>
+            </div>
           </div>
         </div>
-        ${state.discord?.lastError && c.discordEnabled ? `<div class="muted" style="font-size:.8rem;color:#fbbf24;margin-bottom:10px">${escapeHtml(state.discord.lastError)}</div>` : ""}
-        <div style="display:flex;flex-direction:column;gap:10px">
-          <label class="config-toggle">
-            <input type="checkbox" name="discordEnabled" ${c.discordEnabled !== false ? "checked" : ""}>
-            <div>
-              <div class="config-toggle-title">Activar integración con Discord (Rich Presence)</div>
-              <div class="config-toggle-sub">Conecta Playzi con tu aplicación de escritorio de Discord para mostrar tu actividad y habilitar invitaciones.</div>
-            </div>
-          </label>
-          <label class="config-toggle">
-            <input type="checkbox" name="discordShowMedia" ${c.discordShowMedia !== false ? "checked" : ""}>
-            <div>
-              <div class="config-toggle-title">Mostrar en el perfil lo que estás viendo o escuchando</div>
-              <div class="config-toggle-sub">Muestra el título, canal/artista, miniatura y progreso de reproducción en tu perfil de Discord.</div>
-            </div>
-          </label>
-          <label class="config-toggle">
-            <input type="checkbox" name="discordShowParty" ${c.discordShowParty !== false ? "checked" : ""}>
-            <div>
-              <div class="config-toggle-title">Mostrar sala activa y permitir invitaciones / solicitudes de unión</div>
-              <div class="config-toggle-sub">Muestra que estás en una sala con tus amigos, habilita el botón de invitar (+) en Discord y permite recibir solicitudes de "Pedir unirse".</div>
-            </div>
-          </label>
-        </div>
       </div>
-      <button class="btn btn-primary" type="submit">Guardar configuración</button>
-    </form>
+
+      <form class="config-form-layout" id="configForm">
+        <div class="config-panel">
+          <div class="config-card-hdr"><span class="section-title">Configuración general</span></div>
+          <div class="edit-config">
+            <label>MEDIA_ROOT<input class="form-input" name="mediaRoot" value="${escapeHtml(c.mediaRoot || "")}"></label>
+            <label>Reproductor por defecto
+              <select class="form-input" name="defaultPlayer">
+                <option value="mpv" ${c.defaultPlayer === "mpv" ? "selected" : ""}>mpv</option>
+                <option value="vlc" ${c.defaultPlayer === "vlc" ? "selected" : ""}>VLC</option>
+              </select>
+            </label>
+            <label>Ruta mpv<input class="form-input" name="mpvPath" value="${escapeHtml(c.players?.mpv || "")}"></label>
+            <label>Ruta VLC<input class="form-input" name="vlcPath" value="${escapeHtml(c.players?.vlc || "")}"></label>
+            <label>Ruta ffmpeg<input class="form-input" name="ffmpegPath" value="${escapeHtml(c.ffmpeg || "")}"></label>
+            <label>Formato audio
+              <select class="form-input" name="audioFormat">
+                ${["opus", "mp3", "m4a"].map((fmt) => `<option value="${fmt}" ${c.audioFormat === fmt ? "selected" : ""}>${fmt}</option>`).join("")}
+              </select>
+            </label>
+            <label>Calidad reproducción
+              <select class="form-input" name="playbackQuality">
+                ${["best", "2160p", "1440p", "1080p", "720p", "480p", "360p"].map((q) => `<option value="${q}" ${playbackQuality === q ? "selected" : ""}>${q}</option>`).join("")}
+              </select>
+            </label>
+            <label>Límite búsqueda<input class="form-input" name="searchLimit" type="number" min="1" max="50" value="${escapeHtml(c.searchLimit || 12)}"></label>
+            <label>Navegador para cookies automáticas
+              <select class="form-input" name="cookiesBrowser">
+                ${["", "playzi", "zen", "firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi"].map((b) =>
+                  `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Navegador predeterminado (automático)" : (b || "Ninguno")}</option>`
+                ).join("")}
+              </select>
+            </label>
+            <label>Archivo cookies.txt (alternativo; carpeta cookies/ de Playzi)
+              <input class="form-input" name="cookiesFile" value="${escapeHtml(c.cookiesFile || "")}" placeholder="C:\\ruta\\cookies.txt">
+            </label>
+          </div>
+          <div class="config-toggles-grid">
+            <label class="config-toggle">
+              <input type="checkbox" name="volumeNormalization" ${c.volumeNormalization !== false ? "checked" : ""}>
+              <div>
+                <div class="config-toggle-title">Normalizar volumen (estilo YouTube)</div>
+                <div class="config-toggle-sub">Nivela automáticamente canciones y videos muy fuertes usando la referencia de sonoridad de YouTube (-14 LUFS) para mantener un volumen parejo.</div>
+              </div>
+            </label>
+            <label class="config-toggle">
+              <input type="checkbox" name="showShorts" ${c.showShorts ? "checked" : ""}>
+              <div>
+                <div class="config-toggle-title">Mostrar sección de YouTube Shorts</div>
+                <div class="config-toggle-sub">Por defecto los Shorts se ocultan y se separan de los videos normales. Activa esta opción para ver la sección de Shorts.</div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="config-side-stack">
+          <div class="config-panel">
+            <div class="config-card-hdr"><span class="section-title">Caché de cola</span></div>
+            <div class="edit-config">
+              <label>Videos en cola a cachear
+                <input class="form-input" name="queuePrefetchCount" type="number" min="0" max="10" value="${escapeHtml(queuePrefetchCount)}">
+              </label>
+              <label>Inicio de caché (segundos)
+                <input class="form-input" name="queuePrefetchDelaySecs" type="number" min="0" max="600" value="${escapeHtml(queuePrefetchDelaySecs)}">
+              </label>
+            </div>
+            <div class="config-field-hint">
+              Precarga por adelantado las peticiones de los próximos videos en cola (0 para desactivar). Los videos añadidos a la cola durante la reproducción esperan 5 segundos antes de cachearse para evitar precargar elementos sumados por error.
+            </div>
+          </div>
+
+          <div class="config-panel">
+            <div class="config-card-hdr">
+              <span class="section-title">Integración con Discord</span>
+              <div style="display:flex;align-items:center;gap:8px">
+                ${(() => {
+                  const d = state.discord || {};
+                  if (!c.discordEnabled) return `<span class="party-pill">Desactivado</span>`;
+                  if (d.connected) {
+                    const label = d.globalName || d.username || "Conectado";
+                    return `<span class="party-pill party-pill--ok">Conectado: ${escapeHtml(label)}</span>`;
+                  }
+                  if (d.configured === false) return `<span class="party-pill party-pill--warn">No disponible</span>`;
+                  return `<span class="party-pill party-pill--warn">Desconectado</span>`;
+                })()}
+                <button class="btn btn-ghost" type="button" data-discord-reconnect="1" style="padding:4px 10px;font-size:.78rem">Reconectar</button>
+              </div>
+            </div>
+            ${state.discord?.lastError && c.discordEnabled ? `<div class="muted" style="font-size:.8rem;color:#fbbf24;margin-bottom:10px">${escapeHtml(state.discord.lastError)}</div>` : ""}
+            <div style="display:flex;flex-direction:column;gap:10px">
+              <label class="config-toggle">
+                <input type="checkbox" name="discordEnabled" ${c.discordEnabled !== false ? "checked" : ""}>
+                <div>
+                  <div class="config-toggle-title">Activar integración con Discord (Rich Presence)</div>
+                  <div class="config-toggle-sub">Conecta Playzi con tu aplicación de escritorio de Discord para mostrar tu actividad y habilitar invitaciones.</div>
+                </div>
+              </label>
+              <label class="config-toggle">
+                <input type="checkbox" name="discordShowMedia" ${c.discordShowMedia !== false ? "checked" : ""}>
+                <div>
+                  <div class="config-toggle-title">Mostrar en el perfil lo que estás viendo o escuchando</div>
+                  <div class="config-toggle-sub">Muestra el título, canal/artista, miniatura y progreso de reproducción en tu perfil de Discord.</div>
+                </div>
+              </label>
+              <label class="config-toggle">
+                <input type="checkbox" name="discordShowParty" ${c.discordShowParty !== false ? "checked" : ""}>
+                <div>
+                  <div class="config-toggle-title">Mostrar sala activa y permitir invitaciones / solicitudes de unión</div>
+                  <div class="config-toggle-sub">Muestra que estás en una sala con tus amigos, habilita el botón de invitar (+) en Discord y permite recibir solicitudes de "Pedir unirse".</div>
+                </div>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="config-form-actions">
+          <button class="btn btn-primary" type="submit">Guardar configuración</button>
+        </div>
+      </form>
+    </div>
   `;
 }
 
@@ -3533,6 +3655,7 @@ async function addToQueue(item) {
   }
   state.player.queue.push(...entries);
   if (state.player.shuffle) state.player._originalQueue.push(...entries);
+  _markQueueItemsAdded(entries);
   _updateWatchQueue();
   toast(entries.length > 1 ? `Añadidas ${entries.length} pistas a la cola` : "Añadido a la cola");
 }
@@ -3582,6 +3705,7 @@ async function playNext(item) {
   }
   state.player.queue.splice(state.player.index + 1, 0, ...entries);
   if (state.player.shuffle) state.player._originalQueue.push(...entries);
+  _markQueueItemsAdded(entries);
   _updateWatchQueue();
   toast(entries.length > 1 ? `Se reproducirán ${entries.length} pistas a continuación` : "Se reproducirá a continuación");
 }
@@ -3691,6 +3815,7 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
     return;
   }
 
+  _resetQueueAddedTracking();
   state.player.audioOnly = false;
   state.player.sourceContext = sourceContext;
   state.player.shuffle = false;
@@ -3863,6 +3988,7 @@ async function loadWebPlayerItem(index, opts = {}) {
   const loadId = ++state.player._loadingId;
   state.player.index = index;
   state.player.current = item;
+  _scheduleAddedQueuePrefetch();
   _startLoadingStatus("Conectando con YouTube...");
   if (item.sourceContext && state.party?.active) {
     state.player.sourceContext = item.sourceContext;
@@ -4043,51 +4169,195 @@ async function _loadMusicItem(item, loadId, opts = {}) {
   _updateMediaSession();
 }
 
-// Warm the backend stream cache for the next queue item after 30s of playback
-// so transitioning to the next track or video is smooth and near-instant.
-const PREFETCH_TRIGGER_SECONDS = 30;
+// Warm the backend stream cache for upcoming queue items according to user settings
+// (queuePrefetchCount & queuePrefetchDelaySecs). Newly added queue items wait 5 seconds
+// before being prefetched so accidentally queued items are not cached unnecessarily.
+const PREFETCH_DEFAULT_COUNT = 1;
+const PREFETCH_DEFAULT_DELAY_SECONDS = 30;
+const PREFETCH_NEW_ITEM_GRACE_MS = 5000;
 const PREFETCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const PREFETCH_MAX_CONCURRENT = 2;
 const _prefetchedStreamMap = new Map();
+const _queueItemAddedAt = new Map();
+const _queuePrefetchPending = [];
+const _queuePrefetchInFlight = new Set();
+let _queueAddedPrefetchTimer = null;
 
-function _maybePrefetchNextItem(currentTime) {
-  if (!Number.isFinite(currentTime) || currentTime < PREFETCH_TRIGGER_SECONDS) return;
-  _prefetchNextItem();
+function _getQueuePrefetchCount() {
+  const raw = state.config?.queuePrefetchCount;
+  if (raw === null || raw === undefined || raw === "") return PREFETCH_DEFAULT_COUNT;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PREFETCH_DEFAULT_COUNT;
+  return Math.max(0, Math.min(10, Math.trunc(n)));
 }
 
-function _prefetchNextItem() {
-  const next = state.player.queue[state.player.index + 1];
-  if (!next || !next.url || !isUrl(next.url)) return;
+function _getQueuePrefetchDelaySecs() {
+  const raw = state.config?.queuePrefetchDelaySecs;
+  if (raw === null || raw === undefined || raw === "") return PREFETCH_DEFAULT_DELAY_SECONDS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PREFETCH_DEFAULT_DELAY_SECONDS;
+  return Math.max(0, Math.min(600, Math.trunc(n)));
+}
+
+function _resetQueueAddedTracking() {
+  _queueItemAddedAt.clear();
+  if (_queueAddedPrefetchTimer) {
+    clearTimeout(_queueAddedPrefetchTimer);
+    _queueAddedPrefetchTimer = null;
+  }
+}
+
+function _markQueueItemsAdded(entries) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  const now = Date.now();
+  let added = false;
+  for (const entry of entries) {
+    if (entry && entry.url && isUrl(entry.url) && !_queueItemAddedAt.has(entry.url)) {
+      _queueItemAddedAt.set(entry.url, now);
+      added = true;
+    }
+  }
+  if (added) _scheduleAddedQueuePrefetch();
+}
+
+function _pruneQueueAddedTracking() {
+  if (!_queueItemAddedAt.size) return;
+  const activeUrls = new Set(state.player.queue.map((it) => it?.url).filter(Boolean));
+  for (const url of _queueItemAddedAt.keys()) {
+    if (!activeUrls.has(url)) _queueItemAddedAt.delete(url);
+  }
+}
+
+function _scheduleAddedQueuePrefetch() {
+  if (_queueAddedPrefetchTimer) {
+    clearTimeout(_queueAddedPrefetchTimer);
+    _queueAddedPrefetchTimer = null;
+  }
+  _pruneQueueAddedTracking();
+  const count = _getQueuePrefetchCount();
+  if (count <= 0 || !state.player.current) return;
+
+  const now = Date.now();
+  const upcoming = state.player.queue.slice(state.player.index + 1, state.player.index + 1 + count);
+  let minRemainingMs = Infinity;
+  let hasReadyAdded = false;
+
+  for (const item of upcoming) {
+    if (!item?.url || !isUrl(item.url)) continue;
+    const addedAt = _queueItemAddedAt.get(item.url);
+    if (addedAt === undefined) continue;
+    const remaining = PREFETCH_NEW_ITEM_GRACE_MS - (now - addedAt);
+    if (remaining <= 0) {
+      hasReadyAdded = true;
+    } else if (remaining < minRemainingMs) {
+      minRemainingMs = remaining;
+    }
+  }
+
+  if (hasReadyAdded) {
+    _prefetchUpcomingItems({ allowMaturedAdded: true, playbackReady: false });
+  }
+  if (Number.isFinite(minRemainingMs)) {
+    _queueAddedPrefetchTimer = setTimeout(() => {
+      _queueAddedPrefetchTimer = null;
+      _prefetchUpcomingItems({ allowMaturedAdded: true, playbackReady: false });
+      _scheduleAddedQueuePrefetch();
+    }, minRemainingMs + 25);
+  }
+}
+
+function _maybePrefetchNextItem(currentTime) {
+  const count = _getQueuePrefetchCount();
+  if (count <= 0) return;
+  const delaySecs = _getQueuePrefetchDelaySecs();
+  const playbackReady = Number.isFinite(currentTime) && currentTime >= delaySecs;
+  _prefetchUpcomingItems({ allowMaturedAdded: true, playbackReady });
+}
+
+function _prefetchUpcomingItems({ allowMaturedAdded = true, playbackReady = false } = {}) {
+  const count = _getQueuePrefetchCount();
+  if (count <= 0) return;
+  _pruneQueueAddedTracking();
+  const now = Date.now();
   const isAudio = state.player.sourceContext === "music" || state.player.audioOnly;
   const rawQuality = state.config?.playbackQuality || "best";
-  const quality = encodeURIComponent(rawQuality);
-  const cacheKey = `${next.url}|${isAudio ? "audio" : rawQuality}`;
+  const upcoming = state.player.queue.slice(state.player.index + 1, state.player.index + 1 + count);
+
+  for (const item of upcoming) {
+    if (!item || !item.url || !isUrl(item.url)) continue;
+    const addedAt = _queueItemAddedAt.get(item.url);
+    if (addedAt !== undefined) {
+      if (!allowMaturedAdded || (now - addedAt) < PREFETCH_NEW_ITEM_GRACE_MS) continue;
+    } else if (!playbackReady) {
+      continue;
+    }
+    _enqueueStreamPrefetch(item, isAudio, rawQuality);
+  }
+}
+
+function _enqueueStreamPrefetch(item, isAudio, rawQuality) {
+  const cacheKey = `${item.url}|${isAudio ? "audio" : rawQuality}`;
   const now = Date.now();
   const prevTs = _prefetchedStreamMap.get(cacheKey);
   if (prevTs && (now - prevTs) < PREFETCH_CACHE_TTL_MS) return;
-  _prefetchedStreamMap.set(cacheKey, now);
-  if (_prefetchedStreamMap.size > 64) {
-    const oldestKey = _prefetchedStreamMap.keys().next().value;
-    if (oldestKey) _prefetchedStreamMap.delete(oldestKey);
-  }
+  if (_queuePrefetchInFlight.has(cacheKey)) return;
+  if (_queuePrefetchPending.some((task) => task.cacheKey === cacheKey)) return;
 
-  if (IS_TAURI) {
-    const endpoint = isAudio
-      ? `/api/player/audio?url=${encodeURIComponent(next.url)}`
-      : `/api/player/info?url=${encodeURIComponent(next.url)}&quality=${quality}`;
-    api.get(endpoint).catch(() => {
-      _prefetchedStreamMap.delete(cacheKey);
-    });
-    return;
-  }
+  _queuePrefetchPending.push({ item, isAudio, rawQuality, cacheKey });
+  _drainQueuePrefetch();
+}
 
-  const endpoint = isAudio
-    ? `/api/player/audio?url=${encodeURIComponent(next.url)}`
-    : next.manifestUrl
-      ? next.manifestUrl
-      : `/api/player/manifest.mpd?url=${encodeURIComponent(next.url)}&quality=${quality}`;
-  fetch(endpoint).catch(() => {
-    _prefetchedStreamMap.delete(cacheKey);
-  });
+function _drainQueuePrefetch() {
+  while (_queuePrefetchInFlight.size < PREFETCH_MAX_CONCURRENT && _queuePrefetchPending.length > 0) {
+    const task = _queuePrefetchPending.shift();
+    if (!task) break;
+    const { item, isAudio, rawQuality, cacheKey } = task;
+    // Skip if the item was removed from the upcoming prefetch window while queued
+    const count = _getQueuePrefetchCount();
+    const stillUpcoming = state.player.queue
+      .slice(state.player.index + 1, state.player.index + 1 + count)
+      .some((q) => q?.url === item.url);
+    if (!stillUpcoming) continue;
+
+    const now = Date.now();
+    const prevTs = _prefetchedStreamMap.get(cacheKey);
+    if (prevTs && (now - prevTs) < PREFETCH_CACHE_TTL_MS) continue;
+
+    _prefetchedStreamMap.set(cacheKey, now);
+    if (_prefetchedStreamMap.size > 64) {
+      const oldestKey = _prefetchedStreamMap.keys().next().value;
+      if (oldestKey) _prefetchedStreamMap.delete(oldestKey);
+    }
+    _queuePrefetchInFlight.add(cacheKey);
+    const quality = encodeURIComponent(rawQuality);
+
+    let req;
+    if (IS_TAURI) {
+      const endpoint = isAudio
+        ? `/api/player/audio?url=${encodeURIComponent(item.url)}`
+        : `/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}`;
+      req = api.get(endpoint);
+    } else {
+      const endpoint = isAudio
+        ? `/api/player/audio?url=${encodeURIComponent(item.url)}`
+        : item.manifestUrl
+          ? item.manifestUrl
+          : `/api/player/manifest.mpd?url=${encodeURIComponent(item.url)}&quality=${quality}`;
+      req = fetch(endpoint).then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r;
+      });
+    }
+
+    req
+      .catch(() => {
+        _prefetchedStreamMap.delete(cacheKey);
+      })
+      .finally(() => {
+        _queuePrefetchInFlight.delete(cacheKey);
+        _drainQueuePrefetch();
+      });
+  }
 }
 
 async function _loadVideoItem(item, loadId, opts = {}) {
@@ -4589,8 +4859,12 @@ function _clearPlayerSubtitles(player) {
   }
 }
 
+let _subtitleReqSeq = 0;
+
 async function _applySubtitleSelection(player, track, tlang = null, label = "") {
   if (!player || player.isDisposed()) return;
+  const reqSeq = ++_subtitleReqSeq;
+  const loadId = state.player._loadingId;
   if (!track) {
     _clearPlayerSubtitles(player);
     try { localStorage.setItem(_SUB_PREF_KEY, JSON.stringify({ enabled: false })); } catch (_) {}
@@ -4601,7 +4875,7 @@ async function _applySubtitleSelection(player, track, tlang = null, label = "") 
     const qs = new URLSearchParams({ baseUrl: track.baseUrl });
     if (tlang) qs.set("tlang", tlang);
     const data = await api.get(`/api/youtube/subtitle?${qs.toString()}`);
-    if (player.isDisposed()) return;
+    if (player.isDisposed() || reqSeq !== _subtitleReqSeq || loadId !== state.player._loadingId) return;
     const vtt = data?.vtt || "WEBVTT\n\n";
     _clearPlayerSubtitles(player);
     const blob = new Blob([vtt], { type: "text/vtt;charset=utf-8" });
@@ -4815,6 +5089,11 @@ function _toggleChaptersPopover(player) {
     }
     const row = ev.target.closest("[data-seek-sec]");
     if (row) {
+      if (_partyIsGuest()) {
+        toast("Solo el host puede cambiar la posición en Watch Party.");
+        pop.remove();
+        return;
+      }
       const sec = Number(row.dataset.seekSec);
       if (Number.isFinite(sec) && !player.isDisposed()) {
         player.currentTime(sec);
@@ -5961,6 +6240,10 @@ function bindEvents() {
     }
     if (ev.target.id === "configForm") {
       const form = new FormData(ev.target);
+      const rawPrefetchCount = String(form.get("queuePrefetchCount") ?? "").trim();
+      const rawPrefetchDelay = String(form.get("queuePrefetchDelaySecs") ?? "").trim();
+      const parsedPrefetchCount = rawPrefetchCount === "" ? 1 : Number(rawPrefetchCount);
+      const parsedPrefetchDelay = rawPrefetchDelay === "" ? 30 : Number(rawPrefetchDelay);
       const submittedConfig = {
         mediaRoot: form.get("mediaRoot"),
         defaultPlayer: form.get("defaultPlayer"),
@@ -5969,6 +6252,8 @@ function bindEvents() {
         ffmpegPath: form.get("ffmpegPath"),
         audioFormat: form.get("audioFormat"),
         playbackQuality: form.get("playbackQuality"),
+        queuePrefetchCount: Number.isFinite(parsedPrefetchCount) ? Math.max(0, Math.min(10, Math.trunc(parsedPrefetchCount))) : 1,
+        queuePrefetchDelaySecs: Number.isFinite(parsedPrefetchDelay) ? Math.max(0, Math.min(600, Math.trunc(parsedPrefetchDelay))) : 30,
         volumeNormalization: form.get("volumeNormalization") === "on",
         searchLimit: Number(form.get("searchLimit") || 12),
         cookiesBrowser: form.get("cookiesBrowser") || "",
@@ -5985,6 +6270,10 @@ function bindEvents() {
         _applySavedVolumeToMusic();
         if (state.player.vjs && !state.player.vjs.isDisposed()) {
           _applySavedVolumeToVideo(state.player.vjs);
+        }
+        _scheduleAddedQueuePrefetch();
+        if (state.player.current) {
+          _maybePrefetchNextItem(_currentPlaybackPosition().currentTime);
         }
         if (IS_TAURI) {
           await refreshNativePlayerStatus();
@@ -6107,6 +6396,9 @@ function bindEvents() {
       } catch (err) {
         toast(err.message);
       }
+    }
+    if (ev.target.closest("#syncSubscriptionsBtn")) {
+      await syncChannelSubscriptions({ silent: false });
     }
     if (ev.target.closest("#refreshAllChannels")) {
       try {
@@ -7205,6 +7497,7 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
   }
 
   // Sync shared queue into player state
+  const prevQueueUrls = new Set((state.player.queue || []).map((it) => it?.url).filter(Boolean));
   const mappedQueue = (snapshot.queue || []).map((q) => ({
     id: q.id,
     url: q.url,
@@ -7216,6 +7509,11 @@ function _onPartyStateUpdate(snapshot, opts = {}) {
     addedBy: q.addedBy || null,
   }));
   state.player.queue = mappedQueue;
+  if (state.player.current) {
+    const newlyAdded = mappedQueue.filter((it) => it.url && !prevQueueUrls.has(it.url));
+    if (newlyAdded.length) _markQueueItemsAdded(newlyAdded);
+    else _scheduleAddedQueuePrefetch();
+  }
   _updateWatchQueue();
 
   if (opts.skipAutoLoad) return;
@@ -8068,6 +8366,10 @@ document.addEventListener("click", async (ev) => {
 
   const seekBtn = ev.target.closest("[data-seek-sec]");
   if (seekBtn) {
+    if (_partyIsGuest()) {
+      toast("Solo el host puede cambiar la posición en Watch Party.");
+      return;
+    }
     const sec = Number(seekBtn.dataset.seekSec);
     if (Number.isFinite(sec) && sec >= 0) {
       if (state.player.vjs && !state.player.vjs.isDisposed()) {
@@ -8096,6 +8398,7 @@ document.addEventListener("click", async (ev) => {
 
   const sortBtn = ev.target.closest("[data-comment-sort]");
   if (sortBtn) {
+    if (state.player.commentsLoading) return;
     const idx = Number(sortBtn.dataset.commentSort);
     const opts = state.player.details?.commentsSortOptions || [];
     if (Number.isFinite(idx) && opts[idx]?.continuation) {

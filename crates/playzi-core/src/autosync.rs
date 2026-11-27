@@ -273,16 +273,55 @@ impl AutoSyncManager {
     }
 
     async fn sync_channels(&self) -> Result<Value> {
-        let state = self.state.read()?;
-        if !state.channels.is_empty() {
-            let _ = self.youtube.refresh_all_channels(&self.state).await?;
+        let cfg = self.config.snapshot();
+        let cookie_store = CookieStore::new(&cfg.root, &cfg.data_dir);
+        let configured = if cfg.cookies_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.cookies_file.as_str())
+        };
+        let jar = cookie_store.load_jar(configured).ok();
+        let auth_user = self
+            .state
+            .read()
+            .map(|s| s.music_auth_user)
+            .unwrap_or(0);
+
+        let mut synced_subs = 0usize;
+        let mut added_count = 0usize;
+        let mut updated_count = 0usize;
+
+        if let Some(ref cookie_jar) = jar {
+            if let Ok(sub_res) = self
+                .youtube
+                .sync_subscriptions_with_cookies_and_user(Some(cookie_jar), auth_user, &self.state)
+                .await
+            {
+                synced_subs = sub_res.synced_count;
+                added_count = sub_res.added_count;
+                updated_count = sub_res.updated_count;
+            }
+            let _ = self.youtube.refresh_manual_channels(&self.state).await;
+        } else {
+            let state = self.state.read()?;
+            if !state.channels.is_empty() {
+                let _ = self.youtube.refresh_all_channels(&self.state).await?;
+            }
         }
+
         let now = now_timestamp();
-        self.state.update(|s| {
+        let total_channels = self.state.update(|s| {
             s.channels_last_sync = now.clone();
-            Ok(())
+            Ok(s.channels.len())
         })?;
-        Ok(json!({ "ok": true, "lastSync": now }))
+        Ok(json!({
+            "ok": true,
+            "lastSync": now,
+            "channelCount": total_channels,
+            "syncedSubscriptions": synced_subs,
+            "addedCount": added_count,
+            "updatedCount": updated_count,
+        }))
     }
 
     async fn sync_recommendations(&self) -> Result<Value> {
@@ -444,7 +483,11 @@ pub fn section_is_due(data: &AppState, section: SyncSection) -> bool {
     }
 
     let (items_empty, last_sync) = match section {
-        SyncSection::Channels => (data.feed.is_empty() && !data.channels.is_empty(), data.channels_last_sync.as_str()),
+        SyncSection::Channels => (
+            (data.channels.is_empty() && data.music_auth_state == "ok")
+                || (data.feed.is_empty() && !data.channels.is_empty()),
+            data.channels_last_sync.as_str(),
+        ),
         SyncSection::Recommendations => (data.recommendations.is_empty(), data.recommendations_last_sync.as_str()),
         SyncSection::MusicRecommendations => (data.music_recommendations.is_empty(), data.music_recom_last_sync.as_str()),
         SyncSection::MusicPlaylists => (data.music_playlists.is_empty(), data.music_playlists_last_sync.as_str()),

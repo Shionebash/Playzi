@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::config::ConfigStore;
 use crate::cookies::CookieStore;
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::state::StateStore;
 
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 3;

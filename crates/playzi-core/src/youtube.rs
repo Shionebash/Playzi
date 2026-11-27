@@ -65,6 +65,31 @@ pub struct ChannelBrowseResult {
     pub followed_channel_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribedChannel {
+    pub channel_id: String,
+    pub name: String,
+    pub url: String,
+    pub handle: String,
+    pub thumbnail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriber_count: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionSyncResult {
+    pub authenticated: bool,
+    pub synced_count: usize,
+    pub added_count: usize,
+    pub updated_count: usize,
+    pub removed_count: usize,
+    pub total_channels: usize,
+    pub feed_count: usize,
+    pub last_sync: String,
+}
+
 #[derive(Debug, Clone)]
 struct CacheEntry<T> {
     inserted_at: Instant,
@@ -1213,6 +1238,475 @@ impl YouTubeClient {
         Ok(results)
     }
 
+    /// Concurrently refreshes only manually-followed channels (not synced from YouTube subscriptions).
+    pub async fn refresh_manual_channels(&self, store: &StateStore) -> Result<Vec<Value>> {
+        let channels: Vec<Value> = list_channels(store)?
+            .into_iter()
+            .filter(|c| !c.get("syncedFromYoutube").and_then(Value::as_bool).unwrap_or(false))
+            .take(30)
+            .collect();
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sem = Arc::new(Semaphore::new(4));
+        let mut handles = Vec::with_capacity(channels.len());
+
+        for ch in channels {
+            let Some(cid) = ch.get("id").and_then(Value::as_str).map(ToString::to_string) else {
+                continue;
+            };
+            let sem_clone = Arc::clone(&sem);
+            let client = self.clone();
+            let store_clone = store.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem_clone.acquire_owned().await.ok()?;
+                match client.refresh_channel(&store_clone, &cid).await {
+                    Ok(v) => Some(v),
+                    Err(_) => store_clone
+                        .read()
+                        .ok()?
+                        .channels
+                        .into_iter()
+                        .find(|c| c.get("id").and_then(Value::as_str) == Some(cid.as_str())),
+                }
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            if let Ok(Some(val)) = handle.await {
+                results.push(val);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Fetches the signed-in user's YouTube channel subscriptions via InnerTube `FEchannels`
+    /// (paginating through continuations) with a fallback to `/youtubei/v1/guide`.
+    /// Returns `(channels, pagination_complete)`.
+    pub async fn fetch_subscriptions_with_cookies_and_user(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+    ) -> Result<(Vec<SubscribedChannel>, bool)> {
+        let Some(jar) = cookies else {
+            return Ok((Vec::new(), false));
+        };
+        if jar.sapisid().is_none() {
+            return Ok((Vec::new(), false));
+        }
+
+        let mut subs = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+        let mut pagination_complete = false;
+
+        if let Ok(mut data) = self
+            .post_innertube_with_cookies_and_user(
+                "browse",
+                json!({ "browseId": "FEchannels" }),
+                Some(jar),
+                auth_user,
+            )
+            .await
+        {
+            for ch in parse_subscribed_channels(&data) {
+                let key = ch.channel_id.to_ascii_lowercase();
+                if !key.is_empty() && seen_ids.insert(key) {
+                    subs.push(ch);
+                }
+            }
+
+            for _ in 1..10usize {
+                let Some(token) = extract_yt_continuation(&data) else {
+                    pagination_complete = true;
+                    break;
+                };
+                if !seen_tokens.insert(token.clone()) {
+                    pagination_complete = true;
+                    break;
+                }
+                match self
+                    .post_innertube_with_cookies_and_user(
+                        "browse",
+                        json!({ "continuation": token }),
+                        Some(jar),
+                        auth_user,
+                    )
+                    .await
+                {
+                    Ok(next_data) => {
+                        let before = subs.len();
+                        for ch in parse_subscribed_channels(&next_data) {
+                            let key = ch.channel_id.to_ascii_lowercase();
+                            if !key.is_empty() && seen_ids.insert(key) {
+                                subs.push(ch);
+                            }
+                        }
+                        data = next_data;
+                        if subs.len() == before {
+                            pagination_complete = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        pagination_complete = false;
+                        break;
+                    }
+                }
+            }
+            if !pagination_complete && extract_yt_continuation(&data).is_none() {
+                pagination_complete = true;
+            }
+        }
+
+        if subs.is_empty() {
+            if let Ok(guide_data) = self
+                .post_innertube_with_cookies_and_user("guide", json!({}), Some(jar), auth_user)
+                .await
+            {
+                for ch in parse_guide_subscriptions(&guide_data) {
+                    let key = ch.channel_id.to_ascii_lowercase();
+                    if !key.is_empty() && seen_ids.insert(key) {
+                        subs.push(ch);
+                    }
+                }
+                pagination_complete = false;
+            }
+        }
+
+        Ok((subs, pagination_complete))
+    }
+
+    /// Fetches the signed-in user's YouTube Subscriptions video feed (`FEsubscriptions`)
+    /// in a single InnerTube request and merges recent items into `StateStore.feed`.
+    pub async fn fetch_subscription_feed_with_cookies_and_user(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+        store: &StateStore,
+    ) -> Result<usize> {
+        let Some(jar) = cookies else {
+            return Ok(0);
+        };
+        if jar.sapisid().is_none() {
+            return Ok(0);
+        }
+
+        let data = self
+            .post_innertube_with_cookies_and_user(
+                "browse",
+                json!({ "browseId": "FEsubscriptions" }),
+                Some(jar),
+                auth_user,
+            )
+            .await?;
+
+        let mut items = parse_channel_videos(&data, "", "");
+        let mut seen: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+        for item in parse_lockup_videos(&data) {
+            if seen.insert(item.id.clone()) {
+                items.push(item);
+            }
+        }
+        if items.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let count = items.len();
+        store.update(|s| {
+            // Build lookup maps from channelId / handle / lowercase name -> (id, name)
+            let mut by_uc: HashMap<String, (String, String)> = HashMap::new();
+            let mut by_handle: HashMap<String, (String, String)> = HashMap::new();
+            let mut by_name: HashMap<String, (String, String)> = HashMap::new();
+            for ch in &s.channels {
+                let Some(local_id) = ch.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let cname = ch
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(uc) = ch
+                    .get("channelId")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| ch.get("url").and_then(Value::as_str).and_then(extract_uc_id))
+                {
+                    by_uc.insert(uc.to_ascii_lowercase(), (local_id.to_string(), cname.clone()));
+                }
+                if let Some(handle) = ch.get("handle").and_then(Value::as_str).filter(|h| !h.is_empty()) {
+                    by_handle.insert(
+                        handle.trim_start_matches('@').to_ascii_lowercase(),
+                        (local_id.to_string(), cname.clone()),
+                    );
+                }
+                if !cname.is_empty() {
+                    by_name.insert(cname.to_ascii_lowercase(), (local_id.to_string(), cname));
+                }
+            }
+
+            let mut by_feed_id: HashMap<String, Value> = HashMap::new();
+            let mut order: Vec<String> = Vec::new();
+            for existing in &s.feed {
+                if let Some(fid) = existing.get("feedId").and_then(Value::as_str) {
+                    if !by_feed_id.contains_key(fid) {
+                        order.push(fid.to_string());
+                    }
+                    by_feed_id.insert(fid.to_string(), existing.clone());
+                }
+            }
+
+            let mut touched_channels: HashSet<String> = HashSet::new();
+            for item in items.into_iter().rev() {
+                let matched = item
+                    .channel_url
+                    .as_deref()
+                    .and_then(extract_uc_id)
+                    .and_then(|uc| by_uc.get(&uc.to_ascii_lowercase()))
+                    .or_else(|| {
+                        item.channel_url
+                            .as_deref()
+                            .and_then(extract_handle_from_url)
+                            .and_then(|h| by_handle.get(&h))
+                    })
+                    .or_else(|| by_name.get(&item.channel.to_ascii_lowercase()));
+
+                let (source_id, source_name) = match matched {
+                    Some((id, name)) => {
+                        touched_channels.insert(id.clone());
+                        (id.clone(), name.clone())
+                    }
+                    None => ("youtube_subscriptions".to_string(), item.channel.clone()),
+                };
+
+                if let Ok(mut obj) = serde_json::to_value(&item) {
+                    if let Some(map) = obj.as_object_mut() {
+                        let feed_id = format!(
+                            "{source_id}:{}",
+                            if item.id.is_empty() { &item.url } else { &item.id }
+                        );
+                        map.insert("feedId".into(), Value::String(feed_id.clone()));
+                        map.insert("sourceChannelId".into(), Value::String(source_id));
+                        map.insert("sourceChannelName".into(), Value::String(source_name));
+                        map.insert("seenAt".into(), Value::String(now.clone()));
+                        if !by_feed_id.contains_key(&feed_id) {
+                            order.insert(0, feed_id.clone());
+                        }
+                        by_feed_id.insert(feed_id, obj);
+                    }
+                }
+            }
+
+            for ch in &mut s.channels {
+                if let Some(id) = ch.get("id").and_then(Value::as_str) {
+                    if touched_channels.contains(id) {
+                        if let Some(map) = ch.as_object_mut() {
+                            map.insert("lastSync".into(), Value::String(now.clone()));
+                            map.insert("error".into(), Value::String(String::new()));
+                        }
+                    }
+                }
+            }
+
+            s.feed = order
+                .into_iter()
+                .filter_map(|fid| by_feed_id.remove(&fid))
+                .take(200)
+                .collect();
+            Ok(())
+        })?;
+
+        Ok(count)
+    }
+
+    /// Synchronizes the signed-in user's YouTube channel subscriptions into `StateStore.channels`
+    /// and refreshes the subscription feed.
+    pub async fn sync_subscriptions_with_cookies_and_user(
+        &self,
+        cookies: Option<&CookieJar>,
+        auth_user: u8,
+        store: &StateStore,
+    ) -> Result<SubscriptionSyncResult> {
+        let Some(jar) = cookies else {
+            let total = list_channels(store)?.len();
+            return Ok(SubscriptionSyncResult {
+                authenticated: false,
+                total_channels: total,
+                ..Default::default()
+            });
+        };
+        if jar.sapisid().is_none() {
+            let total = list_channels(store)?.len();
+            return Ok(SubscriptionSyncResult {
+                authenticated: false,
+                total_channels: total,
+                ..Default::default()
+            });
+        }
+
+        let (subs, pagination_complete) = self
+            .fetch_subscriptions_with_cookies_and_user(Some(jar), auth_user)
+            .await?;
+
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let synced_count = subs.len();
+        let mut added_count = 0usize;
+        let mut updated_count = 0usize;
+        let mut removed_count = 0usize;
+        let mut total_channels = 0usize;
+
+        let active_uc_ids: HashSet<String> = subs
+            .iter()
+            .map(|s| s.channel_id.to_ascii_lowercase())
+            .collect();
+
+        store.update(|s| {
+            for sub in &subs {
+                let sub_uc = sub.channel_id.to_ascii_lowercase();
+                let sub_handle = sub.handle.trim_start_matches('@').to_ascii_lowercase();
+                let sub_url_lower = sub.url.to_ascii_lowercase();
+
+                let existing_idx = s.channels.iter().position(|ch| {
+                    let ch_uc = ch
+                        .get("channelId")
+                        .and_then(Value::as_str)
+                        .map(|v| v.to_ascii_lowercase())
+                        .or_else(|| {
+                            ch.get("url")
+                                .and_then(Value::as_str)
+                                .and_then(extract_uc_id)
+                                .map(|v| v.to_ascii_lowercase())
+                        });
+                    if ch_uc.as_deref() == Some(sub_uc.as_str()) {
+                        return true;
+                    }
+                    let ch_url = ch
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if ch_url == sub_url_lower {
+                        return true;
+                    }
+                    if !sub_handle.is_empty() {
+                        let ch_handle = ch
+                            .get("handle")
+                            .and_then(Value::as_str)
+                            .map(|h| h.trim_start_matches('@').to_ascii_lowercase())
+                            .or_else(|| extract_handle_from_url(&ch_url));
+                        if ch_handle.as_deref() == Some(sub_handle.as_str()) {
+                            return true;
+                        }
+                    }
+                    false
+                });
+
+                if let Some(idx) = existing_idx {
+                    if let Some(map) = s.channels[idx].as_object_mut() {
+                        if !sub.name.is_empty() {
+                            map.insert("name".into(), Value::String(sub.name.clone()));
+                        }
+                        if !sub.thumbnail.is_empty() {
+                            map.insert("thumbnail".into(), Value::String(sub.thumbnail.clone()));
+                        }
+                        if !sub.channel_id.is_empty() {
+                            map.insert("channelId".into(), Value::String(sub.channel_id.clone()));
+                        }
+                        if !sub.handle.is_empty() {
+                            map.insert("handle".into(), Value::String(sub.handle.clone()));
+                        }
+                        if let Some(ref sc) = sub.subscriber_count {
+                            map.insert("subscriberCount".into(), Value::String(sc.clone()));
+                        }
+                        map.insert("syncedFromYoutube".into(), Value::Bool(true));
+                    }
+                    updated_count += 1;
+                } else {
+                    let mut obj = json!({
+                        "id": Uuid::new_v4().to_string(),
+                        "name": sub.name,
+                        "url": sub.url,
+                        "channelId": sub.channel_id,
+                        "handle": sub.handle,
+                        "thumbnail": sub.thumbnail,
+                        "syncedFromYoutube": true,
+                        "lastSync": "",
+                        "error": "",
+                    });
+                    if let Some(ref sc) = sub.subscriber_count {
+                        obj["subscriberCount"] = Value::String(sc.clone());
+                    }
+                    s.channels.push(obj);
+                    added_count += 1;
+                }
+            }
+
+            if pagination_complete && !subs.is_empty() {
+                let before = s.channels.len();
+                let mut removed_ids: HashSet<String> = HashSet::new();
+                s.channels.retain(|ch| {
+                    let is_synced = ch
+                        .get("syncedFromYoutube")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !is_synced {
+                        return true;
+                    }
+                    let ch_uc = ch
+                        .get("channelId")
+                        .and_then(Value::as_str)
+                        .map(|v| v.to_ascii_lowercase())
+                        .or_else(|| {
+                            ch.get("url")
+                                .and_then(Value::as_str)
+                                .and_then(extract_uc_id)
+                                .map(|v| v.to_ascii_lowercase())
+                        });
+                    let keep = ch_uc
+                        .as_deref()
+                        .is_some_and(|uc| active_uc_ids.contains(uc));
+                    if !keep {
+                        if let Some(id) = ch.get("id").and_then(Value::as_str) {
+                            removed_ids.insert(id.to_string());
+                        }
+                    }
+                    keep
+                });
+                removed_count = before.saturating_sub(s.channels.len());
+                if !removed_ids.is_empty() {
+                    s.feed.retain(|f| {
+                        f.get("sourceChannelId")
+                            .and_then(Value::as_str)
+                            .is_none_or(|id| !removed_ids.contains(id))
+                    });
+                }
+            }
+
+            s.channels_last_sync = now.clone();
+            total_channels = s.channels.len();
+            Ok(())
+        })?;
+
+        let feed_count = self
+            .fetch_subscription_feed_with_cookies_and_user(Some(jar), auth_user, store)
+            .await
+            .unwrap_or(0);
+
+        Ok(SubscriptionSyncResult {
+            authenticated: true,
+            synced_count,
+            added_count,
+            updated_count,
+            removed_count,
+            total_channels,
+            feed_count,
+            last_sync: now,
+        })
+    }
+
     /// Fetches rich watch-page video details (description, publish date, relative time,
     /// chapters, caption tracks, storyboard spec, and comments continuation) via InnerTube.
     pub async fn fetch_video_details(
@@ -1474,10 +1968,16 @@ fn find_followed_channel(
     let mut targets = HashSet::new();
     targets.insert(base.to_ascii_lowercase());
     targets.insert(canonical.to_ascii_lowercase());
-    if !handle.is_empty() {
+    let target_uc = extract_uc_id(canonical)
+        .or_else(|| extract_uc_id(base))
+        .map(|u| u.to_ascii_lowercase());
+    let target_handle = if !handle.is_empty() {
         let h = handle.trim_start_matches('@').to_ascii_lowercase();
         targets.insert(format!("https://www.youtube.com/@{h}"));
-    }
+        Some(h)
+    } else {
+        extract_handle_from_url(base)
+    };
     for ch in &state.channels {
         let url = ch.get("url").and_then(Value::as_str).unwrap_or("");
         let resolved = resolve_channel_base(url)
@@ -1486,8 +1986,169 @@ fn find_followed_channel(
         if targets.contains(&resolved) {
             return ch.get("id").and_then(Value::as_str).map(ToString::to_string);
         }
+        if let Some(ref uc) = target_uc {
+            let ch_uc = ch
+                .get("channelId")
+                .and_then(Value::as_str)
+                .map(|v| v.to_ascii_lowercase())
+                .or_else(|| extract_uc_id(url).map(|v| v.to_ascii_lowercase()));
+            if ch_uc.as_deref() == Some(uc.as_str()) {
+                return ch.get("id").and_then(Value::as_str).map(ToString::to_string);
+            }
+        }
+        if let Some(ref h) = target_handle {
+            let ch_handle = ch
+                .get("handle")
+                .and_then(Value::as_str)
+                .map(|v| v.trim_start_matches('@').to_ascii_lowercase())
+                .or_else(|| extract_handle_from_url(url));
+            if ch_handle.as_deref() == Some(h.as_str()) {
+                return ch.get("id").and_then(Value::as_str).map(ToString::to_string);
+            }
+        }
     }
     None
+}
+
+fn extract_handle_from_url(url: &str) -> Option<String> {
+    let idx = url.find("/@")?;
+    let rest = &url[idx + 2..];
+    let handle: String = rest
+        .chars()
+        .take_while(|c| !matches!(c, '/' | '?' | '#'))
+        .collect();
+    if handle.is_empty() {
+        None
+    } else {
+        Some(handle.to_ascii_lowercase())
+    }
+}
+
+pub(crate) fn parse_subscribed_channels(data: &Value) -> Vec<SubscribedChannel> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for renderer_name in ["channelRenderer", "gridChannelRenderer"] {
+        for node in walk_renderers(data, renderer_name) {
+            let channel_id = node
+                .get("channelId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    node.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if channel_id.is_empty() || !seen.insert(channel_id.to_ascii_lowercase()) {
+                continue;
+            }
+            let name = text_from_node(node.get("title")).unwrap_or_else(|| channel_id.clone());
+            let canonical_path = node
+                .pointer("/navigationEndpoint/browseEndpoint/canonicalBaseUrl")
+                .or_else(|| {
+                    node.pointer("/navigationEndpoint/commandMetadata/webCommandMetadata/url")
+                })
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let handle = if canonical_path.starts_with("/@") {
+                canonical_path.trim_start_matches('/').to_string()
+            } else {
+                String::new()
+            };
+            let url = format!("https://www.youtube.com/channel/{channel_id}/videos");
+            let thumbnail = last_thumbnail_url(node.get("thumbnail")).unwrap_or_default();
+            let subscriber_count = text_from_node(node.get("subscriberCountText"))
+                .or_else(|| text_from_node(node.get("videoCountText")));
+
+            out.push(SubscribedChannel {
+                channel_id,
+                name,
+                url,
+                handle,
+                thumbnail,
+                subscriber_count,
+            });
+        }
+    }
+
+    for node in walk_renderers(data, "lockupViewModel") {
+        let browse_id = node
+            .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !browse_id.starts_with("UC") || !seen.insert(browse_id.to_ascii_lowercase()) {
+            continue;
+        }
+        let name = node
+            .pointer("/metadata/lockupMetadataViewModel/title/content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(browse_id)
+            .to_string();
+        let canonical_path = node
+            .pointer("/rendererContext/commandContext/onTap/innertubeCommand/browseEndpoint/canonicalBaseUrl")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let handle = if canonical_path.starts_with("/@") {
+            canonical_path.trim_start_matches('/').to_string()
+        } else {
+            String::new()
+        };
+        let thumbnail = lockup_thumbnail(node).unwrap_or_default();
+        out.push(SubscribedChannel {
+            channel_id: browse_id.to_string(),
+            name,
+            url: format!("https://www.youtube.com/channel/{browse_id}/videos"),
+            handle,
+            thumbnail,
+            subscriber_count: None,
+        });
+    }
+
+    out
+}
+
+pub(crate) fn parse_guide_subscriptions(data: &Value) -> Vec<SubscribedChannel> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for section in walk_renderers(data, "guideSubscriptionsSectionRenderer") {
+        for entry in walk_renderers(section, "guideEntryRenderer") {
+            let browse_id = entry
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !browse_id.starts_with("UC") || !seen.insert(browse_id.to_ascii_lowercase()) {
+                continue;
+            }
+            let name = text_from_node(entry.get("formattedTitle"))
+                .unwrap_or_else(|| browse_id.to_string());
+            let canonical_path = entry
+                .pointer("/navigationEndpoint/browseEndpoint/canonicalBaseUrl")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let handle = if canonical_path.starts_with("/@") {
+                canonical_path.trim_start_matches('/').to_string()
+            } else {
+                String::new()
+            };
+            let thumbnail = last_thumbnail_url(entry.get("thumbnail")).unwrap_or_default();
+            out.push(SubscribedChannel {
+                channel_id: browse_id.to_string(),
+                name,
+                url: format!("https://www.youtube.com/channel/{browse_id}/videos"),
+                handle,
+                thumbnail,
+                subscriber_count: None,
+            });
+        }
+    }
+
+    out
 }
 
 fn parse_search_items(data: &Value, limit: usize) -> Vec<MediaItem> {
@@ -3842,4 +4503,97 @@ fn decode_xml_entities(input: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    #[test]
+    fn parses_fechannels_and_guide_subscriptions() {
+        let fechannels = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "itemSectionRenderer": {
+                                            "contents": [{
+                                                "shelfRenderer": {
+                                                    "content": {
+                                                        "expandedShelfContentsRenderer": {
+                                                            "items": [{
+                                                                "channelRenderer": {
+                                                                    "channelId": "UC1234567890abcdefghijkl",
+                                                                    "title": { "simpleText": "Veritasium" },
+                                                                    "navigationEndpoint": {
+                                                                        "browseEndpoint": {
+                                                                            "browseId": "UC1234567890abcdefghijkl",
+                                                                            "canonicalBaseUrl": "/@veritasium"
+                                                                        }
+                                                                    },
+                                                                    "thumbnail": {
+                                                                        "thumbnails": [{
+                                                                            "url": "//yt3.googleusercontent.com/abc=s88-c-k-c0x00ffffff-no-rj",
+                                                                            "width": 88,
+                                                                            "height": 88
+                                                                        }]
+                                                                    },
+                                                                    "subscriberCountText": { "simpleText": "15M suscriptores" }
+                                                                }
+                                                            }]
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let parsed = parse_subscribed_channels(&fechannels);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].channel_id, "UC1234567890abcdefghijkl");
+        assert_eq!(parsed[0].name, "Veritasium");
+        assert_eq!(parsed[0].handle, "@veritasium");
+        assert_eq!(
+            parsed[0].url,
+            "https://www.youtube.com/channel/UC1234567890abcdefghijkl/videos"
+        );
+        assert!(parsed[0].thumbnail.starts_with("https://yt3.googleusercontent.com/"));
+        assert_eq!(parsed[0].subscriber_count.as_deref(), Some("15M suscriptores"));
+
+        let guide = json!({
+            "items": [{
+                "guideSubscriptionsSectionRenderer": {
+                    "items": [{
+                        "guideEntryRenderer": {
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "UC9999999999abcdefghijkl",
+                                    "canonicalBaseUrl": "/@dotcsv"
+                                }
+                            },
+                            "formattedTitle": { "simpleText": "Dot CSV" },
+                            "thumbnail": {
+                                "thumbnails": [{ "url": "https://yt3.ggpht.com/avatar.jpg" }]
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+        let guide_parsed = parse_guide_subscriptions(&guide);
+        assert_eq!(guide_parsed.len(), 1);
+        assert_eq!(guide_parsed[0].channel_id, "UC9999999999abcdefghijkl");
+        assert_eq!(guide_parsed[0].name, "Dot CSV");
+        assert_eq!(guide_parsed[0].handle, "@dotcsv");
+    }
 }

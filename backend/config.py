@@ -33,6 +33,8 @@ FFMPEG_PATH = _str_env("FFMPEG_PATH", "ffmpeg")
 AUDIO_FORMAT = _str_env("AUDIO_FORMAT", "opus").lower()
 YTDLP_SEARCH_LIMIT = int(_str_env("YTDLP_SEARCH_LIMIT", "12"))
 PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
+QUEUE_PREFETCH_COUNT = max(0, min(10, int(_str_env("QUEUE_PREFETCH_COUNT", "1"))))
+QUEUE_PREFETCH_DELAY_SECS = max(0, min(600, int(_str_env("QUEUE_PREFETCH_DELAY_SECS", "30"))))
 VOLUME_NORMALIZATION = _str_env("VOLUME_NORMALIZATION", "true").lower() in ("1", "true", "yes", "on")
 COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
 COOKIES_FILE = _str_env("COOKIES_FILE", "")
@@ -58,7 +60,7 @@ def update_config(values: dict) -> dict:
 
 
 def _update_config_locked(values: dict) -> dict:
-    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, VOLUME_NORMALIZATION, COOKIES_BROWSER, COOKIES_FILE, SHOW_SHORTS
+    global MEDIA_ROOT, DATA_DIR, STATE_FILE, DEFAULT_PLAYER, MPV_PATH, VLC_PATH, FFMPEG_PATH, AUDIO_FORMAT, YTDLP_SEARCH_LIMIT, PLAYBACK_QUALITY, QUEUE_PREFETCH_COUNT, QUEUE_PREFETCH_DELAY_SECS, VOLUME_NORMALIZATION, COOKIES_BROWSER, COOKIES_FILE, SHOW_SHORTS
 
     env_values = _read_env_file()
     old_cookies_browser = COOKIES_BROWSER
@@ -72,6 +74,8 @@ def _update_config_locked(values: dict) -> dict:
         "audioFormat": "AUDIO_FORMAT",
         "searchLimit": "YTDLP_SEARCH_LIMIT",
         "playbackQuality": "PLAYBACK_QUALITY",
+        "queuePrefetchCount": "QUEUE_PREFETCH_COUNT",
+        "queuePrefetchDelaySecs": "QUEUE_PREFETCH_DELAY_SECS",
         "volumeNormalization": "VOLUME_NORMALIZATION",
         "cookiesBrowser": "COOKIES_BROWSER",
         "cookiesFile": "COOKIES_FILE",
@@ -103,6 +107,8 @@ def _update_config_locked(values: dict) -> dict:
     AUDIO_FORMAT = _str_env("AUDIO_FORMAT", "opus").lower()
     YTDLP_SEARCH_LIMIT = int(_str_env("YTDLP_SEARCH_LIMIT", "12"))
     PLAYBACK_QUALITY = _str_env("PLAYBACK_QUALITY", "best")
+    QUEUE_PREFETCH_COUNT = max(0, min(10, int(_str_env("QUEUE_PREFETCH_COUNT", "1"))))
+    QUEUE_PREFETCH_DELAY_SECS = max(0, min(600, int(_str_env("QUEUE_PREFETCH_DELAY_SECS", "30"))))
     VOLUME_NORMALIZATION = _str_env("VOLUME_NORMALIZATION", "true").lower() in ("1", "true", "yes", "on")
     COOKIES_BROWSER = _str_env("COOKIES_BROWSER", "")
     COOKIES_FILE = _str_env("COOKIES_FILE", "")
@@ -144,6 +150,8 @@ def _write_env_file(values: dict[str, str]) -> None:
         "AUDIO_FORMAT",
         "YTDLP_SEARCH_LIMIT",
         "PLAYBACK_QUALITY",
+        "QUEUE_PREFETCH_COUNT",
+        "QUEUE_PREFETCH_DELAY_SECS",
         "VOLUME_NORMALIZATION",
         "SHOW_SHORTS",
     ]
@@ -174,6 +182,8 @@ def public_config() -> dict:
         "audioFormat": AUDIO_FORMAT,
         "searchLimit": YTDLP_SEARCH_LIMIT,
         "playbackQuality": PLAYBACK_QUALITY,
+        "queuePrefetchCount": QUEUE_PREFETCH_COUNT,
+        "queuePrefetchDelaySecs": QUEUE_PREFETCH_DELAY_SECS,
         "volumeNormalization": VOLUME_NORMALIZATION,
         "cookiesBrowser": COOKIES_BROWSER,
         "cookiesFile": COOKIES_FILE,

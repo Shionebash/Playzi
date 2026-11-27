@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from . import config
-from .channels import refresh_all_channels
+from .channels import refresh_all_channels, refresh_manual_channels, sync_youtube_subscriptions
 from .recommendations import fetch_recommendations
 from .state import read_state, update_state
 from .ytmusic import fetch_music_playlists, fetch_music_recommendations
@@ -26,15 +26,15 @@ _STARTED = False
 SectionRunner = Callable[[], dict[str, Any]]
 
 def _refresh_channels_for_sync() -> dict[str, Any]:
+    sync_res = sync_youtube_subscriptions()
     data = read_state()
-    if not data.get("channels"):
-        now = _now()
-        update_state(lambda d: d.update({"channelsLastSync": now}))
-        return {"lastSync": now}
-    refresh_all_channels()
+    if sync_res.get("authenticated"):
+        refresh_manual_channels()
+    elif data.get("channels"):
+        refresh_all_channels()
     now = _now()
     update_state(lambda d: d.update({"channelsLastSync": now}))
-    return {"lastSync": now}
+    return {"lastSync": now, **sync_res}
 
 
 _SECTIONS: dict[str, dict[str, Any]] = {

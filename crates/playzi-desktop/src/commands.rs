@@ -354,6 +354,44 @@ pub async fn dispatch_api_request(
                 .map_err(|e| e.to_string())?;
             Ok(json!({ "ok": true, "result": res }))
         }
+        ("POST", "/api/channels/sync-subscriptions") => {
+            let cfg = runtime.config.snapshot();
+            let configured = if cfg.cookies_file.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.cookies_file.as_str())
+            };
+            let jar = runtime.cookie_store().load_jar(configured).ok();
+            let auth_user = runtime
+                .state
+                .read()
+                .map(|s| s.music_auth_user)
+                .unwrap_or(0);
+            let res = runtime
+                .youtube
+                .sync_subscriptions_with_cookies_and_user(
+                    jar.as_ref(),
+                    auth_user,
+                    &runtime.state,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let items = list_channels(&runtime.state).map_err(|e| e.to_string())?;
+            let feed = list_feed(&runtime.state).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "ok": true,
+                "authenticated": res.authenticated,
+                "syncedCount": res.synced_count,
+                "addedCount": res.added_count,
+                "updatedCount": res.updated_count,
+                "removedCount": res.removed_count,
+                "totalChannels": res.total_channels,
+                "feedCount": res.feed_count,
+                "lastSync": res.last_sync,
+                "items": items,
+                "feed": feed,
+            }))
+        }
         ("GET", "/api/channel") => {
             let url = query.get("url").map(String::as_str).unwrap_or("");
             let tab = query.get("tab").map(String::as_str).unwrap_or("videos");

@@ -23,7 +23,7 @@ from starlette.background import BackgroundTask
 from . import config
 from .autosync import get_sync_status, refresh_all, refresh_section, start_autosync
 from .channel_browse import browse_channel
-from .channels import add_channel, delete_channel, list_channels, list_feed, preview_channel, refresh_all_channels, refresh_channel
+from .channels import add_channel, delete_channel, list_channels, list_feed, preview_channel, refresh_all_channels, refresh_channel, sync_youtube_subscriptions
 from .collections import create_collection, delete_collection, list_collections
 from .history import delete_history_event
 from .playlists import add_item as playlist_add_item
@@ -409,6 +409,16 @@ def api_channel_refresh(channel_id: str):
 @app.post("/api/channels/refresh")
 def api_channels_refresh():
     return {"task": start_task("refresh-channels", refresh_all_channels)}
+
+
+@app.post("/api/channels/sync-subscriptions")
+def api_channels_sync_subscriptions():
+    try:
+        res = sync_youtube_subscriptions()
+        return {"ok": True, **res, "items": list_channels(), "feed": list_feed()}
+    except Exception as exc:
+        logger.exception("Error al sincronizar suscripciones de YouTube")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/feed")

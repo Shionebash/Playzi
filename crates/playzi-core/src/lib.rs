@@ -39,11 +39,15 @@ mod tests {
         let initial = store.public_config();
         assert_eq!(initial.app_port, 8765);
         assert_eq!(initial.search_limit, 12);
+        assert_eq!(initial.queue_prefetch_count, 1);
+        assert_eq!(initial.queue_prefetch_delay_secs, 30);
 
         let updated = store
             .update(ConfigUpdate {
                 search_limit: Some(25),
                 playback_quality: Some("1080p".into()),
+                queue_prefetch_count: Some(4),
+                queue_prefetch_delay_secs: Some(15),
                 cookies_browser: Some("firefox".into()),
                 ..Default::default()
             })
@@ -51,12 +55,37 @@ mod tests {
 
         assert_eq!(updated.search_limit, 25);
         assert_eq!(updated.playback_quality, "1080p");
+        assert_eq!(updated.queue_prefetch_count, 4);
+        assert_eq!(updated.queue_prefetch_delay_secs, 15);
         assert_eq!(updated.cookies_browser, "firefox");
 
         let reloaded = ConfigStore::load_from_root(dir.path()).public_config();
         assert_eq!(reloaded.search_limit, 25);
         assert_eq!(reloaded.playback_quality, "1080p");
+        assert_eq!(reloaded.queue_prefetch_count, 4);
+        assert_eq!(reloaded.queue_prefetch_delay_secs, 15);
         assert_eq!(reloaded.cookies_browser, "firefox");
+
+        // Zero count (disabled) and zero delay (immediate) should be preserved, and values clamped
+        let zeroed = store
+            .update(ConfigUpdate {
+                queue_prefetch_count: Some(0),
+                queue_prefetch_delay_secs: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(zeroed.queue_prefetch_count, 0);
+        assert_eq!(zeroed.queue_prefetch_delay_secs, 0);
+
+        let clamped = store
+            .update(ConfigUpdate {
+                queue_prefetch_count: Some(99),
+                queue_prefetch_delay_secs: Some(9999),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(clamped.queue_prefetch_count, 10);
+        assert_eq!(clamped.queue_prefetch_delay_secs, 600);
     }
 
     #[test]

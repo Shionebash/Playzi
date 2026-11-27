@@ -20,6 +20,8 @@ const ENV_KEY_ORDER: &[&str] = &[
     "AUDIO_FORMAT",
     "YTDLP_SEARCH_LIMIT",
     "PLAYBACK_QUALITY",
+    "QUEUE_PREFETCH_COUNT",
+    "QUEUE_PREFETCH_DELAY_SECS",
     "SHOW_SHORTS",
     "SOCIAL_HUB_URL",
     "DISCORD_ENABLED",
@@ -61,6 +63,8 @@ pub struct PublicConfig {
     pub audio_format: String,
     pub search_limit: usize,
     pub playback_quality: String,
+    pub queue_prefetch_count: usize,
+    pub queue_prefetch_delay_secs: usize,
     pub volume_normalization: bool,
     pub cookies_browser: String,
     pub cookies_file: String,
@@ -82,6 +86,8 @@ pub struct ConfigUpdate {
     pub audio_format: Option<String>,
     pub search_limit: Option<usize>,
     pub playback_quality: Option<String>,
+    pub queue_prefetch_count: Option<usize>,
+    pub queue_prefetch_delay_secs: Option<usize>,
     pub volume_normalization: Option<bool>,
     pub cookies_browser: Option<String>,
     pub cookies_file: Option<String>,
@@ -108,6 +114,8 @@ pub struct AppConfig {
     pub audio_format: String,
     pub ytdlp_search_limit: usize,
     pub playback_quality: String,
+    pub queue_prefetch_count: usize,
+    pub queue_prefetch_delay_secs: usize,
     pub volume_normalization: bool,
     pub cookies_browser: String,
     pub cookies_file: String,
@@ -156,6 +164,14 @@ impl AppConfig {
             .unwrap_or(12)
             .clamp(1, 100);
         let playback_quality = get("PLAYBACK_QUALITY", "best");
+        let queue_prefetch_count = get("QUEUE_PREFETCH_COUNT", "1")
+            .parse::<usize>()
+            .unwrap_or(1)
+            .clamp(0, 10);
+        let queue_prefetch_delay_secs = get("QUEUE_PREFETCH_DELAY_SECS", "30")
+            .parse::<usize>()
+            .unwrap_or(30)
+            .clamp(0, 600);
         let volume_normalization = matches!(
             get("VOLUME_NORMALIZATION", "true")
                 .to_ascii_lowercase()
@@ -224,6 +240,8 @@ impl AppConfig {
             audio_format,
             ytdlp_search_limit,
             playback_quality,
+            queue_prefetch_count,
+            queue_prefetch_delay_secs,
             volume_normalization,
             cookies_browser,
             cookies_file,
@@ -257,6 +275,8 @@ impl AppConfig {
             audio_format: self.audio_format.clone(),
             search_limit: self.ytdlp_search_limit,
             playback_quality: self.playback_quality.clone(),
+            queue_prefetch_count: self.queue_prefetch_count,
+            queue_prefetch_delay_secs: self.queue_prefetch_delay_secs,
             volume_normalization: self.volume_normalization,
             cookies_browser: self.cookies_browser.clone(),
             cookies_file: self.cookies_file.clone(),
@@ -326,6 +346,15 @@ impl ConfigStore {
             patch.search_limit.map(|n| n.clamp(1, 100).to_string()),
         );
         apply_non_empty("PLAYBACK_QUALITY", patch.playback_quality);
+        if let Some(n) = patch.queue_prefetch_count {
+            env_map.insert("QUEUE_PREFETCH_COUNT".to_string(), n.clamp(0, 10).to_string());
+        }
+        if let Some(n) = patch.queue_prefetch_delay_secs {
+            env_map.insert(
+                "QUEUE_PREFETCH_DELAY_SECS".to_string(),
+                n.clamp(0, 600).to_string(),
+            );
+        }
         if let Some(v) = patch.volume_normalization {
             env_map.insert(
                 "VOLUME_NORMALIZATION".to_string(),
