@@ -2247,8 +2247,8 @@ function renderConfig() {
             <label>Límite búsqueda<input class="form-input" name="searchLimit" type="number" min="1" max="50" value="${escapeHtml(c.searchLimit || 12)}"></label>
             <label>Navegador para cookies automáticas
               <select class="form-input" name="cookiesBrowser">
-                ${["", "playzi", "zen", "firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi"].map((b) =>
-                  `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Navegador predeterminado (automático)" : (b || "Ninguno")}</option>`
+                ${["", "playzi", "dia", "zen", "firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi"].map((b) =>
+                  `<option value="${b}" ${(c.cookiesBrowser || "") === b ? "selected" : ""}>${b === "playzi" ? "Navegador predeterminado (automático)" : (b === "dia" ? "Dia" : (b || "Ninguno"))}</option>`
                 ).join("")}
               </select>
             </label>

@@ -626,6 +626,102 @@ fn firefox_fork_candidate(label: &str, profiles_roots: &[PathBuf]) -> Option<Bro
     None
 }
 
+/// Finds the most recently modified Chromium-style profile directory containing `Network/Cookies` or `Cookies`.
+fn newest_chromium_profile_dir(user_data_root: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(user_data_root).ok()?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let network_cookies = dir.join("Network").join("Cookies");
+        let legacy_cookies = dir.join("Cookies");
+        let cookies_db = if network_cookies.is_file() {
+            network_cookies
+        } else if legacy_cookies.is_file() {
+            legacy_cookies
+        } else {
+            continue;
+        };
+        let mtime = fs::metadata(&cookies_db)
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        match &best {
+            Some((best_time, _)) if mtime <= *best_time => {}
+            _ => best = Some((mtime, dir)),
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn chromium_fork_candidate(label: &str, user_data_roots: &[PathBuf]) -> Option<BrowserCandidate> {
+    for root in user_data_roots {
+        if let Some(profile) = newest_chromium_profile_dir(root) {
+            return Some(BrowserCandidate {
+                label: label.to_string(),
+                ytdlp_spec: format!("chrome:{}", profile.display()),
+            });
+        }
+    }
+    None
+}
+
+fn known_chromium_fork_roots(name: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(windows)]
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        let base = PathBuf::from(local_appdata);
+        if name == "dia" {
+            let packages = base.join("Packages");
+            if let Ok(entries) = fs::read_dir(&packages) {
+                for entry in entries.flatten() {
+                    let pkg_name = entry.file_name();
+                    let pkg_lower = pkg_name.to_string_lossy().to_ascii_lowercase();
+                    if pkg_lower.starts_with("thebrowsercompany.dia_") {
+                        roots.push(
+                            entry
+                                .path()
+                                .join("LocalCache")
+                                .join("Local")
+                                .join("Dia")
+                                .join("User Data"),
+                        );
+                    }
+                }
+            }
+            roots.push(base.join("Dia").join("User Data"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = std::env::var("HOME") {
+        let base = PathBuf::from(home);
+        if name == "dia" {
+            roots.push(
+                base.join("Library")
+                    .join("Application Support")
+                    .join("Dia")
+                    .join("User Data"),
+            );
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok(home) = std::env::var("HOME") {
+        let base = PathBuf::from(home);
+        if name == "dia" {
+            roots.push(base.join(".config").join("Dia"));
+        }
+    }
+    roots
+}
+
+fn matches_dia_browser(combined_lower: &str) -> bool {
+    combined_lower.contains("dia.exe")
+        || combined_lower.contains("thebrowsercompany.dia")
+        || combined_lower.contains("thebrowser.dia")
+        || combined_lower.contains("dia.desktop")
+}
+
 fn known_firefox_fork_roots(name: &str) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     #[cfg(windows)]
@@ -720,6 +816,11 @@ fn detect_primary_browser_windows() -> Option<BrowserCandidate> {
     .unwrap_or_default();
 
     let combined = format!("{} {}", prog_id, command_str).to_ascii_lowercase();
+    if matches_dia_browser(&combined) {
+        if let Some(c) = chromium_fork_candidate("Dia", &known_chromium_fork_roots("dia")) {
+            return Some(c);
+        }
+    }
     if combined.contains("zen.exe") || combined.contains("zen browser") {
         if let Some(c) = firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen")) {
             return Some(c);
@@ -796,6 +897,11 @@ fn detect_primary_browser_unix() -> Option<BrowserCandidate> {
         return None;
     }
     let lower = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    if matches_dia_browser(&lower) {
+        if let Some(c) = chromium_fork_candidate("Dia", &known_chromium_fork_roots("dia")) {
+            return Some(c);
+        }
+    }
     if lower.contains("zen") {
         if let Some(c) = firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen")) {
             return Some(c);
@@ -869,6 +975,12 @@ pub fn detect_default_browser_candidates() -> Vec<BrowserCandidate> {
         push_unique_candidate(&mut out, primary);
     }
 
+    for (name, label) in [("dia", "Dia")] {
+        if let Some(c) = chromium_fork_candidate(label, &known_chromium_fork_roots(name)) {
+            push_unique_candidate(&mut out, c);
+        }
+    }
+
     for (name, label) in [
         ("zen", "Zen Browser"),
         ("floorp", "Floorp"),
@@ -907,6 +1019,13 @@ pub fn candidates_for_config(cookies_browser: &str) -> Vec<BrowserCandidate> {
     let lower = trimmed.to_ascii_lowercase();
     if !lower.is_empty() && lower != "playzi" && lower != "auto" && lower != "default" {
         match lower.as_str() {
+            "dia" => {
+                if let Some(c) =
+                    chromium_fork_candidate("Dia", &known_chromium_fork_roots("dia"))
+                {
+                    push_unique_candidate(&mut out, c);
+                }
+            }
             "zen" => {
                 if let Some(c) =
                     firefox_fork_candidate("Zen Browser", &known_firefox_fork_roots("zen"))
@@ -1038,4 +1157,41 @@ pub async fn export_cookies_from_browser(
         )));
     }
     Ok(jar)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_dia_browser_detects_dia_without_false_positives() {
+        assert!(matches_dia_browser(
+            r#"appx06t8cqx "c:\program files\windowsapps\thebrowsercompany.dia_1.7.4.2_x64__ttt1ap7aakyb4\dia.exe""#
+        ));
+        assert!(matches_dia_browser("thebrowsercompany.dia"));
+        assert!(matches_dia_browser("dia.desktop"));
+        assert!(!matches_dia_browser("vivaldi"));
+        assert!(!matches_dia_browser("msedgehtm"));
+        assert!(!matches_dia_browser("media-player"));
+    }
+
+    #[test]
+    fn chromium_fork_candidate_finds_network_cookies_profile() {
+        let base = std::env::temp_dir().join(format!(
+            "playzi_dia_test_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let default_net = base.join("Default").join("Network");
+        fs::create_dir_all(&default_net).unwrap();
+        fs::write(default_net.join("Cookies"), b"sqlite").unwrap();
+
+        let candidate = chromium_fork_candidate("Dia", std::slice::from_ref(&base));
+        let _ = fs::remove_dir_all(&base);
+
+        let candidate = candidate.expect("expected Dia candidate");
+        assert_eq!(candidate.label, "Dia");
+        assert!(candidate.ytdlp_spec.starts_with("chrome:"));
+        assert!(candidate.ytdlp_spec.ends_with("Default"));
+    }
 }
