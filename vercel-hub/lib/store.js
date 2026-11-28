@@ -181,7 +181,7 @@ async function redisCommand(args) {
 
 // ── Unified KV API ──────────────────────────────────────────────────────────
 
-export async function kvGetJson(key, fallback = null) {
+export async function kvGetWithRaw(key, fallback = null) {
   const turso = getTursoConfig();
   if (turso) {
     await ensureTursoSchema(turso);
@@ -191,38 +191,46 @@ export async function kvGetJson(key, fallback = null) {
       [key]
     );
     const row = result.rows?.[0];
-    if (!row) return fallback;
+    if (!row) return { value: fallback, raw: null };
     const raw = fromHranaCell(row[0]);
     const expiresAt = Number(fromHranaCell(row[1]) || 0);
     if (expiresAt > 0 && Date.now() > expiresAt) {
-      return fallback;
+      return { value: fallback, raw: null };
     }
-    if (raw == null) return fallback;
+    if (raw == null) return { value: fallback, raw: null };
+    const rawStr = typeof raw === "string" ? raw : JSON.stringify(raw);
     try {
-      return typeof raw === "string" ? JSON.parse(raw) : raw;
+      return { value: typeof raw === "string" ? JSON.parse(raw) : raw, raw: rawStr };
     } catch {
-      return fallback;
+      return { value: fallback, raw: rawStr };
     }
   }
 
   const redis = getRedisConfig();
   if (redis) {
     const raw = await redisCommand(["GET", key]);
-    if (raw == null) return fallback;
+    if (raw == null) return { value: fallback, raw: null };
+    const rawStr = typeof raw === "string" ? raw : JSON.stringify(raw);
     try {
-      return typeof raw === "string" ? JSON.parse(raw) : raw;
+      return { value: typeof raw === "string" ? JSON.parse(raw) : raw, raw: rawStr };
     } catch {
-      return fallback;
+      return { value: fallback, raw: rawStr };
     }
   }
 
   const entry = memoryStore.get(key);
-  if (!entry) return fallback;
+  if (!entry) return { value: fallback, raw: null };
   if (entry.expiresAt && Date.now() > entry.expiresAt) {
     memoryStore.delete(key);
-    return fallback;
+    return { value: fallback, raw: null };
   }
-  return entry.value;
+  const rawStr = JSON.stringify(entry.value);
+  return { value: JSON.parse(rawStr), raw: rawStr };
+}
+
+export async function kvGetJson(key, fallback = null) {
+  const { value } = await kvGetWithRaw(key, fallback);
+  return value;
 }
 
 export async function kvMGetJson(keys) {
@@ -316,6 +324,67 @@ export async function kvSetJson(key, value, ttlSeconds = 0) {
     value,
     expiresAt: ttlSeconds > 0 ? Date.now() + ttlSeconds * 1000 : 0,
   });
+}
+
+export async function kvCasJson(key, expectedRaw, value, ttlSeconds = 0) {
+  const encoded = JSON.stringify(value);
+  const now = Date.now();
+  const expiresAt = ttlSeconds > 0 ? now + Math.trunc(ttlSeconds * 1000) : 0;
+
+  const turso = getTursoConfig();
+  if (turso) {
+    await ensureTursoSchema(turso);
+    if (expectedRaw === null) {
+      const delRes = await tursoExecute(
+        turso,
+        "DELETE FROM playzi_kv WHERE k = ? AND expires_at > 0 AND expires_at < ?",
+        [key, now]
+      );
+      void delRes;
+      const ins = await tursoExecute(
+        turso,
+        "INSERT OR IGNORE INTO playzi_kv (k, v, expires_at) VALUES (?, ?, ?)",
+        [key, encoded, expiresAt]
+      );
+      return Number(ins?.affected_row_count || 0) > 0;
+    }
+    const upd = await tursoExecute(
+      turso,
+      "UPDATE playzi_kv SET v = ?, expires_at = ? WHERE k = ? AND v = ?",
+      [encoded, expiresAt, key, expectedRaw]
+    );
+    return Number(upd?.affected_row_count || 0) > 0;
+  }
+
+  const redis = getRedisConfig();
+  if (redis) {
+    const script =
+      "local cur = redis.call('GET', KEYS[1]); " +
+      "if (not cur and ARGV[1] == '__NULL__') or (cur == ARGV[1]) then " +
+      "  if tonumber(ARGV[3]) > 0 then redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3])) " +
+      "  else redis.call('SET', KEYS[1], ARGV[2]) end; return 1 " +
+      "else return 0 end";
+    const ok = await redisCommand([
+      "EVAL",
+      script,
+      "1",
+      key,
+      expectedRaw === null ? "__NULL__" : expectedRaw,
+      encoded,
+      String(ttlSeconds > 0 ? Math.trunc(ttlSeconds) : 0),
+    ]);
+    return Number(ok) === 1;
+  }
+
+  const entry = memoryStore.get(key);
+  const currentRaw =
+    entry && (!entry.expiresAt || now <= entry.expiresAt) ? JSON.stringify(entry.value) : null;
+  if (currentRaw !== expectedRaw) return false;
+  memoryStore.set(key, {
+    value: JSON.parse(encoded),
+    expiresAt,
+  });
+  return true;
 }
 
 export async function kvDel(key) {

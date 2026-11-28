@@ -474,7 +474,7 @@ impl DownloadManager {
         };
         let cookie_file = store.resolve_cookie_file(configured).ok();
         let url = job.get("url").and_then(Value::as_str).unwrap_or("");
-        let is_youtube = source_for_url(url) == "youtube";
+        let is_youtube = matches!(source_for_url(url), "youtube" | "ytmusic");
 
         // For YouTube, try unauthenticated web_safari/default first to avoid SABR-only
         // account restrictions that drop formats; fall back to cookies when sign-in is required.
@@ -885,13 +885,39 @@ pub fn size_text(path: &Path) -> String {
 }
 
 pub fn source_for_url(url: &str) -> &'static str {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("music.youtube.com") {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return "other";
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return "other";
+    }
+    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return "other";
+    };
+    if host == "music.youtube.com" {
         "ytmusic"
-    } else if lower.contains("youtube.com") || lower.contains("youtu.be") {
+    } else if host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+    {
         "youtube"
     } else {
         "other"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_for_url;
+
+    #[test]
+    fn source_for_url_validates_host_strictly() {
+        assert_eq!(source_for_url("https://www.youtube.com/watch?v=abc"), "youtube");
+        assert_eq!(source_for_url("https://youtu.be/abc"), "youtube");
+        assert_eq!(source_for_url("https://music.youtube.com/watch?v=abc"), "ytmusic");
+        assert_eq!(source_for_url("https://evil.com/?r=youtube.com"), "other");
+        assert_eq!(source_for_url("https://youtube.com.evil.com/watch?v=abc"), "other");
     }
 }
 

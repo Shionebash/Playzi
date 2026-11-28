@@ -5,7 +5,7 @@ use std::time::Instant;
 use chrono::Utc;
 use playzi_core::updater::{
     CURRENT_VERSION, check_latest_release, configured_repo, download_release_asset,
-    launch_installer_and_relaunch,
+    launch_installer_and_relaunch, verify_asset_sha256,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -193,6 +193,15 @@ impl DesktopUpdater {
                 });
             }
         };
+
+        if let Some(ref sha_url) = release.sha256_url
+            && let Err(err) = verify_asset_sha256(&downloaded_path, sha_url).await
+        {
+            return self.set_and_emit(app, |s| {
+                s.status = "error".to_string();
+                s.error = Some(err.to_string());
+            });
+        }
 
         let installing_status = self.set_and_emit(app, |s| {
             s.status = "installing".to_string();

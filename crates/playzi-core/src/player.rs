@@ -20,6 +20,8 @@ use crate::youtube::{extract_video_id, format_duration, is_youtube_url};
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const DEFAULT_STREAM_CACHE_TTL_SECS: u64 = 600;
+const STREAM_URL_FALLBACK_TTL_SECS: u64 = 3 * 3600;
+const STREAM_UPGRADE_COOLDOWN_SECS: u64 = 15;
 const EXPIRE_SAFETY_MARGIN_SECS: i64 = 60;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -104,6 +106,8 @@ pub struct StreamFormat {
     pub asr: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
     #[serde(default)]
     pub http_headers: HashMap<String, String>,
 }
@@ -304,6 +308,33 @@ impl CachedRawVideo {
 }
 
 type InFlightMap = HashMap<String, broadcast::Sender<std::result::Result<CachedRawVideo, String>>>;
+type UpgradeInFlightMap = HashMap<String, broadcast::Sender<std::result::Result<(), String>>>;
+
+#[derive(Debug, Clone)]
+pub struct UpstreamStreamEntry {
+    pub url: String,
+    pub content_length: Option<u64>,
+    pub upgraded: bool,
+    pub verified: bool,
+    pub expires_at: Option<i64>,
+    pub updated_at: Instant,
+}
+
+impl UpstreamStreamEntry {
+    pub fn is_expired(&self) -> bool {
+        if let Some(exp) = self.expires_at {
+            return now_unix_secs() >= exp - EXPIRE_SAFETY_MARGIN_SECS;
+        }
+        self.updated_at.elapsed() > Duration::from_secs(STREAM_URL_FALLBACK_TTL_SECS)
+    }
+
+    pub fn can_refresh_on_403(&self) -> bool {
+        if !self.upgraded {
+            return true;
+        }
+        self.updated_at.elapsed() >= Duration::from_secs(STREAM_UPGRADE_COOLDOWN_SECS)
+    }
+}
 
 struct ManagedSession {
     child: Option<Child>,
@@ -326,6 +357,8 @@ pub struct PlayerManager {
     ytdlp_override: Option<String>,
     raw_cache: Arc<Mutex<HashMap<String, CachedRawVideo>>>,
     in_flight: Arc<Mutex<InFlightMap>>,
+    stream_urls: Arc<Mutex<HashMap<(String, String), UpstreamStreamEntry>>>,
+    upgrade_in_flight: Arc<Mutex<UpgradeInFlightMap>>,
     loudness_cache: Arc<Mutex<HashMap<String, Option<f64>>>>,
     loudness_client: reqwest::Client,
     innertube_client: reqwest::Client,
@@ -355,6 +388,8 @@ impl PlayerManager {
             ytdlp_override: None,
             raw_cache: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            stream_urls: Arc::new(Mutex::new(HashMap::new())),
+            upgrade_in_flight: Arc::new(Mutex::new(HashMap::new())),
             loudness_cache: Arc::new(Mutex::new(HashMap::new())),
             loudness_client,
             innertube_client,
@@ -740,20 +775,37 @@ impl PlayerManager {
     }
 
     /// Generates an in-memory DASH `.mpd` manifest for a video URL using the cached or resolved formats.
+    /// When `quality` is `"audio"`, emits an audio-only DASH manifest (no video AdaptationSet).
     pub async fn resolve_dash_manifest(
         &self,
         url: &str,
         quality: Option<&str>,
         proxy_prefix: &str,
     ) -> Result<String> {
-        let info = self.resolve_stream(url, quality, false).await?;
-        let video = info.video.as_ref().ok_or_else(|| {
-            CoreError::External("No video stream available for DASH manifest".into())
-        })?;
+        let audio_only = quality.is_some_and(|q| q.eq_ignore_ascii_case("audio"));
+        let info = self.resolve_stream(url, quality, audio_only).await?;
+        let video_id = extract_video_id(url);
         let audio = info.audio.as_ref().ok_or_else(|| {
             CoreError::External("No audio stream available for DASH manifest".into())
         })?;
-        build_dash_mpd_manifest(info.duration, video, audio, proxy_prefix)
+        if audio_only {
+            return build_dash_audio_mpd_manifest_for_video(
+                info.duration,
+                audio,
+                proxy_prefix,
+                video_id.as_deref(),
+            );
+        }
+        let video = info.video.as_ref().ok_or_else(|| {
+            CoreError::External("No video stream available for DASH manifest".into())
+        })?;
+        build_dash_mpd_manifest_for_video(
+            info.duration,
+            video,
+            audio,
+            proxy_prefix,
+            video_id.as_deref(),
+        )
     }
 
     async fn resolve_raw_video(&self, url: &str, force_refresh: bool) -> Result<CachedRawVideo> {
@@ -838,14 +890,27 @@ impl PlayerManager {
             }
         }
 
-        let (raw_res, fetched_loudness) = tokio::join!(
-            self.run_ytdlp_json(url, false, None),
-            self.fetch_loudness_db(url),
-        );
+        let cached_loudness = extract_video_id(url).and_then(|vid| {
+            self.loudness_cache
+                .lock()
+                .ok()
+                .and_then(|c| c.get(&vid).copied().flatten())
+        });
+        let (raw_res, fetched_loudness) = if cached_loudness.is_some() {
+            (self.run_ytdlp_json(url, false, None).await, cached_loudness)
+        } else {
+            tokio::join!(
+                self.run_ytdlp_json(url, false, None),
+                self.fetch_loudness_db(url),
+            )
+        };
         let raw = raw_res?;
         let mut cached = parse_ytdlp_raw_video(&raw, url);
         if cached.loudness_db.is_none() {
             cached.loudness_db = fetched_loudness;
+        }
+        if let Some(vid) = extract_video_id(url) {
+            self.register_stream_urls(&vid, &cached.formats, true);
         }
         self.put_cached_raw(cache_key.to_string(), cached.clone());
         Ok(cached)
@@ -897,7 +962,196 @@ impl PlayerManager {
             .await
             .map_err(|e| CoreError::External(format!("InnerTube IOS JSON parse failed: {e}")))?;
 
-        parse_innertube_player_json(&data, video_id, original_url)
+        let raw = parse_innertube_player_json(&data, video_id, original_url)?;
+
+        // Register IOS adaptive formats immediately so playback starts in ~350-450ms via
+        // stable /yt-stream?v=<vid>&itag=<itag> proxy URLs. YouTube enforces GVS PO tokens
+        // past ~60s on many music/copyrighted IOS streams; verify the tail in the background
+        // and silently swap (vid, itag) to identical-byte TVHTML5 URLs before the 60s cutoff.
+        self.register_stream_urls(video_id, &raw.formats, false);
+
+        let audio_probe = select_best_audio(&raw.formats).map(|a| (a.url, a.content_length));
+        let video_probe = raw
+            .formats
+            .iter()
+            .filter(|f| !f.vcodec.is_empty() && f.vcodec != "none" && is_dash_format(f))
+            .max_by_key(|f| (f.height.unwrap_or(0), f.tbr.unwrap_or(0.0) as u64))
+            .map(|v| (v.url.clone(), v.content_length));
+
+        self.spawn_ios_tail_verify_and_upgrade(
+            video_id.to_string(),
+            original_url.to_string(),
+            audio_probe,
+            video_probe,
+        );
+
+        Ok(raw)
+    }
+
+    fn spawn_ios_tail_verify_and_upgrade(
+        &self,
+        video_id: String,
+        original_url: String,
+        audio_probe: Option<(String, Option<u64>)>,
+        video_probe: Option<(String, Option<u64>)>,
+    ) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let audio_fut = async {
+                match &audio_probe {
+                    Some((u, cl)) => mgr.probe_innertube_stream_tail(u, *cl).await,
+                    None => true,
+                }
+            };
+            let video_fut = async {
+                match &video_probe {
+                    Some((u, cl)) => mgr.probe_innertube_stream_tail(u, *cl).await,
+                    None => true,
+                }
+            };
+            let (audio_ok, video_ok) = tokio::join!(audio_fut, video_fut);
+            if audio_ok && video_ok {
+                mgr.mark_stream_urls_verified(&video_id);
+            } else {
+                let _ = mgr.ensure_yt_stream_upgraded(&video_id, &original_url).await;
+            }
+        });
+    }
+
+    pub fn resolve_yt_stream_entry(&self, video_id: &str, itag: &str) -> Option<UpstreamStreamEntry> {
+        let mut map = self.stream_urls.lock().expect("stream_urls lock");
+        let key = (video_id.to_string(), itag.to_string());
+        let entry = map.get(&key)?;
+        if entry.is_expired() {
+            map.remove(&key);
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    pub async fn ensure_yt_stream_upgraded(&self, video_id: &str, original_url: &str) -> Result<()> {
+        let mut rx_opt = None;
+        {
+            let mut inflight = self
+                .upgrade_in_flight
+                .lock()
+                .expect("upgrade_in_flight lock");
+            if let Some(tx) = inflight.get(video_id) {
+                rx_opt = Some(tx.subscribe());
+            } else {
+                let (tx, _) = broadcast::channel(8);
+                inflight.insert(video_id.to_string(), tx);
+            }
+        }
+
+        if let Some(mut rx) = rx_opt {
+            return match rx.recv().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(msg)) => Err(CoreError::External(msg)),
+                Err(_) => Err(CoreError::External(
+                    "Background stream upgrade channel closed".into(),
+                )),
+            };
+        }
+
+        let upgrade_res = async {
+            let raw = self.run_ytdlp_json(original_url, false, None).await?;
+            let mut cached = parse_ytdlp_raw_video(&raw, original_url);
+            if cached.loudness_db.is_none() {
+                if let Ok(lcache) = self.loudness_cache.lock() {
+                    if let Some(Some(db)) = lcache.get(video_id) {
+                        cached.loudness_db = Some(*db);
+                    }
+                }
+            }
+            self.register_stream_urls(video_id, &cached.formats, true);
+            self.put_cached_raw(format!("yt:{video_id}"), cached);
+            Ok::<(), CoreError>(())
+        }
+        .await;
+
+        let tx_opt = self
+            .upgrade_in_flight
+            .lock()
+            .expect("upgrade_in_flight lock")
+            .remove(video_id);
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(upgrade_res.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+        }
+
+        upgrade_res
+    }
+
+    fn register_stream_urls(&self, video_id: &str, formats: &[StreamFormat], upgraded: bool) {
+        if video_id.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut map = self.stream_urls.lock().expect("stream_urls lock");
+        if map.len() >= 1024 {
+            map.retain(|_, v| !v.is_expired());
+            if map.len() >= 1024 {
+                map.clear();
+            }
+        }
+        for fmt in formats {
+            if fmt.format_id.is_empty() || is_hls_url(&fmt.url) {
+                continue;
+            }
+            let key = (video_id.to_string(), fmt.format_id.clone());
+            if let Some(existing) = map.get(&key) {
+                let existing_fresh = !existing.is_expired();
+                if !upgraded && existing.upgraded && existing_fresh {
+                    // Never downgrade a fresh upgraded entry back to unverified IOS.
+                    continue;
+                }
+                if upgraded
+                    && existing_fresh
+                    && let (Some(old_len), Some(new_len)) =
+                        (existing.content_length, fmt.content_length)
+                    && old_len != new_len
+                {
+                    // Guard DASH sidx byte-offset integrity: only swap byte-identical files.
+                    continue;
+                }
+            }
+            map.insert(
+                key,
+                UpstreamStreamEntry {
+                    url: fmt.url.clone(),
+                    content_length: fmt.content_length,
+                    upgraded,
+                    verified: upgraded,
+                    expires_at: extract_url_expire(&fmt.url),
+                    updated_at: now,
+                },
+            );
+        }
+    }
+
+    fn mark_stream_urls_verified(&self, video_id: &str) {
+        let mut map = self.stream_urls.lock().expect("stream_urls lock");
+        for ((vid, _), entry) in map.iter_mut() {
+            if vid == video_id {
+                entry.verified = true;
+            }
+        }
+    }
+
+    async fn probe_innertube_stream_tail(&self, url: &str, content_length: Option<u64>) -> bool {
+        let range = compute_ios_tail_probe_range(content_length);
+        let resp = self
+            .innertube_client
+            .get(url)
+            .header("User-Agent", IOS_INNERTUBE_USER_AGENT)
+            .header("Range", range)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        match resp {
+            Ok(r) => matches!(r.status().as_u16(), 200 | 206),
+            Err(_) => false,
+        }
     }
 
     async fn fetch_loudness_db(&self, url: &str) -> Option<f64> {
@@ -1804,6 +2058,10 @@ fn parse_innertube_format(v: &Value) -> Option<StreamFormat> {
         .get("audioChannels")
         .and_then(Value::as_u64)
         .map(|n| n as u32);
+    let content_length = v.get("contentLength").and_then(|n| {
+        n.as_u64()
+            .or_else(|| n.as_str().and_then(|s| s.parse::<u64>().ok()))
+    });
 
     let mut http_headers = HashMap::new();
     http_headers.insert("User-Agent".into(), IOS_INNERTUBE_USER_AGENT.into());
@@ -1830,8 +2088,17 @@ fn parse_innertube_format(v: &Value) -> Option<StreamFormat> {
         index_range: parse_innertube_range(v.get("indexRange")),
         asr,
         audio_channels,
+        content_length,
         http_headers,
     })
+}
+
+fn compute_ios_tail_probe_range(content_length: Option<u64>) -> String {
+    match content_length {
+        Some(len) if len > 2048 => format!("bytes={}-{}", len - 1024, len - 1),
+        Some(len) if len > 1 => format!("bytes=0-{}", len - 1),
+        _ => "bytes=1500000-1501023".to_string(),
+    }
 }
 
 fn parse_innertube_player_json(
@@ -2143,6 +2410,10 @@ fn parse_format_value(v: &Value) -> Option<StreamFormat> {
             .get("audio_channels")
             .and_then(Value::as_u64)
             .map(|n| n as u32),
+        content_length: v
+            .get("filesize")
+            .or_else(|| v.get("filesize_approx"))
+            .and_then(Value::as_u64),
         http_headers,
     })
 }
@@ -2422,7 +2693,18 @@ pub fn build_stream_proxy_client() -> Result<reqwest::Client> {
         .user_agent(DEFAULT_USER_AGENT)
         .pool_max_idle_per_host(12)
         .tcp_nodelay(true)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(12))
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            if !is_allowed_stream_proxy_host(attempt.url()) {
+                return attempt.error("redirect to disallowed stream proxy host");
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(|err| CoreError::External(format!("Failed to build stream proxy client: {err}")))
 }
@@ -2449,6 +2731,18 @@ pub fn build_dash_mpd_manifest(
     video: &StreamFormat,
     audio: &StreamFormat,
     proxy_prefix: &str,
+) -> Result<String> {
+    build_dash_mpd_manifest_for_video(duration, video, audio, proxy_prefix, None)
+}
+
+/// Builds a static DASH `.mpd` manifest using stable `/yt-stream?v=<vid>&itag=<itag>` proxy
+/// URLs when `video_id` is supplied, allowing transparent upstream upgrades mid-playback.
+pub fn build_dash_mpd_manifest_for_video(
+    duration: f64,
+    video: &StreamFormat,
+    audio: &StreamFormat,
+    proxy_prefix: &str,
+    video_id: Option<&str>,
 ) -> Result<String> {
     if !is_isobmff_container(video) || !is_isobmff_container(audio) {
         return Err(CoreError::External(
@@ -2505,8 +2799,8 @@ pub fn build_dash_mpd_manifest(
     } else {
         &audio.acodec
     });
-    let video_url = xml_escape(&encode_proxy_url(proxy_prefix, &video.url));
-    let audio_url = xml_escape(&encode_proxy_url(proxy_prefix, &audio.url));
+    let video_url = xml_escape(&encode_dash_base_url(proxy_prefix, video_id, video));
+    let audio_url = xml_escape(&encode_dash_base_url(proxy_prefix, video_id, audio));
     let width = video.width.unwrap_or(1280);
     let height = video.height.unwrap_or(720);
     let fps = video.fps.unwrap_or(30.0).round().max(1.0) as u32;
@@ -2550,6 +2844,96 @@ pub fn build_dash_mpd_manifest(
 </MPD>
 "#
     ))
+}
+
+/// Builds an audio-only ISO-BMFF on-demand DASH `.mpd` manifest for an adaptive audio stream
+/// proxied through the local `playzi-stream` custom protocol.
+pub fn build_dash_audio_mpd_manifest(
+    duration: f64,
+    audio: &StreamFormat,
+    proxy_prefix: &str,
+) -> Result<String> {
+    build_dash_audio_mpd_manifest_for_video(duration, audio, proxy_prefix, None)
+}
+
+/// Builds an audio-only DASH `.mpd` manifest using stable `/yt-stream?v=<vid>&itag=<itag>` proxy
+/// URLs when `video_id` is supplied.
+pub fn build_dash_audio_mpd_manifest_for_video(
+    duration: f64,
+    audio: &StreamFormat,
+    proxy_prefix: &str,
+    video_id: Option<&str>,
+) -> Result<String> {
+    if !is_isobmff_container(audio) {
+        return Err(CoreError::External(
+            "DASH audio manifest requires an ISOBMFF (mp4/m4a) audio stream".into(),
+        ));
+    }
+    let a_init = audio
+        .init_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Audio stream missing DASH initRange".into()))?;
+    let a_index = audio
+        .index_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Audio stream missing DASH indexRange".into()))?;
+
+    let dur = if duration > 0.0 && duration.is_finite() {
+        duration
+    } else {
+        36000.0
+    };
+    let audio_mime = audio.mime_type.as_deref().unwrap_or("audio/mp4");
+    let audio_codec = xml_escape(if audio.acodec.is_empty() || audio.acodec == "none" {
+        "mp4a.40.2"
+    } else {
+        &audio.acodec
+    });
+    let audio_url = xml_escape(&encode_dash_base_url(proxy_prefix, video_id, audio));
+    let bw_a = ((audio.abr.or(audio.tbr).unwrap_or(128.0) * 1000.0).round() as u64).max(32_000);
+    let asr = audio.asr.unwrap_or(44100);
+    let channels = audio.audio_channels.unwrap_or(2);
+    let a_id = xml_escape(if audio.format_id.is_empty() {
+        "audio"
+    } else {
+        &audio.format_id
+    });
+
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT{dur:.3}S" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+  <Period duration="PT{dur:.3}S">
+    <AdaptationSet id="audio" contentType="audio" mimeType="{audio_mime}" codecs="{audio_codec}" startWithSAP="1" subsegmentAlignment="true">
+      <Representation id="{a_id}" bandwidth="{bw_a}" audioSamplingRate="{asr}">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="{channels}" />
+        <BaseURL>{audio_url}</BaseURL>
+        <SegmentBase indexRange="{a_index}" indexRangeExact="true">
+          <Initialization range="{a_init}" />
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#
+    ))
+}
+
+fn encode_dash_base_url(
+    proxy_prefix: &str,
+    video_id: Option<&str>,
+    fmt: &StreamFormat,
+) -> String {
+    if let Some(vid) = video_id.filter(|s| !s.is_empty()) {
+        if !fmt.format_id.is_empty() && !is_hls_url(&fmt.url) {
+            let v_enc: String = url::form_urlencoded::byte_serialize(vid.as_bytes()).collect();
+            let i_enc: String =
+                url::form_urlencoded::byte_serialize(fmt.format_id.as_bytes()).collect();
+            return format!("{proxy_prefix}yt-stream?v={v_enc}&itag={i_enc}");
+        }
+    }
+    encode_proxy_url(proxy_prefix, &fmt.url)
 }
 
 fn encode_proxy_url(proxy_prefix: &str, absolute_url: &str) -> String {
@@ -2834,12 +3218,20 @@ pub async fn fetch_proxied_stream(
 
     let (status, final_url, content_type, content_range, accept_ranges, bytes) = loop {
         attempt += 1;
+        let is_ios_videoplayback = parsed.path().contains("/videoplayback")
+            && parsed.query().is_some_and(|q| q.contains("c=IOS"));
         let mut req = client.get(parsed.clone()).header("Accept", "*/*");
-        if parsed.query().is_some_and(|q| q.contains("c=IOS")) {
+        if is_ios_videoplayback {
             req = req.header("User-Agent", IOS_INNERTUBE_USER_AGENT);
         }
         if let Some(range) = range_header.filter(|r| !r.trim().is_empty()) {
             req = req.header("Range", range);
+        } else if is_ios_videoplayback {
+            // Video.js VHS probes DASH SegmentBase URLs without a Range header to detect the
+            // container type (mp4 vs webm), and YouTube's c=IOS videoplayback endpoints return
+            // HTTP 403 when Range is omitted. A 64 KiB head range satisfies both the container
+            // probe and the sidx index in a single 206 response without buffering the whole file.
+            req = req.header("Range", "bytes=0-65535");
         }
 
         let resp = match req.send().await {
@@ -2886,18 +3278,50 @@ pub async fn fetch_proxied_stream(
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
 
-        match resp.bytes().await {
-            Ok(b) => {
+        const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+        if let Some(cl) = resp.content_length()
+            && cl as usize > MAX_PROXY_BODY_BYTES
+        {
+            return Err(CoreError::External(format!(
+                "Stream proxy response too large ({cl} bytes)"
+            )));
+        }
+
+        let mut resp = resp;
+        let mut buf = Vec::with_capacity(
+            resp.content_length()
+                .map(|n| (n as usize).min(MAX_PROXY_BODY_BYTES))
+                .unwrap_or(0),
+        );
+        let mut read_err = None;
+        while let Some(chunk_res) = resp.chunk().await.transpose() {
+            match chunk_res {
+                Ok(chunk) => {
+                    if buf.len().saturating_add(chunk.len()) > MAX_PROXY_BODY_BYTES {
+                        return Err(CoreError::External(
+                            "Stream proxy response exceeded maximum allowed size".into(),
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Err(err) => {
+                    read_err = Some(err);
+                    break;
+                }
+            }
+        }
+        match read_err {
+            None => {
                 break (
                     status,
                     final_url,
                     content_type,
                     content_range,
                     accept_ranges,
-                    b.to_vec(),
+                    buf,
                 );
             }
-            Err(err) => {
+            Some(err) => {
                 if attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt - 1])).await;
                     continue;
@@ -4058,6 +4482,20 @@ mod tests {
         assert!(mpd.contains("indexRange=\"741-1480\""));
         assert!(mpd.contains("<Initialization range=\"0-740\" />"));
         assert!(mpd.contains("http://playzi-stream.localhost/?url="));
+
+        let audio_mpd = build_dash_audio_mpd_manifest(
+            audio.duration,
+            audio.audio.as_ref().unwrap(),
+            "http://playzi-stream.localhost/",
+        )
+        .expect("should build valid audio-only DASH MPD");
+        assert!(audio_mpd.contains("mediaPresentationDuration=\"PT314.000S\""));
+        assert!(!audio_mpd.contains("contentType=\"video\""));
+        assert!(audio_mpd.contains("contentType=\"audio\""));
+        assert!(audio_mpd.contains("mimeType=\"audio/mp4\""));
+        assert!(audio_mpd.contains("codecs=\"mp4a.40.2\""));
+        assert!(audio_mpd.contains("indexRange=\"632-1090\""));
+        assert!(audio_mpd.contains("<Initialization range=\"0-631\" />"));
     }
 
     #[test]
@@ -4073,5 +4511,217 @@ mod tests {
             "playabilityStatus": { "status": "LOGIN_REQUIRED" }
         });
         assert!(parse_innertube_player_json(&blocked, "blk12345678", "https://www.youtube.com/watch?v=blk12345678").is_err());
+    }
+
+    #[test]
+    fn compute_ios_tail_probe_range_targets_tail_past_cutoff() {
+        assert_eq!(
+            compute_ios_tail_probe_range(Some(3_507_604)),
+            "bytes=3506580-3507603"
+        );
+        assert_eq!(compute_ios_tail_probe_range(Some(1024)), "bytes=0-1023");
+        assert_eq!(compute_ios_tail_probe_range(None), "bytes=1500000-1501023");
+    }
+
+    #[test]
+    fn dash_mpd_for_video_emits_stable_yt_stream_proxy_urls() {
+        let video = StreamFormat {
+            format_id: "137".into(),
+            url: "https://rr1.googlevideo.com/videoplayback?itag=137&c=IOS".into(),
+            ext: "mp4".into(),
+            vcodec: "avc1.640028".into(),
+            acodec: "none".into(),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            tbr: Some(2500.0),
+            abr: None,
+            language: None,
+            language_name: None,
+            mime_type: Some("video/mp4".into()),
+            init_range: Some("0-740".into()),
+            index_range: Some("741-1480".into()),
+            asr: None,
+            audio_channels: None,
+            content_length: Some(50_000_000),
+            http_headers: HashMap::new(),
+        };
+        let audio = StreamFormat {
+            format_id: "140".into(),
+            url: "https://rr1.googlevideo.com/videoplayback?itag=140&c=IOS".into(),
+            ext: "m4a".into(),
+            vcodec: "none".into(),
+            acodec: "mp4a.40.2".into(),
+            width: None,
+            height: None,
+            fps: None,
+            tbr: Some(130.0),
+            abr: Some(128.0),
+            language: None,
+            language_name: None,
+            mime_type: Some("audio/mp4".into()),
+            init_range: Some("0-631".into()),
+            index_range: Some("632-1090".into()),
+            asr: Some(44100),
+            audio_channels: Some(2),
+            content_length: Some(4_557_665),
+            http_headers: HashMap::new(),
+        };
+
+        let mpd = build_dash_mpd_manifest_for_video(
+            240.0,
+            &video,
+            &audio,
+            "http://playzi-stream.localhost/",
+            Some("kJQP7kiw5Fk"),
+        )
+        .expect("should build video+audio MPD with stable URLs");
+        assert!(mpd.contains("http://playzi-stream.localhost/yt-stream?v=kJQP7kiw5Fk&amp;itag=137"));
+        assert!(mpd.contains("http://playzi-stream.localhost/yt-stream?v=kJQP7kiw5Fk&amp;itag=140"));
+
+        let audio_mpd = build_dash_audio_mpd_manifest_for_video(
+            240.0,
+            &audio,
+            "http://playzi-stream.localhost/",
+            Some("kJQP7kiw5Fk"),
+        )
+        .expect("should build audio-only MPD with stable URL");
+        assert!(
+            audio_mpd.contains("http://playzi-stream.localhost/yt-stream?v=kJQP7kiw5Fk&amp;itag=140")
+        );
+    }
+
+    #[test]
+    fn stream_registry_upgrades_matching_content_length_and_guards_mismatch() {
+        let tmp = std::env::temp_dir().join(format!("playzi_reg_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = ConfigStore::load_from_root(&tmp);
+        let st = StateStore::new(cfg.snapshot().state_file.clone());
+        let mgr = PlayerManager::new(st, cfg);
+
+        let ios_fmt = StreamFormat {
+            format_id: "140".into(),
+            url: "https://rr1.googlevideo.com/videoplayback?itag=140&c=IOS".into(),
+            ext: "m4a".into(),
+            vcodec: "none".into(),
+            acodec: "mp4a.40.2".into(),
+            width: None,
+            height: None,
+            fps: None,
+            tbr: Some(130.0),
+            abr: Some(128.0),
+            language: None,
+            language_name: None,
+            mime_type: Some("audio/mp4".into()),
+            init_range: Some("0-631".into()),
+            index_range: Some("632-1090".into()),
+            asr: Some(44100),
+            audio_channels: Some(2),
+            content_length: Some(4_557_665),
+            http_headers: HashMap::new(),
+        };
+        mgr.register_stream_urls("kJQP7kiw5Fk", &[ios_fmt.clone()], false);
+        let e1 = mgr.resolve_yt_stream_entry("kJQP7kiw5Fk", "140").unwrap();
+        assert!(!e1.upgraded);
+        assert!(e1.url.contains("c=IOS"));
+
+        // Mismatched content_length must be ignored to protect DASH sidx byte offsets.
+        let bad_tv = StreamFormat {
+            url: "https://rr1.googlevideo.com/videoplayback?itag=140&c=TVHTML5&bad=1".into(),
+            content_length: Some(9_999_999),
+            ..ios_fmt.clone()
+        };
+        mgr.register_stream_urls("kJQP7kiw5Fk", &[bad_tv], true);
+        let e2 = mgr.resolve_yt_stream_entry("kJQP7kiw5Fk", "140").unwrap();
+        assert!(e2.url.contains("c=IOS"));
+
+        // Identical content_length atomically upgrades to TVHTML5.
+        let good_tv = StreamFormat {
+            url: "https://rr1.googlevideo.com/videoplayback?itag=140&c=TVHTML5".into(),
+            content_length: Some(4_557_665),
+            ..ios_fmt.clone()
+        };
+        mgr.register_stream_urls("kJQP7kiw5Fk", &[good_tv], true);
+        let e3 = mgr.resolve_yt_stream_entry("kJQP7kiw5Fk", "140").unwrap();
+        assert!(e3.upgraded);
+        assert!(e3.url.contains("c=TVHTML5"));
+
+        // Subsequent unverified IOS registration must NOT downgrade a fresh upgraded entry.
+        mgr.register_stream_urls("kJQP7kiw5Fk", &[ios_fmt], false);
+        let e4 = mgr.resolve_yt_stream_entry("kJQP7kiw5Fk", "140").unwrap();
+        assert!(e4.upgraded);
+        assert!(e4.url.contains("c=TVHTML5"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn verified_ios_stream_still_allows_403_upgrade_and_respects_url_expire() {
+        let tmp = std::env::temp_dir().join(format!("playzi_ver_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cfg = ConfigStore::load_from_root(&tmp);
+        let st = StateStore::new(cfg.snapshot().state_file.clone());
+        let mgr = PlayerManager::new(st, cfg);
+
+        let future_exp = now_unix_secs() + 3600;
+        let ios_fmt = StreamFormat {
+            format_id: "137".into(),
+            url: format!(
+                "https://rr1.googlevideo.com/videoplayback?itag=137&c=IOS&expire={future_exp}"
+            ),
+            ext: "mp4".into(),
+            vcodec: "avc1.640028".into(),
+            acodec: "none".into(),
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(30.0),
+            tbr: Some(2500.0),
+            abr: None,
+            language: None,
+            language_name: None,
+            mime_type: Some("video/mp4".into()),
+            init_range: Some("0-740".into()),
+            index_range: Some("741-1480".into()),
+            asr: None,
+            audio_channels: None,
+            content_length: Some(50_000_000),
+            http_headers: HashMap::new(),
+        };
+        mgr.register_stream_urls("abcDEF12345", &[ios_fmt], false);
+        mgr.mark_stream_urls_verified("abcDEF12345");
+        let entry = mgr.resolve_yt_stream_entry("abcDEF12345", "137").unwrap();
+        assert!(entry.verified);
+        assert!(!entry.upgraded);
+        assert!(entry.can_refresh_on_403());
+        assert_eq!(entry.expires_at, Some(future_exp));
+
+        let expired_fmt = StreamFormat {
+            format_id: "140".into(),
+            url: format!(
+                "https://rr1.googlevideo.com/videoplayback?itag=140&c=IOS&expire={}",
+                now_unix_secs() + 10
+            ),
+            ext: "m4a".into(),
+            vcodec: "none".into(),
+            acodec: "mp4a.40.2".into(),
+            width: None,
+            height: None,
+            fps: None,
+            tbr: Some(128.0),
+            abr: Some(128.0),
+            language: None,
+            language_name: None,
+            mime_type: Some("audio/mp4".into()),
+            init_range: Some("0-631".into()),
+            index_range: Some("632-1090".into()),
+            asr: Some(44100),
+            audio_channels: Some(2),
+            content_length: Some(4_000_000),
+            http_headers: HashMap::new(),
+        };
+        mgr.register_stream_urls("abcDEF12345", &[expired_fmt], false);
+        assert!(mgr.resolve_yt_stream_entry("abcDEF12345", "140").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

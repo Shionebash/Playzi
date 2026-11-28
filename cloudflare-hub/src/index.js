@@ -16,6 +16,8 @@ function jsonResponse(data, status = 200) {
   });
 }
 
+const SAFE_USER_ID_RE = /^[A-Z0-9_-]{1,80}$/;
+
 function normalizeUserId(raw) {
   return String(raw || "").trim().toUpperCase();
 }
@@ -287,26 +289,86 @@ export class SocialHub {
 
   async ensureLoaded() {
     if (this.loaded) return;
-    const [users, authTokens, friendships, friendRequests] = await Promise.all([
+    const [sharded, legacyUsers, legacyAuth, legacyFriends, friendRequests] = await Promise.all([
+      this.ctx.storage.list(),
       this.ctx.storage.get("users"),
       this.ctx.storage.get("authTokens"),
       this.ctx.storage.get("friendships"),
       this.ctx.storage.get("friendRequests"),
     ]);
-    this.users = users && typeof users === "object" ? users : {};
-    this.authTokens = authTokens && typeof authTokens === "object" ? authTokens : {};
-    this.friendships = friendships && typeof friendships === "object" ? friendships : {};
+
+    this.users = {};
+    this.authTokens = {};
+    this.friendships = {};
+
+    let hasSharded = false;
+    for (const [k, v] of sharded.entries()) {
+      if (k.startsWith("user:")) {
+        this.users[k.slice(5)] = v;
+        hasSharded = true;
+      } else if (k.startsWith("auth:")) {
+        this.authTokens[k.slice(5)] = v;
+        hasSharded = true;
+      } else if (k.startsWith("friends:")) {
+        this.friendships[k.slice(8)] = Array.isArray(v) ? v : [];
+        hasSharded = true;
+      }
+    }
+
+    if (!hasSharded) {
+      if (legacyUsers && typeof legacyUsers === "object") this.users = legacyUsers;
+      if (legacyAuth && typeof legacyAuth === "object") this.authTokens = legacyAuth;
+      if (legacyFriends && typeof legacyFriends === "object") this.friendships = legacyFriends;
+      const migrated = {};
+      for (const [uid, val] of Object.entries(this.users)) migrated[`user:${uid}`] = val;
+      for (const [uid, val] of Object.entries(this.authTokens)) migrated[`auth:${uid}`] = val;
+      for (const [uid, val] of Object.entries(this.friendships)) migrated[`friends:${uid}`] = val;
+      if (Object.keys(migrated).length > 0) {
+        const entries = Object.entries(migrated);
+        for (let i = 0; i < entries.length; i += 100) {
+          await this.ctx.storage.put(Object.fromEntries(entries.slice(i, i + 100)));
+        }
+        await this.ctx.storage.delete(["users", "authTokens", "friendships"]);
+      }
+    }
+
     this.friendRequests = Array.isArray(friendRequests) ? friendRequests : [];
     this.loaded = true;
   }
 
-  async persist() {
-    await this.ctx.storage.put({
-      users: this.users,
-      authTokens: this.authTokens,
-      friendships: this.friendships,
-      friendRequests: this.friendRequests,
-    });
+  async persistUser(userId) {
+    const batch = {};
+    if (Object.prototype.hasOwnProperty.call(this.users, userId)) {
+      batch[`user:${userId}`] = this.users[userId];
+    }
+    if (Object.prototype.hasOwnProperty.call(this.authTokens, userId)) {
+      batch[`auth:${userId}`] = this.authTokens[userId];
+    }
+    if (Object.prototype.hasOwnProperty.call(this.friendships, userId)) {
+      batch[`friends:${userId}`] = this.friendships[userId];
+    }
+    if (Object.keys(batch).length > 0) {
+      await this.ctx.storage.put(batch);
+    }
+  }
+
+  async persistFriendRequests() {
+    await this.ctx.storage.put("friendRequests", this.friendRequests);
+  }
+
+  async persist(...affectedUserIds) {
+    const uniqueIds = Array.from(new Set(affectedUserIds.filter(Boolean)));
+    if (uniqueIds.length > 0) {
+      const batch = { friendRequests: this.friendRequests };
+      for (const uid of uniqueIds) {
+        if (Object.prototype.hasOwnProperty.call(this.users, uid)) batch[`user:${uid}`] = this.users[uid];
+        if (Object.prototype.hasOwnProperty.call(this.authTokens, uid)) batch[`auth:${uid}`] = this.authTokens[uid];
+        if (Object.prototype.hasOwnProperty.call(this.friendships, uid)) batch[`friends:${uid}`] = this.friendships[uid];
+      }
+      await this.ctx.storage.put(batch);
+      return;
+    }
+    await this.persistFriendRequests();
   }
 
   isOnline(userId) {
@@ -439,6 +501,9 @@ export class SocialHub {
     if (!userId) {
       return jsonResponse({ error: "Missing userId" }, 400);
     }
+    if (!SAFE_USER_ID_RE.test(userId)) {
+      return jsonResponse({ error: "Invalid userId" }, 400);
+    }
 
     const rawAuthToken = String(
       request.headers.get("X-Playzi-Auth")
@@ -477,7 +542,7 @@ export class SocialHub {
       googleAccountName,
       updatedAt: new Date().toISOString(),
     };
-    await this.persist();
+    await this.persistUser(userId);
 
     if (!this.sockets.has(userId)) {
       this.sockets.set(userId, new Set());
@@ -542,6 +607,13 @@ export class SocialHub {
     }
 
     if (type === "client_disconnect" || type === "disconnect") {
+      const set = this.sockets.get(userId);
+      if (set) {
+        set.delete(ws);
+        if (set.size === 0) {
+          this.sockets.delete(userId);
+        }
+      }
       this.rooms.delete(userId);
       for (const [reqId, jr] of this.joinRequests.entries()) {
         if (jr.toUserId === userId || jr.fromUserId === userId) {
@@ -562,7 +634,7 @@ export class SocialHub {
         googleAccountName: googleAccountName || existing.googleAccountName || "",
         updatedAt: new Date().toISOString(),
       };
-      await this.persist();
+      await this.persistUser(userId);
       this.syncUser(userId);
       this.syncFriendsOf(userId);
       return;
@@ -590,7 +662,7 @@ export class SocialHub {
       if (reverse) {
         this.friendRequests = this.friendRequests.filter((r) => r.id !== reverse.id);
         this.addMutualFriend(userId, toUserId);
-        await this.persist();
+        await this.persist(userId, toUserId);
         this.syncUser(userId);
         this.syncUser(toUserId);
         safeSend(ws, { type: "notice", level: "ok", message: "Solicitud mutua aceptada. ¡Ya son amigos!" });
@@ -653,7 +725,7 @@ export class SocialHub {
 
       if (accept) {
         this.addMutualFriend(userId, req.fromUserId);
-        await this.persist();
+        await this.persist(userId, req.fromUserId);
         this.syncUser(userId);
         this.syncUser(req.fromUserId);
         safeSend(ws, {
@@ -694,7 +766,7 @@ export class SocialHub {
       const friendUserId = normalizeUserId(msg.friendUserId);
       if (!friendUserId) return;
       this.removeMutualFriend(userId, friendUserId);
-      await this.persist();
+      await this.persist(userId, friendUserId);
       this.syncUser(userId);
       this.syncUser(friendUserId);
       safeSend(ws, { type: "notice", level: "info", message: "Amigo eliminado." });

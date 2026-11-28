@@ -1,7 +1,7 @@
 // Playzi Watch Party HTTP Relay on Vercel Serverless Functions.
 // Bridges host and guest JSON control/sync messages via a lightweight per-room queue.
 
-import { hashSecret, kvGetJson, kvSetJson, setCors, timingSafeEqualStr } from "../lib/store.js";
+import { hashSecret, kvCasJson, kvGetWithRaw, setCors, timingSafeEqualStr } from "../lib/store.js";
 
 const ROOM_TTL_SECS = 120; // 2 min idle expiry (refreshed on every host_poll)
 const GUEST_STALE_MS = 25_000;
@@ -52,10 +52,14 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const code = String(body.room || req.query?.room || "").trim().toUpperCase();
     if (!code) return res.status(400).json({ error: "Missing room code" });
+    if (!SAFE_KEY_RE.test(code)) return res.status(400).json({ error: "Invalid room code" });
 
     const action = String(body.action || "").trim();
     const key = roomKey(code);
-    const room = (await kvGetJson(key, null)) || emptyRoom(code);
+    const MAX_CAS_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
+    const { value: loadedRoom, raw: roomRaw } = await kvGetWithRaw(key, null);
+    const room = loadedRoom || emptyRoom(code);
     pruneGuests(room);
 
     if (action === "host_poll" || action === "host_send" || action === "host_close") {
@@ -95,7 +99,10 @@ export default async function handler(req, res) {
             }
           }
         }
-        await kvSetJson(key, room, ROOM_TTL_SECS);
+        if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+          if (attempt + 1 < MAX_CAS_RETRIES) continue;
+          return res.status(409).json({ error: "Concurrent room update conflict" });
+        }
         return res.status(200).json({
           ok: true,
           seq: room.seq,
@@ -124,7 +131,10 @@ export default async function handler(req, res) {
             }
           }
         }
-        await kvSetJson(key, room, ROOM_TTL_SECS);
+        if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+          if (attempt + 1 < MAX_CAS_RETRIES) continue;
+          return res.status(409).json({ error: "Concurrent room update conflict" });
+        }
         return res.status(200).json({ ok: true, seq: room.seq });
       }
 
@@ -151,7 +161,10 @@ export default async function handler(req, res) {
           room.guestInboxes[cid].push({ seq: room.seq, payload: closePayload });
         }
         room.guests = {};
-        await kvSetJson(key, room, 60);
+        if (!(await kvCasJson(key, roomRaw, room, 60))) {
+          if (attempt + 1 < MAX_CAS_RETRIES) continue;
+          return res.status(409).json({ error: "Concurrent room update conflict" });
+        }
         return res.status(200).json({ ok: true, closed: true });
       }
     }
@@ -173,7 +186,10 @@ export default async function handler(req, res) {
       room.guestInboxes[connId] = [];
       room.seq += 1;
       room.hostInbox.push({ seq: room.seq, event: { relayOpen: connId } });
-      await kvSetJson(key, room, ROOM_TTL_SECS);
+      if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+        if (attempt + 1 < MAX_CAS_RETRIES) continue;
+        return res.status(409).json({ error: "Concurrent room update conflict" });
+      }
       return res.status(200).json({
         ok: true,
         connId,
@@ -192,7 +208,9 @@ export default async function handler(req, res) {
         if (connId && hasOwnSafeKey(room.guests, connId)) {
           delete room.guests[connId];
           delete room.guestInboxes[connId];
-          await kvSetJson(key, room, 60);
+          if (!(await kvCasJson(key, roomRaw, room, 60))) {
+            if (attempt + 1 < MAX_CAS_RETRIES) continue;
+          }
         }
         return res.status(200).json({
           ok: true,
@@ -218,7 +236,10 @@ export default async function handler(req, res) {
           },
         });
       }
-      await kvSetJson(key, room, ROOM_TTL_SECS);
+      if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+        if (attempt + 1 < MAX_CAS_RETRIES) continue;
+        return res.status(409).json({ error: "Concurrent room update conflict" });
+      }
       return res.status(200).json({
         ok: true,
         roomClosed: false,
@@ -239,7 +260,10 @@ export default async function handler(req, res) {
         seq: room.seq,
         event: { relayFrom: connId, payload },
       });
-      await kvSetJson(key, room, ROOM_TTL_SECS);
+      if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+        if (attempt + 1 < MAX_CAS_RETRIES) continue;
+        return res.status(409).json({ error: "Concurrent room update conflict" });
+      }
       return res.status(200).json({ ok: true, seq: room.seq });
     }
 
@@ -250,12 +274,17 @@ export default async function handler(req, res) {
         delete room.guestInboxes[connId];
         room.seq += 1;
         room.hostInbox.push({ seq: room.seq, event: { relayClose: connId } });
-        await kvSetJson(key, room, ROOM_TTL_SECS);
+        if (!(await kvCasJson(key, roomRaw, room, ROOM_TTL_SECS))) {
+          if (attempt + 1 < MAX_CAS_RETRIES) continue;
+          return res.status(409).json({ error: "Concurrent room update conflict" });
+        }
       }
       return res.status(200).json({ ok: true });
     }
 
     return res.status(400).json({ error: `Unsupported action: ${action}` });
+    }
+    return res.status(409).json({ error: "Concurrent room update conflict" });
   } catch (err) {
     return res.status(500).json({ error: String(err?.message || err) });
   }

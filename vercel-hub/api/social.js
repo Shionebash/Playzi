@@ -3,8 +3,9 @@
 
 import {
   hashSecret,
+  kvCasJson,
   kvDel,
-  kvGetJson,
+  kvGetWithRaw,
   kvMGetJson,
   kvSetJson,
   normalizeUserId,
@@ -293,13 +294,23 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const uid = normalizeUserId(body.userId);
     if (!uid) return res.status(400).json({ error: "Missing userId" });
+    if (!SAFE_KEY_RE.test(uid)) return res.status(400).json({ error: "Invalid userId" });
 
     const now = Date.now();
     const action = String(body.action || body.type || "sync").trim();
     const msg = body.payload || body;
     const isDisconnect = action === "disconnect" || action === "client_disconnect" || action === "offline";
 
-    const st = (await kvGetJson(STATE_KEY, null)) || emptySocialState();
+    const rawAuthToken = String(req.headers["x-playzi-auth"] || body.authToken || "").trim();
+    if (rawAuthToken.length < 16) {
+      return res.status(401).json({ error: "Missing or invalid authToken" });
+    }
+    const tokenHash = await hashSecret(rawAuthToken);
+
+    const MAX_CAS_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt += 1) {
+    const { value: loadedState, raw: stateRaw } = await kvGetWithRaw(STATE_KEY, null);
+    const st = loadedState || emptySocialState();
     if (!st.profiles) st.profiles = {};
     if (!st.authTokens) st.authTokens = {};
     if (!st.friends) st.friends = {};
@@ -311,11 +322,6 @@ export default async function handler(req, res) {
 
     let stateDirty = false;
 
-    const rawAuthToken = String(req.headers["x-playzi-auth"] || body.authToken || "").trim();
-    if (rawAuthToken.length < 16) {
-      return res.status(401).json({ error: "Missing or invalid authToken" });
-    }
-    const tokenHash = await hashSecret(rawAuthToken);
     if (hasOwnSafeKey(st.authTokens, uid)) {
       if (!timingSafeEqualStr(st.authTokens[uid], tokenHash)) {
         return res.status(403).json({ error: "Invalid authToken for userId" });
@@ -359,7 +365,8 @@ export default async function handler(req, res) {
         }
       }
       if (stateDirty) {
-        await kvSetJson(STATE_KEY, st);
+        const committed = await kvCasJson(STATE_KEY, stateRaw, st);
+        if (!committed && attempt + 1 < MAX_CAS_RETRIES) continue;
       }
       return res.status(200).json({ ok: true });
     }
@@ -451,7 +458,7 @@ export default async function handler(req, res) {
         }
       }
     } else if (action === "friend_request_respond" || action === "friend_request_accept" || action === "friend_request_decline") {
-      const reqItem = st.friendRequests[msg.requestId];
+      const reqItem = hasOwnSafeKey(st.friendRequests, msg.requestId) ? st.friendRequests[msg.requestId] : null;
       const accept = action === "friend_request_accept"
         ? true
         : action === "friend_request_decline"
@@ -478,7 +485,7 @@ export default async function handler(req, res) {
         stateDirty = true;
       }
     } else if (action === "friend_request_cancel") {
-      const reqItem = st.friendRequests[msg.requestId];
+      const reqItem = hasOwnSafeKey(st.friendRequests, msg.requestId) ? st.friendRequests[msg.requestId] : null;
       if (reqItem && (reqItem.toUserId === uid || reqItem.fromUserId === uid)) {
         delete st.friendRequests[reqItem.id];
         notice = { level: "info", message: "Solicitud cancelada." };
@@ -632,7 +639,8 @@ export default async function handler(req, res) {
     }
 
     if (stateDirty) {
-      await kvSetJson(STATE_KEY, st);
+      const committed = await kvCasJson(STATE_KEY, stateRaw, st);
+      if (!committed && attempt + 1 < MAX_CAS_RETRIES) continue;
     }
 
     return res.status(200).json({
@@ -641,6 +649,8 @@ export default async function handler(req, res) {
       events,
       notice,
     });
+    }
+    return res.status(409).json({ error: "Concurrent social state update conflict, please retry" });
   } catch (err) {
     return res.status(500).json({ error: String(err?.message || err) });
   }

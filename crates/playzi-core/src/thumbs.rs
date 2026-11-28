@@ -6,8 +6,11 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use uuid::Uuid;
 
 use crate::error::{CoreError, Result};
+
+const MAX_THUMB_BYTES: usize = 10 * 1024 * 1024;
 
 pub const DEFAULT_THUMB_TTL_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_THUMB_MAX_FILES: usize = 500;
@@ -76,6 +79,16 @@ impl ThumbnailCache {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
             .pool_max_idle_per_host(10)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many thumbnail redirects");
+                }
+                let host = attempt.url().host_str().unwrap_or("");
+                if attempt.url().scheme() != "https" || !is_allowed_thumbnail_host(host) {
+                    return attempt.error("redirect to disallowed thumbnail host");
+                }
+                attempt.follow()
+            }))
             .build()?;
 
         Ok(Self {
@@ -125,9 +138,13 @@ impl ThumbnailCache {
             trimmed.to_string()
         };
 
-        let parsed = Url::parse(&normalized)?;
+        let mut parsed = Url::parse(&normalized)?;
         match parsed.scheme() {
-            "http" | "https" => {}
+            "https" => {}
+            "http" if self.allow_any_host => {}
+            "http" => {
+                let _ = parsed.set_scheme("https");
+            }
             _ => {
                 return Err(CoreError::Validation(
                     "Invalid thumbnail URL scheme (expected http or https)".into(),
@@ -144,7 +161,7 @@ impl ThumbnailCache {
             }
         }
 
-        Ok(normalized)
+        Ok(parsed.to_string())
     }
 
     pub fn cache_key(url: &str) -> String {
@@ -198,11 +215,31 @@ impl ThumbnailCache {
     /// Fetches a thumbnail from disk cache or downloads and persists it atomically.
     pub async fn get_or_fetch(&self, raw_url: &str) -> Result<CachedThumbnail> {
         let normalized = self.normalize_and_validate_url(raw_url)?;
-        if let Some(hit) = self.read_cached(&normalized)? {
+        let cache_for_read = self.clone();
+        let norm_for_read = normalized.clone();
+        if let Some(hit) = tokio::task::spawn_blocking(move || cache_for_read.read_cached(&norm_for_read))
+            .await
+            .map_err(|e| CoreError::External(format!("Thumbnail cache read task failed: {e}")))??
+        {
             return Ok(hit);
         }
 
-        let response = self.client.get(&normalized).send().await?.error_for_status()?;
+        let mut response = self.client.get(&normalized).send().await?.error_for_status()?;
+        if !self.allow_any_host {
+            let final_host = response.url().host_str().unwrap_or("");
+            if response.url().scheme() != "https" || !is_allowed_thumbnail_host(final_host) {
+                return Err(CoreError::Validation(format!(
+                    "Thumbnail redirect host not allowed: {final_host}"
+                )));
+            }
+        }
+        if let Some(cl) = response.content_length()
+            && cl as usize > MAX_THUMB_BYTES
+        {
+            return Err(CoreError::External(format!(
+                "Thumbnail too large ({cl} bytes)"
+            )));
+        }
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -210,27 +247,58 @@ impl ThumbnailCache {
             .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
             .filter(|ct| ct.starts_with("image/"))
             .unwrap_or_else(|| "image/jpeg".to_string());
-        let bytes = response.bytes().await?.to_vec();
 
-        let key = Self::cache_key(&normalized);
-        let data_path = self.data_path(&key);
-        let meta_path = self.meta_path(&key);
-        fs::create_dir_all(&self.cache_dir)?;
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .map(|n| (n as usize).min(MAX_THUMB_BYTES))
+                .unwrap_or(0),
+        );
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_THUMB_BYTES {
+                return Err(CoreError::External(
+                    "Thumbnail exceeded maximum allowed size".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
-        let data_tmp = self.cache_dir.join(format!("{key}.img.tmp"));
-        fs::write(&data_tmp, &bytes)?;
-        fs::rename(&data_tmp, &data_path)?;
+        let cache_for_write = self.clone();
+        let bytes_for_write = bytes.clone();
+        let ct_for_write = content_type.clone();
+        let data_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            let key = Self::cache_key(&normalized);
+            let data_path = cache_for_write.data_path(&key);
+            let meta_path = cache_for_write.meta_path(&key);
+            fs::create_dir_all(&cache_for_write.cache_dir)?;
 
-        let meta = ThumbMeta {
-            url: normalized,
-            content_type: content_type.clone(),
-            cached_at: now_unix_secs(),
-        };
-        let meta_tmp = self.cache_dir.join(format!("{key}.meta.json.tmp"));
-        fs::write(&meta_tmp, serde_json::to_vec(&meta)?)?;
-        fs::rename(&meta_tmp, &meta_path)?;
+            let suffix = Uuid::new_v4();
+            let data_tmp = cache_for_write
+                .cache_dir
+                .join(format!("{key}.{suffix}.img.tmp"));
+            fs::write(&data_tmp, &bytes_for_write)?;
+            if fs::rename(&data_tmp, &data_path).is_err() {
+                let _ = fs::remove_file(&data_tmp);
+            }
 
-        let _ = self.prune_excess();
+            let meta = ThumbMeta {
+                url: normalized,
+                content_type: ct_for_write,
+                cached_at: now_unix_secs(),
+            };
+            let meta_tmp = cache_for_write
+                .cache_dir
+                .join(format!("{key}.{suffix}.meta.json.tmp"));
+            fs::write(&meta_tmp, serde_json::to_vec(&meta)?)?;
+            if fs::rename(&meta_tmp, &meta_path).is_err() {
+                let _ = fs::remove_file(&meta_tmp);
+            }
+
+            let _ = cache_for_write.prune_excess();
+            Ok(data_path)
+        })
+        .await
+        .map_err(|e| CoreError::External(format!("Thumbnail cache write task failed: {e}")))??;
 
         Ok(CachedThumbnail {
             bytes,

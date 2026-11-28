@@ -126,7 +126,7 @@ impl AppRuntime {
             "musicAuthState": s.music_auth_state,
             "musicAccountName": s.music_account_name,
             "syncStatus": s.sync_status,
-            "userProfile": user_profile,
+            "userProfile": user_profile.public_json(),
             "friends": friends,
         }))
     }

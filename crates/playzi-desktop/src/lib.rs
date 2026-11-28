@@ -138,13 +138,19 @@ pub fn run() {
                                 &meta,
                             )
                             .into_bytes();
+                            let body_len = body.len().to_string();
+                            let resp_body = if method == tauri::http::Method::HEAD {
+                                Vec::new()
+                            } else {
+                                body
+                            };
                             let resp = tauri::http::Response::builder()
                                 .status(200)
                                 .header("Content-Type", "application/vnd.apple.mpegurl")
-                                .header("Content-Length", body.len().to_string())
+                                .header("Content-Length", body_len)
                                 .header("Access-Control-Allow-Origin", allowed_webview_origin())
                                 .header("Access-Control-Allow-Headers", "Range, Content-Type")
-                                .body(body)
+                                .body(resp_body)
                                 .unwrap();
                             responder.respond(resp);
                         }
@@ -185,18 +191,137 @@ pub fn run() {
                     {
                         Ok(mpd_xml) => {
                             let body = mpd_xml.into_bytes();
+                            let body_len = body.len().to_string();
+                            let resp_body = if method == tauri::http::Method::HEAD {
+                                Vec::new()
+                            } else {
+                                body
+                            };
                             let resp = tauri::http::Response::builder()
                                 .status(200)
                                 .header("Content-Type", "application/dash+xml")
-                                .header("Content-Length", body.len().to_string())
+                                .header("Content-Length", body_len)
                                 .header("Access-Control-Allow-Origin", allowed_webview_origin())
                                 .header("Access-Control-Allow-Headers", "Range, Content-Type")
-                                .body(body)
+                                .body(resp_body)
                                 .unwrap();
                             responder.respond(resp);
                         }
                         Err(err) => {
                             eprintln!("[playzi-stream] manifest.mpd error: {err}");
+                            let resp = tauri::http::Response::builder()
+                                .status(502)
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                                .body(err.to_string().into_bytes())
+                                .unwrap();
+                            responder.respond(resp);
+                        }
+                    }
+                    return;
+                }
+
+                if let Some(u) = parsed_req.as_ref().filter(|u| u.path() == "/yt-stream") {
+                    let vid = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "v")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let itag = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "itag")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    if vid.is_empty() || itag.is_empty() {
+                        let resp = tauri::http::Response::builder()
+                            .status(400)
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                            .body(b"missing v or itag parameter".to_vec())
+                            .unwrap();
+                        responder.respond(resp);
+                        return;
+                    }
+                    let watch_url = format!("https://www.youtube.com/watch?v={vid}");
+                    let mut entry = player.resolve_yt_stream_entry(&vid, &itag);
+                    if entry.is_none() {
+                        // Prefer upgrading directly via yt-dlp on mid-playback cache miss/expiry
+                        // instead of re-injecting an unverified InnerTube IOS URL.
+                        let _ = player.ensure_yt_stream_upgraded(&vid, &watch_url).await;
+                        entry = player.resolve_yt_stream_entry(&vid, &itag);
+                        if entry.is_none() {
+                            let _ = player.resolve_stream(&watch_url, None, false).await;
+                            entry = player.resolve_yt_stream_entry(&vid, &itag);
+                        }
+                    }
+                    let Some(entry) = entry else {
+                        let resp = tauri::http::Response::builder()
+                            .status(404)
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                            .body(b"stream entry not found".to_vec())
+                            .unwrap();
+                        responder.respond(resp);
+                        return;
+                    };
+
+                    let mut proxied_res = playzi_core::player::fetch_proxied_stream(
+                        &client,
+                        &entry.url,
+                        range_header.as_deref(),
+                        &proxy_prefix,
+                    )
+                    .await;
+
+                    if let Ok(ref proxied) = proxied_res
+                        && matches!(proxied.status, 403 | 410)
+                        && entry.can_refresh_on_403()
+                    {
+                        if player.ensure_yt_stream_upgraded(&vid, &watch_url).await.is_ok()
+                            && let Some(upgraded_entry) = player.resolve_yt_stream_entry(&vid, &itag)
+                            && upgraded_entry.url != entry.url
+                        {
+                            proxied_res = playzi_core::player::fetch_proxied_stream(
+                                &client,
+                                &upgraded_entry.url,
+                                range_header.as_deref(),
+                                &proxy_prefix,
+                            )
+                            .await;
+                        }
+                    }
+
+                    match proxied_res {
+                        Ok(proxied) => {
+                            if proxied.status >= 400 {
+                                eprintln!(
+                                    "[playzi-stream] yt-stream HTTP {} for {} itag={}",
+                                    proxied.status, vid, itag
+                                );
+                            }
+                            let mut builder = tauri::http::Response::builder()
+                                .status(proxied.status)
+                                .header("Content-Type", proxied.content_type)
+                                .header("Content-Length", proxied.bytes.len().to_string())
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                                .header("Access-Control-Allow-Headers", "Range, Content-Type")
+                                .header(
+                                    "Access-Control-Expose-Headers",
+                                    "Content-Length, Content-Range, Accept-Ranges",
+                                );
+                            if let Some(cr) = proxied.content_range {
+                                builder = builder.header("Content-Range", cr);
+                            }
+                            if let Some(ar) = proxied.accept_ranges {
+                                builder = builder.header("Accept-Ranges", ar);
+                            }
+                            let resp_body = if method == tauri::http::Method::HEAD {
+                                Vec::new()
+                            } else {
+                                proxied.bytes
+                            };
+                            let resp = builder.body(resp_body).unwrap();
+                            responder.respond(resp);
+                        }
+                        Err(err) => {
+                            eprintln!("[playzi-stream] yt-stream proxy error: {err}");
                             let resp = tauri::http::Response::builder()
                                 .status(502)
                                 .header("Access-Control-Allow-Origin", allowed_webview_origin())
@@ -259,7 +384,12 @@ pub fn run() {
                         if let Some(ar) = proxied.accept_ranges {
                             builder = builder.header("Accept-Ranges", ar);
                         }
-                        let resp = builder.body(proxied.bytes).unwrap();
+                        let resp_body = if method == tauri::http::Method::HEAD {
+                            Vec::new()
+                        } else {
+                            proxied.bytes
+                        };
+                        let resp = builder.body(resp_body).unwrap();
                         responder.respond(resp);
                     }
                     Err(err) => {
@@ -287,8 +417,14 @@ pub fn run() {
             let mut dl_rx = runtime.downloads.subscribe();
             let app_dl = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = dl_rx.recv().await {
-                    let _ = app_dl.emit("download-progress", &ev);
+                loop {
+                    match dl_rx.recv().await {
+                        Ok(ev) => {
+                            let _ = app_dl.emit("download-progress", &ev);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
 
@@ -296,8 +432,14 @@ pub fn run() {
             let mut sync_rx = runtime.autosync.subscribe();
             let app_sync = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = sync_rx.recv().await {
-                    let _ = app_sync.emit("sync-status", &ev);
+                loop {
+                    match sync_rx.recv().await {
+                        Ok(ev) => {
+                            let _ = app_sync.emit("sync-status", &ev);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
 
@@ -312,7 +454,12 @@ pub fn run() {
             let app_player = app.handle().clone();
             let discord_for_player = runtime.discord.clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = player_rx.recv().await {
+                loop {
+                    let ev = match player_rx.recv().await {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     if let Some(mc) = os_media.as_mut() {
                         mc.sync_state(&ev.state);
                     }
@@ -340,7 +487,12 @@ pub fn run() {
             let social_for_party = runtime.social.clone();
             let discord_for_party = runtime.discord.clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = party_rx.recv().await {
+                loop {
+                    let ev = match party_rx.recv().await {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     match ev {
                         playzi_core::party::PartyEvent::State { snapshot } => {
                             let _ = app_party.emit("party-state", &snapshot);
@@ -386,7 +538,12 @@ pub fn run() {
             let party_for_discord = runtime.party.clone();
             let social_for_discord = runtime.social.clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = discord_rx.recv().await {
+                loop {
+                    let ev = match discord_rx.recv().await {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     match ev {
                         playzi_core::discord::DiscordEvent::State { snapshot } => {
                             let _ = app_discord.emit("discord-state", &snapshot);
@@ -441,7 +598,12 @@ pub fn run() {
             let party_for_social = runtime.party.clone();
             let social_for_join = runtime.social.clone();
             tauri::async_runtime::spawn(async move {
-                while let Ok(ev) = social_rx.recv().await {
+                loop {
+                    let ev = match social_rx.recv().await {
+                        Ok(ev) => ev,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     match ev {
                         playzi_core::social::SocialEvent::State { snapshot } => {
                             let _ = app_social.emit("social-state", &snapshot);

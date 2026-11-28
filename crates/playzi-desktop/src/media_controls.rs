@@ -93,7 +93,7 @@ impl OsMediaControls {
             return;
         }
 
-        let duration = if state.duration_secs > 0.0 {
+        let duration = if state.duration_secs.is_finite() && state.duration_secs > 0.0 {
             Some(Duration::from_secs_f64(state.duration_secs))
         } else {
             None
@@ -112,9 +112,12 @@ impl OsMediaControls {
             duration,
         });
 
-        let progress = Some(MediaPosition(Duration::from_secs_f64(
-            state.position_secs.max(0.0),
-        )));
+        let pos_secs = if state.position_secs.is_finite() {
+            state.position_secs.max(0.0)
+        } else {
+            0.0
+        };
+        let progress = Some(MediaPosition(Duration::from_secs_f64(pos_secs)));
         let playback = if state.paused {
             MediaPlayback::Paused { progress }
         } else {

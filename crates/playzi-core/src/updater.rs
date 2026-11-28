@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use url::Url;
+use uuid::Uuid;
 
 use crate::error::{CoreError, Result};
 
@@ -49,6 +52,8 @@ pub struct ReleaseInfo {
     pub asset_name: String,
     pub download_url: String,
     pub asset_size: u64,
+    #[serde(default)]
+    pub sha256_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,11 +64,43 @@ pub struct UpdateCheckResult {
     pub release: Option<ReleaseInfo>,
 }
 
+pub fn is_valid_github_repo(repo: &str) -> bool {
+    let mut parts = repo.trim().split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let valid_seg = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s != "."
+            && s != ".."
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    valid_seg(owner) && valid_seg(name)
+}
+
+pub fn is_allowed_update_download_url(raw_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+    host == "github.com"
+        || host == "api.github.com"
+        || host == "githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
 pub fn configured_repo() -> String {
     std::env::var("PLAYZI_UPDATE_REPO")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| is_valid_github_repo(s))
         .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string())
 }
 
@@ -157,6 +194,15 @@ fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .default_headers(headers)
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            if !is_allowed_update_download_url(attempt.url().as_str()) {
+                return attempt.error("redirect to disallowed update host");
+            }
+            attempt.follow()
+        }))
         .build()
         .map_err(CoreError::from)
 }
@@ -165,6 +211,11 @@ pub async fn check_latest_release(
     repo: &str,
     current_version: &str,
 ) -> Result<UpdateCheckResult> {
+    if !is_valid_github_repo(repo) {
+        return Err(CoreError::Validation(format!(
+            "Invalid GitHub update repository: {repo}"
+        )));
+    }
     let client = build_http_client(Duration::from_secs(20))?;
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = client.get(&url).send().await?;
@@ -216,6 +267,20 @@ pub async fn check_latest_release(
         ))
     })?;
 
+    if !is_allowed_update_download_url(&asset.browser_download_url) {
+        return Err(CoreError::Validation(
+            "Release asset download URL is not on an allowed GitHub HTTPS host".into(),
+        ));
+    }
+
+    let expected_sha_name = format!("{}.sha256", asset.name).to_ascii_lowercase();
+    let sha256_url = release
+        .assets
+        .iter()
+        .find(|a| a.name.to_ascii_lowercase() == expected_sha_name)
+        .map(|a| a.browser_download_url.clone())
+        .filter(|u| is_allowed_update_download_url(u));
+
     Ok(UpdateCheckResult {
         current_version: normalize_version(current_version),
         update_available: true,
@@ -229,6 +294,7 @@ pub async fn check_latest_release(
             asset_name: asset.name.clone(),
             download_url: asset.browser_download_url.clone(),
             asset_size: asset.size,
+            sha256_url,
         }),
     })
 }
@@ -251,6 +317,65 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+fn resolve_updates_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let trimmed = local_app_data.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("Playzi").join("updates");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
+        let trimmed = xdg_cache.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("playzi").join("updates");
+        }
+    }
+    std::env::temp_dir().join(format!("playzi-updates-{}", std::process::id()))
+}
+
+pub async fn verify_asset_sha256(file_path: &Path, sha256_url: &str) -> Result<()> {
+    if !is_allowed_update_download_url(sha256_url) {
+        return Err(CoreError::Validation(
+            "Update checksum URL is not on an allowed GitHub HTTPS host".into(),
+        ));
+    }
+    let client = build_http_client(Duration::from_secs(30))?;
+    let resp = client.get(sha256_url).send().await?;
+    if !resp.status().is_success() {
+        return Err(CoreError::External(format!(
+            "Failed to download update SHA-256 checksum (HTTP {})",
+            resp.status()
+        )));
+    }
+    let text = resp.text().await?;
+    let expected = text
+        .split_whitespace()
+        .next()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| CoreError::External("Invalid SHA-256 checksum format in release asset".into()))?;
+
+    let path = file_path.to_path_buf();
+    let actual = tokio::task::spawn_blocking(move || -> Result<String> {
+        let bytes = std::fs::read(&path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Ok(hex::encode(hasher.finalize()))
+    })
+    .await
+    .map_err(|e| CoreError::External(format!("Checksum task failed: {e}")))??;
+
+    if actual != expected {
+        let _ = tokio::fs::remove_file(file_path).await;
+        return Err(CoreError::External(format!(
+            "Update installer SHA-256 mismatch (expected {expected}, got {actual})"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn download_release_asset<F>(
     download_url: &str,
     asset_name: &str,
@@ -260,6 +385,11 @@ pub async fn download_release_asset<F>(
 where
     F: FnMut(u64, u64, f64),
 {
+    if !is_allowed_update_download_url(download_url) {
+        return Err(CoreError::Validation(
+            "Update download URL is not on an allowed GitHub HTTPS host".into(),
+        ));
+    }
     let client = build_http_client(Duration::from_secs(600))?;
     let mut resp = client
         .get(download_url)
@@ -275,12 +405,12 @@ where
     }
 
     let total_bytes = resp.content_length().unwrap_or(expected_size);
-    let updates_dir = std::env::temp_dir().join("playzi-updates");
+    let updates_dir = resolve_updates_dir();
     tokio::fs::create_dir_all(&updates_dir).await?;
 
     let safe_name = sanitize_filename(asset_name);
     let final_path = updates_dir.join(&safe_name);
-    let part_path = updates_dir.join(format!("{safe_name}.part"));
+    let part_path = updates_dir.join(format!("{safe_name}.{}.part", Uuid::new_v4()));
 
     let mut file = tokio::fs::File::create(&part_path).await?;
     let mut downloaded: u64 = 0;
@@ -298,6 +428,13 @@ where
 
     file.flush().await?;
     drop(file);
+
+    if expected_size > 0 && downloaded != expected_size {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Err(CoreError::External(format!(
+            "Downloaded update size mismatch (expected {expected_size} bytes, got {downloaded} bytes)"
+        )));
+    }
 
     if final_path.exists() {
         let _ = tokio::fs::remove_file(&final_path).await;
@@ -573,5 +710,26 @@ mod tests {
         assert!(script.contains("'msiexec.exe'"));
         assert!(script.contains(r##"'"C:\Users\My User\AppData\Local\Temp\Playzi_1.0.4_x64.msi"'"##));
         assert!(script.contains("'/norestart'"));
+    }
+
+    #[test]
+    fn validates_github_repo_and_download_urls() {
+        assert!(is_valid_github_repo("Shionebash/Playzi"));
+        assert!(!is_valid_github_repo("Shionebash/Playzi/extra"));
+        assert!(!is_valid_github_repo("../evil"));
+        assert!(!is_valid_github_repo("owner/repo?foo=bar"));
+
+        assert!(is_allowed_update_download_url(
+            "https://github.com/Shionebash/Playzi/releases/download/v1.2.15/Playzi.exe"
+        ));
+        assert!(is_allowed_update_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/123"
+        ));
+        assert!(!is_allowed_update_download_url(
+            "http://github.com/Shionebash/Playzi/releases/download/v1.2.15/Playzi.exe"
+        ));
+        assert!(!is_allowed_update_download_url(
+            "https://evil.example.com/github.com/Playzi.exe"
+        ));
     }
 }

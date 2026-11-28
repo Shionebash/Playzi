@@ -2125,7 +2125,7 @@ function historyCard(item) {
         ${canPlay ? `<button class="btn btn-primary" type="button" data-history-play="${escapeHtml(url)}" data-history-title="${escapeHtml(item.title || "")}">▶ Reproducir</button>` : ""}
         ${isRemoteUrl ? `<button class="btn btn-ghost" type="button" data-download-history="audio" data-history-id="${escapeHtml(item.id)}">Audio</button>` : ""}
         ${isRemoteUrl ? `<button class="btn btn-ghost" type="button" data-add-history-playlist="${escapeHtml(item.id)}">+ Lista</button>` : ""}
-        ${isRemoteUrl ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank">Abrir</a>` : ""}
+        ${isRemoteUrl ? `<a class="btn btn-ghost" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">Abrir</a>` : ""}
         <button class="btn btn-danger" type="button" data-delete-history="${escapeHtml(item.id)}">Eliminar</button>
       </div>
     </div>
@@ -3261,6 +3261,59 @@ function _applySavedVolumeToVideo(player, videoEl = null) {
   }
 }
 
+let _musicStallWatchdog = null;
+let _musicStallAnchorTime = null;
+
+function _clearMusicStallWatchdog() {
+  if (_musicStallWatchdog) {
+    clearTimeout(_musicStallWatchdog);
+    _musicStallWatchdog = null;
+  }
+  _musicStallAnchorTime = null;
+}
+
+function _onMusicTimeProgress(currentTime) {
+  if (_musicStallWatchdog && _musicStallAnchorTime !== null && Math.abs(currentTime - _musicStallAnchorTime) > 0.2) {
+    _setMusicBuffering(false);
+  }
+}
+
+function _setMusicBuffering(active) {
+  state.player.buffering = Boolean(active);
+  const btn = $("#musicPlayPause");
+  if (btn) {
+    btn.classList.toggle("is-buffering", Boolean(active));
+    btn.setAttribute("aria-busy", active ? "true" : "false");
+  }
+  if (!active) {
+    _clearMusicStallWatchdog();
+  }
+}
+
+function _armMusicStallWatchdog(getCurrentTime, isPaused) {
+  if (!IS_TAURI || _musicStallWatchdog) return;
+  _musicStallAnchorTime = Number(getCurrentTime() || 0);
+  _musicStallWatchdog = setTimeout(() => {
+    const anchor = _musicStallAnchorTime;
+    _musicStallWatchdog = null;
+    _musicStallAnchorTime = null;
+    if (state.player.loading || isPaused()) return;
+    const nowTime = Number(getCurrentTime() || 0);
+    if (anchor !== null && Math.abs(nowTime - anchor) > 0.2) return;
+    const curUrl = state.player.current?.url || "";
+    const recoverKey = `audio|${curUrl}`;
+    if (curUrl && isUrl(curUrl) && state.player._autoRecoverKey !== recoverKey) {
+      state.player._autoRecoverKey = recoverKey;
+      toast("Reconectando stream de audio...");
+      loadWebPlayerItem(state.player.index, {
+        forceRefresh: true,
+        isAutoRecovery: true,
+        resumeTime: Number.isFinite(nowTime) && nowTime > 1 ? nowTime : 0,
+      });
+    }
+  }, 15000);
+}
+
 function _setupMusicListeners(sig) {
   const audio = $("#webPlayerAudio");
   if (!audio) return;
@@ -3296,6 +3349,7 @@ function _setupMusicListeners(sig) {
     const cur = $("#musicCurrent");
     if (fill && audio.duration) fill.style.width = `${(audio.currentTime / audio.duration) * 100}%`;
     if (cur) cur.textContent = _formatTime(audio.currentTime);
+    _onMusicTimeProgress(audio.currentTime);
     _maybePrefetchNextItem(audio.currentTime);
   }, sig);
 
@@ -3309,6 +3363,28 @@ function _setupMusicListeners(sig) {
     if (dur) dur.textContent = _formatTime(audio.duration);
   }, sig);
 
+  audio.addEventListener("waiting", () => {
+    if (!audio.paused) {
+      _setMusicBuffering(true);
+      _armMusicStallWatchdog(() => audio.currentTime, () => audio.paused);
+    }
+  }, sig);
+
+  audio.addEventListener("stalled", () => {
+    if (!audio.paused) {
+      _setMusicBuffering(true);
+      _armMusicStallWatchdog(() => audio.currentTime, () => audio.paused);
+    }
+  }, sig);
+
+  audio.addEventListener("playing", () => {
+    _setMusicBuffering(false);
+  }, sig);
+
+  audio.addEventListener("canplay", () => {
+    _setMusicBuffering(false);
+  }, sig);
+
   audio.addEventListener("play", () => {
     const btn = $("#musicPlayPause");
     if (btn) btn.innerHTML = PLAYER_ICONS.pause(23);
@@ -3317,10 +3393,15 @@ function _setupMusicListeners(sig) {
   }, sig);
 
   audio.addEventListener("pause", () => {
+    _setMusicBuffering(false);
     const btn = $("#musicPlayPause");
     if (btn) btn.innerHTML = PLAYER_ICONS.play(23);
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
     _onLocalMediaEvent("pause");
+  }, sig);
+
+  audio.addEventListener("ended", () => {
+    _setMusicBuffering(false);
   }, sig);
 
   audio.addEventListener("seeked", () => {
@@ -3601,9 +3682,13 @@ async function _onTrackEnded() {
 }
 
 function _extractVideoIdFromUrl(url) {
-  const m = String(url || "").match(/[?&]v=([A-Za-z0-9_-]{11})/)
-    || String(url || "").match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
-  return m ? m[1] : "";
+  const s = String(url || "");
+  const m = s.match(/[?&]v=([A-Za-z0-9_-]{11})/)
+    || s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+  if (m) return m[1];
+  const rd = s.match(/[?&]list=RD([A-Za-z0-9_-]{11})(?:[&#]|$)/);
+  if (rd && !/^(MM|EM|QM|CL|AM)/.test(rd[1])) return rd[1];
+  return "";
 }
 
 function _isExpandablePlaylistOrMix(item) {
@@ -3771,21 +3856,36 @@ function _updateMediaSession() {
 
 async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   const singleItem = queue.length === 1 ? queue[0] : null;
+  let deferredMixItem = null;
+  let deferredMixSeedVid = "";
   if (singleItem && _isExpandablePlaylistOrMix(singleItem)) {
-    toast("Cargando cola...");
-    try {
-      const seedVid = _extractVideoIdFromUrl(singleItem.url);
-      const resolved = await _resolvePlaylistOrMixItems(singleItem);
-      queue = resolved;
-      if (seedVid) {
-        const matchIdx = queue.findIndex((it) => _extractVideoIdFromUrl(it.url) === seedVid);
-        index = matchIdx >= 0 ? matchIdx : 0;
-      } else {
-        index = 0;
+    const seedVid = _extractVideoIdFromUrl(singleItem.url);
+    // For Mixes with a known seed video (non-party), start playing the seed immediately
+    // and expand the rest of the Mix queue in parallel so playback never blocks on /playlist.
+    if (seedVid && !state.party?.active) {
+      deferredMixItem = singleItem;
+      deferredMixSeedVid = seedVid;
+      queue = [_itemToQueueEntry({
+        ...singleItem,
+        id: seedVid,
+        url: `https://www.youtube.com/watch?v=${seedVid}`,
+      })];
+      index = 0;
+    } else {
+      toast("Cargando cola...");
+      try {
+        const resolved = await _resolvePlaylistOrMixItems(singleItem);
+        queue = resolved;
+        if (seedVid) {
+          const matchIdx = queue.findIndex((it) => _extractVideoIdFromUrl(it.url) === seedVid);
+          index = matchIdx >= 0 ? matchIdx : 0;
+        } else {
+          index = 0;
+        }
+      } catch (err) {
+        toast(err.message);
+        return;
       }
-    } catch (err) {
-      toast(err.message);
-      return;
     }
   }
 
@@ -3839,6 +3939,22 @@ async function openWatchQueue(queue, index = 0, sourceContext = "search") {
   state.player.current = null;
   state.player.loading = true;
   setView("watch");
+  if (deferredMixItem && deferredMixSeedVid) {
+    const mixLoadToken = state.player._loadingId + 1;
+    _resolvePlaylistOrMixItems(deferredMixItem)
+      .then((resolved) => {
+        if (!Array.isArray(resolved) || !resolved.length) return;
+        const curVid = _extractVideoIdFromUrl(state.player.current?.url || state.player.queue?.[state.player.index]?.url || "");
+        if (curVid !== deferredMixSeedVid && state.player._loadingId !== mixLoadToken) return;
+        const currentEntry = state.player.queue[state.player.index] || resolved[0];
+        const rest = resolved.filter((it) => _extractVideoIdFromUrl(it.url) !== deferredMixSeedVid);
+        state.player.queue = [currentEntry, ...rest];
+        state.player.index = 0;
+        _updateWatchQueue();
+        _scheduleAddedQueuePrefetch();
+      })
+      .catch(() => {});
+  }
   await loadWebPlayerItem(index);
 }
 
@@ -4077,8 +4193,10 @@ function _getAudioEl() {
 }
 
 async function _loadMusicItem(item, loadId, opts = {}) {
+  const t0 = performance.now();
   const refreshParam = opts?.forceRefresh ? "&refresh=1" : "";
   const info = await api.get(`/api/player/audio?url=${encodeURIComponent(item.url)}${refreshParam}`);
+  const infoMs = Math.round(performance.now() - t0);
   if (state.player._loadingId !== loadId) return;
   const audio = _getAudioEl();
   if (!audio) return;
@@ -4086,9 +4204,15 @@ async function _loadMusicItem(item, loadId, opts = {}) {
   _setCurrentLoudnessDb(info.loudnessDb);
   _stopLoadingStatus();
   const rawSrc = info.streamUrl || info.proxyUrl || "";
-  const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist");
-  const proxiedSrc = streamProxyUrl(rawSrc);
-  if (IS_TAURI && isHls && window.videojs) {
+  const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
+  const isDashAudio = !isHls
+    && info.audio?.ext !== "webm"
+    && Boolean(info.audio?.initRange && info.audio?.indexRange);
+  const proxiedSrc = isDashAudio
+    ? streamDashProxyUrl(item.url, "audio")
+    : streamProxyUrl(rawSrc);
+  const vhsMimeType = isDashAudio ? "application/dash+xml" : "application/x-mpegURL";
+  if (IS_TAURI && (isHls || isDashAudio) && window.videojs) {
     if (!state.player.audioVjs || state.player.audioVjs.isDisposed()) {
       _applySavedVolumeToMusic();
       state.player.audioVjs = videojs("webPlayerAudio", {
@@ -4106,7 +4230,35 @@ async function _loadMusicItem(item, loadId, opts = {}) {
       state.player.audioVjs.on("loadedmetadata", () => {
         _applySavedVolumeToMusic();
       });
+      state.player.audioVjs.on("waiting", () => {
+        if (!state.player.audioVjs?.paused()) {
+          _setMusicBuffering(true);
+          _armMusicStallWatchdog(
+            () => state.player.audioVjs?.currentTime() || 0,
+            () => !state.player.audioVjs || state.player.audioVjs.isDisposed() || state.player.audioVjs.paused(),
+          );
+        }
+      });
+      state.player.audioVjs.on("stalled", () => {
+        if (!state.player.audioVjs?.paused()) {
+          _setMusicBuffering(true);
+          _armMusicStallWatchdog(
+            () => state.player.audioVjs?.currentTime() || 0,
+            () => !state.player.audioVjs || state.player.audioVjs.isDisposed() || state.player.audioVjs.paused(),
+          );
+        }
+      });
+      state.player.audioVjs.on("playing", () => {
+        _setMusicBuffering(false);
+      });
+      state.player.audioVjs.on("canplay", () => {
+        _setMusicBuffering(false);
+      });
+      state.player.audioVjs.on("pause", () => {
+        _setMusicBuffering(false);
+      });
       state.player.audioVjs.on("error", () => {
+        _setMusicBuffering(false);
         const err = state.player.audioVjs?.error();
         const curUrl = state.player.current?.url || "";
         const recoverKey = `audio|${curUrl}`;
@@ -4124,15 +4276,28 @@ async function _loadMusicItem(item, loadId, opts = {}) {
         const rawMsg = String(err?.message || "");
         const isVhsErr = /no available working or supported playlists|playback cannot continue/i.test(rawMsg);
         _updateWatchMeta(isVhsErr
-          ? "La playlist HLS de audio dejó de responder o expiró. Pulsa 'Reintentar'."
+          ? "El stream de audio dejó de responder o expiró. Pulsa 'Reintentar'."
           : (rawMsg || "Error al reproducir el audio."));
       });
       state.player.audioVjs.on("timeupdate", () => {
-        _maybePrefetchNextItem(state.player.audioVjs?.currentTime() || 0);
+        const ct = state.player.audioVjs?.currentTime() || 0;
+        _onMusicTimeProgress(ct);
+        _maybePrefetchNextItem(ct);
       });
     }
+    _setMusicBuffering(true);
     _applySavedVolumeToMusic();
-    state.player.audioVjs.src({ src: proxiedSrc, type: "application/x-mpegURL" });
+    state.player.audioVjs.src({ src: proxiedSrc, type: vhsMimeType });
+    let musicPerfLogged = false;
+    const logMusicPerf = () => {
+      if (musicPerfLogged || state.player._loadingId !== loadId) return;
+      musicPerfLogged = true;
+      console.info(
+        `[playzi-perf] music info=${infoMs}ms total=${Math.round(performance.now() - t0)}ms mode=${isDashAudio ? "dash" : "hls"} refresh=${Boolean(opts?.forceRefresh)}`
+      );
+    };
+    state.player.audioVjs.one("canplay", logMusicPerf);
+    state.player.audioVjs.one("playing", logMusicPerf);
     if (opts?.resumeTime > 1) {
       const targetTime = opts.resumeTime;
       state.player.audioVjs.one("canplay", () => {
@@ -4168,7 +4333,21 @@ async function _loadMusicItem(item, loadId, opts = {}) {
     }
     if (!targetAudio) return;
     targetAudio.onerror = () => {
+      if (state.player._loadingId !== loadId) return;
       const code = targetAudio.error?.code;
+      const curUrl = state.player.current?.url || "";
+      const recoverKey = `audio|${curUrl}`;
+      if (IS_TAURI && curUrl && isUrl(curUrl) && state.player._autoRecoverKey !== recoverKey) {
+        state.player._autoRecoverKey = recoverKey;
+        const resumeTime = Number(targetAudio.currentTime || 0);
+        toast("Reconectando stream de audio...");
+        loadWebPlayerItem(state.player.index, {
+          forceRefresh: true,
+          isAutoRecovery: true,
+          resumeTime: Number.isFinite(resumeTime) && resumeTime > 1 ? resumeTime : 0,
+        });
+        return;
+      }
       _updateWatchMeta(`Error de audio (código ${code || "?"}). Prueba con 'Abrir externo'.`);
     };
     _applySavedVolumeToMusic();
@@ -4187,7 +4366,7 @@ async function _loadMusicItem(item, loadId, opts = {}) {
 // (queuePrefetchCount & queuePrefetchDelaySecs). Newly added queue items wait 5 seconds
 // before being prefetched so accidentally queued items are not cached unnecessarily.
 const PREFETCH_DEFAULT_COUNT = 1;
-const PREFETCH_DEFAULT_DELAY_SECONDS = 30;
+const PREFETCH_DEFAULT_DELAY_SECONDS = 5;
 const PREFETCH_NEW_ITEM_GRACE_MS = 5000;
 const PREFETCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const PREFETCH_MAX_CONCURRENT = 2;
@@ -4389,7 +4568,9 @@ async function _loadVideoItem(item, loadId, opts = {}) {
   if (IS_TAURI) {
     // Load rich details (description, dates, chapters, captions, storyboards, comments) in parallel
     _loadVideoDetails(item, loadId);
+    const t0 = performance.now();
     const info = await api.get(`/api/player/info?url=${encodeURIComponent(item.url)}&quality=${quality}${refreshParam}`);
+    const infoMs = Math.round(performance.now() - t0);
     if (state.player._loadingId !== loadId) return;
     state.player.current = { ...item, ...(info.item || {}) };
     _setCurrentLoudnessDb(info.loudnessDb);
@@ -4435,6 +4616,9 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       const finishLoad = () => {
         if (state.player._loadingId !== loadId) return;
         if (state.player.loading) {
+          console.info(
+            `[playzi-perf] info=${infoMs}ms total=${Math.round(performance.now() - t0)}ms mode=${isDashPair ? "dash" : (isHls ? "hls" : "direct")} q=${info.video?.height || "?"}p refresh=${Boolean(opts?.forceRefresh)}`
+          );
           _stopLoadingStatus();
           _updateWatchMeta();
         }
@@ -4569,34 +4753,125 @@ async function ensureVideoPlayer() {
     _ambientStop();
     _onTrackEnded();
   });
-  player.on("timeupdate", () => {
-    const ct = player.currentTime();
-    _maybePrefetchNextItem(ct);
-    _updateCurrentChapterIndicator(player, ct);
-  });
   let _bufferPillTimer = null;
-  const _showBufferPill = () => {
-    if (state.player.loading) return;
+  let _videoStallWatchdog = null;
+  let _videoStallAnchorTime = null;
+  let _videoStallNudged = false;
+  let _stablePlayTimer = null;
+  const _clearStablePlayTimer = () => {
+    if (_stablePlayTimer) {
+      clearTimeout(_stablePlayTimer);
+      _stablePlayTimer = null;
+    }
+  };
+  const _armStablePlayReset = () => {
+    _clearStablePlayTimer();
+    if (!state.player._autoRecoverKey) return;
+    _stablePlayTimer = setTimeout(() => {
+      _stablePlayTimer = null;
+      if (!player.isDisposed() && !player.paused() && !state.player.loading) {
+        state.player._autoRecoverKey = "";
+      }
+    }, 15000);
+  };
+  const _hasForwardBuffer = (minSecs = 2.0) => {
+    try {
+      const ct = Number(player.currentTime() || 0);
+      const buf = player.buffered();
+      if (!buf || !buf.length) return false;
+      for (let i = 0; i < buf.length; i += 1) {
+        if (buf.start(i) <= ct + 0.25 && buf.end(i) - ct >= minSecs) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  };
+  const _clearVideoStallWatchdog = () => {
+    if (_videoStallWatchdog) {
+      clearTimeout(_videoStallWatchdog);
+      _videoStallWatchdog = null;
+    }
+    _videoStallAnchorTime = null;
+  };
+  const _armVideoStallWatchdog = (delayMs) => {
+    if (!IS_TAURI || _videoStallWatchdog) return;
+    _videoStallAnchorTime = Number(player.currentTime() || 0);
+    _videoStallWatchdog = setTimeout(() => {
+      const anchor = _videoStallAnchorTime;
+      _videoStallWatchdog = null;
+      _videoStallAnchorTime = null;
+      if (state.player.loading || player.isDisposed() || player.paused()) return;
+      const nowTime = Number(player.currentTime() || 0);
+      // Playback actually progressed while timer was armed; ignore stale waiting/stalled event.
+      if (anchor !== null && Math.abs(nowTime - anchor) > 0.2) {
+        _videoStallNudged = false;
+        return;
+      }
+      // Try one lightweight seek nudge before tearing down and reloading the whole player.
+      if (!_videoStallNudged && nowTime > 0.5) {
+        _videoStallNudged = true;
+        try {
+          player.currentTime(nowTime + 0.05);
+          player.play().catch(() => {});
+        } catch (_) {}
+        _armVideoStallWatchdog(8000);
+        return;
+      }
+      const curUrl = state.player.current?.url || "";
+      const recoverKey = `video|${curUrl}|${state.player.activeQuality || "best"}`;
+      if (curUrl && state.player._autoRecoverKey !== recoverKey) {
+        state.player._autoRecoverKey = recoverKey;
+        _videoStallNudged = false;
+        toast("Reconectando stream...");
+        loadWebPlayerItem(state.player.index, {
+          forceRefresh: true,
+          isAutoRecovery: true,
+          resumeTime: Number.isFinite(nowTime) && nowTime > 1 ? nowTime : 0,
+        });
+      }
+    }, delayMs);
+  };
+  const _showBufferPill = (isStalledEvent = false) => {
+    if (state.player.loading || player.isDisposed() || player.paused()) return;
+    // WebView2/MSE frequently fires `stalled` during normal DASH pacing while buffer is healthy.
+    if (isStalledEvent && _hasForwardBuffer(2.0)) return;
+    _clearStablePlayTimer();
     if (_bufferPillTimer) clearTimeout(_bufferPillTimer);
     _bufferPillTimer = setTimeout(() => {
       if (state.player.loading || player.isDisposed() || player.paused()) return;
       const pill = $("#webPlayerBufferPill");
       if (pill) pill.classList.remove("hidden");
     }, 450);
+    _armVideoStallWatchdog(16000);
   };
   const _hideBufferPill = () => {
     if (_bufferPillTimer) { clearTimeout(_bufferPillTimer); _bufferPillTimer = null; }
+    _clearVideoStallWatchdog();
     const pill = $("#webPlayerBufferPill");
     if (pill) pill.classList.add("hidden");
   };
-  player.on("waiting", _showBufferPill);
+  player.on("timeupdate", () => {
+    const ct = player.currentTime();
+    if (_videoStallWatchdog && _videoStallAnchorTime !== null && Math.abs(ct - _videoStallAnchorTime) > 0.2) {
+      _videoStallNudged = false;
+      _hideBufferPill();
+      _armStablePlayReset();
+    }
+    _maybePrefetchNextItem(ct);
+    _updateCurrentChapterIndicator(player, ct);
+  });
+  player.on("waiting", () => _showBufferPill(false));
+  player.on("stalled", () => _showBufferPill(true));
   player.on("play", () => {
     _resumeVideoAudioGraph(player);
     _onLocalMediaEvent("play");
     _syncAmbientState();
   });
   player.on("playing", () => {
+    _videoStallNudged = false;
     _hideBufferPill();
+    _armStablePlayReset();
     _ambientTickVideo(!_ambient.hasDrawnFrame);
     _syncAmbientState();
   });
@@ -4606,6 +4881,7 @@ async function ensureVideoPlayer() {
     _syncAmbientState();
   });
   player.on("pause", () => {
+    _clearStablePlayTimer();
     _hideBufferPill();
     _onLocalMediaEvent("pause");
     _syncAmbientState();
@@ -4616,6 +4892,9 @@ async function ensureVideoPlayer() {
   });
   player.on("ratechange", () => { _onLocalMediaEvent("ratechange"); });
   player.on("loadstart", () => {
+    _clearStablePlayTimer();
+    _videoStallNudged = false;
+    _hideBufferPill();
     _applySavedVolumeToVideo(player);
     _ambient.corsBlocked = false;
     _ambient.hasDrawnFrame = false;
