@@ -17,6 +17,7 @@ pub fn run() {
     let app_runtime = AppRuntime::initialize(root).expect("failed to initialize Playzi core runtime");
     let desktop_updater = DesktopUpdater::new();
     let thumbs_for_proto = app_runtime.thumbs.clone();
+    let player_for_proto = app_runtime.player.clone();
     let stream_client = playzi_core::player::build_stream_proxy_client()
         .expect("failed to initialize stream proxy HTTP client");
 
@@ -67,6 +68,7 @@ pub fn run() {
         })
         .register_asynchronous_uri_scheme_protocol("playzi-stream", move |_ctx, request, responder| {
             let client = stream_client.clone();
+            let player = player_for_proto.clone();
             let method = request.method().clone();
             let req_uri = request.uri().to_string();
             let range_header = request
@@ -151,6 +153,54 @@ pub fn run() {
                                 .status(400)
                                 .header("Access-Control-Allow-Origin", allowed_webview_origin())
                                 .body(b"missing v or a parameter".to_vec())
+                                .unwrap();
+                            responder.respond(resp);
+                        }
+                    }
+                    return;
+                }
+
+                if let Some(u) = parsed_req.as_ref().filter(|u| u.path() == "/manifest.mpd") {
+                    let target_url = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "url")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let quality = u
+                        .query_pairs()
+                        .find(|(k, _)| k == "quality")
+                        .map(|(_, v)| v.into_owned());
+                    if target_url.is_empty() {
+                        let resp = tauri::http::Response::builder()
+                            .status(400)
+                            .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                            .body(b"missing url parameter".to_vec())
+                            .unwrap();
+                        responder.respond(resp);
+                        return;
+                    }
+                    match player
+                        .resolve_dash_manifest(&target_url, quality.as_deref(), &proxy_prefix)
+                        .await
+                    {
+                        Ok(mpd_xml) => {
+                            let body = mpd_xml.into_bytes();
+                            let resp = tauri::http::Response::builder()
+                                .status(200)
+                                .header("Content-Type", "application/dash+xml")
+                                .header("Content-Length", body.len().to_string())
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                                .header("Access-Control-Allow-Headers", "Range, Content-Type")
+                                .body(body)
+                                .unwrap();
+                            responder.respond(resp);
+                        }
+                        Err(err) => {
+                            eprintln!("[playzi-stream] manifest.mpd error: {err}");
+                            let resp = tauri::http::Response::builder()
+                                .status(502)
+                                .header("Access-Control-Allow-Origin", allowed_webview_origin())
+                                .body(err.to_string().into_bytes())
                                 .unwrap();
                             responder.respond(resp);
                         }

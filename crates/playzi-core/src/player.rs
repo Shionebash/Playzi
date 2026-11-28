@@ -25,6 +25,10 @@ const EXPIRE_SAFETY_MARGIN_SECS: i64 = 60;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/143 Safari/537.36";
+const IOS_INNERTUBE_CLIENT_VERSION: &str = "20.10.4";
+const IOS_INNERTUBE_USER_AGENT: &str =
+    "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+const INNERTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +94,16 @@ pub struct StreamFormat {
     pub abr: Option<f64>,
     pub language: Option<String>,
     pub language_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_channels: Option<u32>,
     #[serde(default)]
     pub http_headers: HashMap<String, String>,
 }
@@ -207,10 +221,89 @@ pub enum PlayerControlCommand {
     Stop,
 }
 
-struct CachedStream {
-    info: ResolvedStreamInfo,
+#[derive(Clone)]
+struct CachedRawVideo {
+    item: Value,
+    duration: f64,
+    formats: Vec<StreamFormat>,
+    direct_url: Option<String>,
+    loudness_db: Option<f64>,
+    expires_at: Option<i64>,
     cached_at: Instant,
 }
+
+impl CachedRawVideo {
+    fn project(&self, quality: &str, audio_only: bool) -> ResolvedStreamInfo {
+        let max_h = quality_to_height(quality);
+        let selected_hls_audio = select_best_hls_audio(&self.formats);
+        let selected_audio = select_best_audio(&self.formats);
+        let has_dash_audio = selected_audio.as_ref().is_some_and(is_dash_format);
+        let available_qualities = if audio_only {
+            Vec::new()
+        } else {
+            extract_available_qualities(&self.formats, selected_hls_audio.is_some(), has_dash_audio)
+        };
+        let selected_video = if audio_only {
+            None
+        } else {
+            select_best_video(
+                &self.formats,
+                max_h,
+                selected_hls_audio.is_some(),
+                has_dash_audio,
+            )
+        };
+        let audio_tracks = extract_audio_tracks(&self.formats);
+
+        let stream_url = self.direct_url.clone().or_else(|| {
+            if audio_only {
+                selected_audio.as_ref().map(|a| a.url.clone())
+            } else {
+                selected_video
+                    .as_ref()
+                    .map(|v| v.url.clone())
+                    .or_else(|| selected_audio.as_ref().map(|a| a.url.clone()))
+            }
+        });
+
+        let mut expires_candidates = Vec::new();
+        if let Some(exp) = self.expires_at {
+            expires_candidates.push(exp);
+        }
+        if let Some(v) = &selected_video {
+            if let Some(exp) = extract_url_expire(&v.url) {
+                expires_candidates.push(exp);
+            }
+        }
+        if let Some(a) = &selected_audio {
+            if let Some(exp) = extract_url_expire(&a.url) {
+                expires_candidates.push(exp);
+            }
+        }
+        if let Some(u) = &stream_url {
+            if let Some(exp) = extract_url_expire(u) {
+                expires_candidates.push(exp);
+            }
+        }
+        let expires_at = expires_candidates.into_iter().min();
+
+        ResolvedStreamInfo {
+            item: self.item.clone(),
+            duration: self.duration,
+            quality: quality.to_string(),
+            stream_url,
+            video: selected_video,
+            audio: selected_audio,
+            hls_audio: selected_hls_audio,
+            audio_tracks,
+            available_qualities,
+            loudness_db: self.loudness_db,
+            expires_at,
+        }
+    }
+}
+
+type InFlightMap = HashMap<String, broadcast::Sender<std::result::Result<CachedRawVideo, String>>>;
 
 struct ManagedSession {
     child: Option<Child>,
@@ -231,9 +324,11 @@ pub struct PlayerManager {
     state_store: StateStore,
     config: ConfigStore,
     ytdlp_override: Option<String>,
-    stream_cache: Arc<Mutex<HashMap<String, CachedStream>>>,
+    raw_cache: Arc<Mutex<HashMap<String, CachedRawVideo>>>,
+    in_flight: Arc<Mutex<InFlightMap>>,
     loudness_cache: Arc<Mutex<HashMap<String, Option<f64>>>>,
     loudness_client: reqwest::Client,
+    innertube_client: reqwest::Client,
     playback: Arc<Mutex<PlaybackState>>,
     session: Arc<Mutex<ManagedSession>>,
     events: broadcast::Sender<PlayerEvent>,
@@ -247,13 +342,22 @@ impl PlayerManager {
             .timeout(Duration::from_secs(4))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let innertube_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(4))
+            .timeout(Duration::from_secs(6))
+            .pool_max_idle_per_host(8)
+            .tcp_nodelay(true)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             state_store,
             config,
             ytdlp_override: None,
-            stream_cache: Arc::new(Mutex::new(HashMap::new())),
+            raw_cache: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             loudness_cache: Arc::new(Mutex::new(HashMap::new())),
             loudness_client,
+            innertube_client,
             playback: Arc::new(Mutex::new(PlaybackState::default())),
             session: Arc::new(Mutex::new(ManagedSession {
                 child: None,
@@ -631,27 +735,169 @@ impl PlayerManager {
         let qual = quality
             .filter(|q| !q.trim().is_empty())
             .unwrap_or(&cfg.playback_quality);
-        let cache_key = format!("{}|{}|{}", trimmed, qual, audio_only);
+        let raw = self.resolve_raw_video(trimmed, force_refresh).await?;
+        Ok(raw.project(qual, audio_only))
+    }
+
+    /// Generates an in-memory DASH `.mpd` manifest for a video URL using the cached or resolved formats.
+    pub async fn resolve_dash_manifest(
+        &self,
+        url: &str,
+        quality: Option<&str>,
+        proxy_prefix: &str,
+    ) -> Result<String> {
+        let info = self.resolve_stream(url, quality, false).await?;
+        let video = info.video.as_ref().ok_or_else(|| {
+            CoreError::External("No video stream available for DASH manifest".into())
+        })?;
+        let audio = info.audio.as_ref().ok_or_else(|| {
+            CoreError::External("No audio stream available for DASH manifest".into())
+        })?;
+        build_dash_mpd_manifest(info.duration, video, audio, proxy_prefix)
+    }
+
+    async fn resolve_raw_video(&self, url: &str, force_refresh: bool) -> Result<CachedRawVideo> {
+        let cache_key = extract_video_id(url)
+            .map(|id| format!("yt:{id}"))
+            .unwrap_or_else(|| url.to_string());
 
         if force_refresh {
-            if let Ok(mut cache) = self.stream_cache.lock() {
+            if let Ok(mut cache) = self.raw_cache.lock() {
                 cache.remove(&cache_key);
             }
-        } else if let Some(cached) = self.get_cached_stream(&cache_key) {
+        } else if let Some(cached) = self.get_cached_raw(&cache_key) {
             return Ok(cached);
         }
 
+        // Single-flight deduplication: if another task (e.g. hover prefetch) is already
+        // resolving the same video, await its result instead of firing a duplicate request.
+        let mut rx_opt = None;
+        if !force_refresh {
+            let mut inflight = self.in_flight.lock().expect("in_flight lock");
+            if let Some(tx) = inflight.get(&cache_key) {
+                rx_opt = Some(tx.subscribe());
+            } else {
+                let (tx, _) = broadcast::channel(8);
+                inflight.insert(cache_key.clone(), tx);
+            }
+        }
+
+        if let Some(mut rx) = rx_opt {
+            return match rx.recv().await {
+                Ok(Ok(raw)) => Ok(raw),
+                Ok(Err(msg)) => Err(CoreError::External(msg)),
+                Err(_) => {
+                    // Sender dropped unexpectedly; fall back to fresh resolution.
+                    self.fetch_raw_video_uncached(url, &cache_key, force_refresh)
+                        .await
+                }
+            };
+        }
+
+        let result = self
+            .fetch_raw_video_uncached(url, &cache_key, force_refresh)
+            .await;
+
+        if !force_refresh {
+            let tx_opt = self
+                .in_flight
+                .lock()
+                .expect("in_flight lock")
+                .remove(&cache_key);
+            if let Some(tx) = tx_opt {
+                let _ = tx.send(result.as_ref().cloned().map_err(|e| e.to_string()));
+            }
+        }
+
+        result
+    }
+
+    async fn fetch_raw_video_uncached(
+        &self,
+        url: &str,
+        cache_key: &str,
+        force_refresh: bool,
+    ) -> Result<CachedRawVideo> {
+        // Fast path: direct InnerTube IOS /youtubei/v1/player (~240-350ms warm vs ~5.8s yt-dlp).
+        // Skip fast path on explicit force_refresh (auto-recovery after playback error) so
+        // recovery transparently switches to yt-dlp HLS.
+        if !force_refresh && is_youtube_url(url) {
+            if let Some(vid) = extract_video_id(url) {
+                if let Ok(mut fast_raw) = self.resolve_via_innertube_ios(&vid, url).await {
+                    if fast_raw.loudness_db.is_none() {
+                        // Reuse cached loudness if already known, without blocking playback on HTML scraping.
+                        if let Ok(lcache) = self.loudness_cache.lock() {
+                            if let Some(Some(db)) = lcache.get(&vid) {
+                                fast_raw.loudness_db = Some(*db);
+                            }
+                        }
+                    }
+                    self.put_cached_raw(cache_key.to_string(), fast_raw.clone());
+                    return Ok(fast_raw);
+                }
+            }
+        }
+
         let (raw_res, fetched_loudness) = tokio::join!(
-            self.run_ytdlp_json(trimmed, false, None),
-            self.fetch_loudness_db(trimmed),
+            self.run_ytdlp_json(url, false, None),
+            self.fetch_loudness_db(url),
         );
         let raw = raw_res?;
-        let mut resolved = parse_ytdlp_info_json(&raw, trimmed, qual, audio_only);
-        if resolved.loudness_db.is_none() {
-            resolved.loudness_db = fetched_loudness;
+        let mut cached = parse_ytdlp_raw_video(&raw, url);
+        if cached.loudness_db.is_none() {
+            cached.loudness_db = fetched_loudness;
         }
-        self.put_cached_stream(cache_key, resolved.clone());
-        Ok(resolved)
+        self.put_cached_raw(cache_key.to_string(), cached.clone());
+        Ok(cached)
+    }
+
+    async fn resolve_via_innertube_ios(
+        &self,
+        video_id: &str,
+        original_url: &str,
+    ) -> Result<CachedRawVideo> {
+        let body = json!({
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "clientName": "IOS",
+                    "clientVersion": IOS_INNERTUBE_CLIENT_VERSION,
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.3.2.22D82",
+                    "hl": "es",
+                    "gl": "EC",
+                }
+            },
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+        });
+
+        let resp = self
+            .innertube_client
+            .post(INNERTUBE_PLAYER_URL)
+            .header("User-Agent", IOS_INNERTUBE_USER_AGENT)
+            .header("X-YouTube-Client-Name", "5")
+            .header("X-YouTube-Client-Version", IOS_INNERTUBE_CLIENT_VERSION)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CoreError::External(format!("InnerTube IOS request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(CoreError::External(format!(
+                "InnerTube IOS returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::External(format!("InnerTube IOS JSON parse failed: {e}")))?;
+
+        parse_innertube_player_json(&data, video_id, original_url)
     }
 
     async fn fetch_loudness_db(&self, url: &str) -> Option<f64> {
@@ -808,35 +1054,29 @@ impl PlayerManager {
             .map_err(|err| CoreError::External(format!("Invalid yt-dlp JSON output: {err}")))
     }
 
-    fn get_cached_stream(&self, key: &str) -> Option<ResolvedStreamInfo> {
+    fn get_cached_raw(&self, key: &str) -> Option<CachedRawVideo> {
         let now_unix = now_unix_secs();
-        let mut cache = self.stream_cache.lock().expect("stream_cache lock");
+        let mut cache = self.raw_cache.lock().expect("raw_cache lock");
         let entry = cache.get(key)?;
         if entry.cached_at.elapsed() > Duration::from_secs(DEFAULT_STREAM_CACHE_TTL_SECS) {
             cache.remove(key);
             return None;
         }
-        if let Some(exp) = entry.info.expires_at {
+        if let Some(exp) = entry.expires_at {
             if now_unix >= exp - EXPIRE_SAFETY_MARGIN_SECS {
                 cache.remove(key);
                 return None;
             }
         }
-        Some(entry.info.clone())
+        Some(entry.clone())
     }
 
-    fn put_cached_stream(&self, key: String, info: ResolvedStreamInfo) {
-        let mut cache = self.stream_cache.lock().expect("stream_cache lock");
+    fn put_cached_raw(&self, key: String, entry: CachedRawVideo) {
+        let mut cache = self.raw_cache.lock().expect("raw_cache lock");
         if cache.len() >= 128 {
             cache.clear();
         }
-        cache.insert(
-            key,
-            CachedStream {
-                info,
-                cached_at: Instant::now(),
-            },
-        );
+        cache.insert(key, entry);
     }
 
     fn emit_event(&self, kind: &str, state: PlaybackState) {
@@ -1370,12 +1610,7 @@ pub fn send_mpv_ipc_json(endpoint: &str, payload: &Value) -> Result<()> {
 }
 
 /// Parses `yt-dlp --dump-single-json` output into normalized `ResolvedStreamInfo`.
-pub fn parse_ytdlp_info_json(
-    raw: &Value,
-    original_url: &str,
-    quality: &str,
-    audio_only: bool,
-) -> ResolvedStreamInfo {
+fn parse_ytdlp_raw_video(raw: &Value, original_url: &str) -> CachedRawVideo {
     let duration = raw
         .get("duration")
         .and_then(Value::as_f64)
@@ -1420,54 +1655,17 @@ pub fn parse_ytdlp_info_json(
         .map(|arr| arr.iter().filter_map(parse_format_value).collect())
         .unwrap_or_default();
 
-    let max_h = quality_to_height(quality);
-    let selected_hls_audio = select_best_hls_audio(&formats);
-    let available_qualities = if audio_only {
-        Vec::new()
-    } else {
-        extract_available_qualities(&formats, selected_hls_audio.is_some())
-    };
-    let selected_video = if audio_only {
-        None
-    } else {
-        select_best_video(&formats, max_h, selected_hls_audio.is_some())
-    };
-    let selected_audio = select_best_audio(&formats);
-    let audio_tracks = extract_audio_tracks(&formats);
-
     let direct_url = raw
         .get("url")
         .and_then(Value::as_str)
         .filter(|s| s.starts_with("http"))
-        .map(str::to_string)
-        .or_else(|| {
-            if audio_only {
-                selected_audio.as_ref().map(|a| a.url.clone())
-            } else {
-                selected_video
-                    .as_ref()
-                    .map(|v| v.url.clone())
-                    .or_else(|| selected_audio.as_ref().map(|a| a.url.clone()))
-            }
-        });
+        .map(str::to_string);
 
-    let mut expires_candidates = Vec::new();
-    if let Some(v) = &selected_video {
-        if let Some(exp) = extract_url_expire(&v.url) {
-            expires_candidates.push(exp);
-        }
-    }
-    if let Some(a) = &selected_audio {
-        if let Some(exp) = extract_url_expire(&a.url) {
-            expires_candidates.push(exp);
-        }
-    }
-    if let Some(u) = &direct_url {
-        if let Some(exp) = extract_url_expire(u) {
-            expires_candidates.push(exp);
-        }
-    }
-    let expires_at = expires_candidates.into_iter().min();
+    let expires_at = formats
+        .iter()
+        .filter_map(|f| extract_url_expire(&f.url))
+        .chain(direct_url.as_deref().and_then(extract_url_expire))
+        .min();
 
     let item = json!({
         "id": id,
@@ -1485,19 +1683,283 @@ pub fn parse_ytdlp_info_json(
         .and_then(Value::as_f64)
         .filter(|v| v.is_finite() && (-60.0..=30.0).contains(v));
 
-    ResolvedStreamInfo {
+    CachedRawVideo {
         item,
         duration,
-        quality: quality.to_string(),
-        stream_url: direct_url,
-        video: selected_video,
-        audio: selected_audio,
-        hls_audio: selected_hls_audio,
-        audio_tracks,
-        available_qualities,
+        formats,
+        direct_url,
         loudness_db,
         expires_at,
+        cached_at: Instant::now(),
     }
+}
+
+pub fn parse_ytdlp_info_json(
+    raw: &Value,
+    original_url: &str,
+    quality: &str,
+    audio_only: bool,
+) -> ResolvedStreamInfo {
+    parse_ytdlp_raw_video(raw, original_url).project(quality, audio_only)
+}
+
+fn parse_innertube_range(obj: Option<&Value>) -> Option<String> {
+    let map = obj?.as_object()?;
+    let start = map
+        .get("start")
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))?;
+    let end = map
+        .get("end")
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))?;
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+    Some(format!("{start}-{end}"))
+}
+
+fn parse_innertube_mime(raw_mime: &str) -> (String, String, String, String) {
+    let mut parts = raw_mime.split(';');
+    let base_mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let ext = match base_mime.as_str() {
+        "video/mp4" => "mp4",
+        "audio/mp4" => "m4a",
+        "video/webm" | "audio/webm" => "webm",
+        _ => "",
+    }
+    .to_string();
+
+    let mut codecs_str = String::new();
+    for part in parts {
+        let p = part.trim();
+        if let Some(rest) = p.strip_prefix("codecs=") {
+            codecs_str = rest.trim_matches('"').trim_matches('\'').trim().to_string();
+            break;
+        }
+    }
+
+    let (vcodec, acodec) = if base_mime.starts_with("video/") {
+        if let Some((v, a)) = codecs_str.split_once(',') {
+            (v.trim().to_string(), a.trim().to_string())
+        } else if !codecs_str.is_empty() {
+            (codecs_str, "none".to_string())
+        } else {
+            ("unknown".to_string(), "none".to_string())
+        }
+    } else if base_mime.starts_with("audio/") {
+        (
+            "none".to_string(),
+            if codecs_str.is_empty() {
+                "unknown".to_string()
+            } else {
+                codecs_str
+            },
+        )
+    } else {
+        ("none".to_string(), "none".to_string())
+    };
+
+    (base_mime, ext, vcodec, acodec)
+}
+
+fn parse_innertube_format(v: &Value) -> Option<StreamFormat> {
+    let url = v.get("url").and_then(Value::as_str)?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    let raw_mime = v.get("mimeType").and_then(Value::as_str).unwrap_or("");
+    let (mime_type, ext, vcodec, acodec) = parse_innertube_mime(raw_mime);
+    let itag = v.get("itag").and_then(Value::as_u64).unwrap_or(0);
+    let is_drc = v.get("isDrc").and_then(Value::as_bool).unwrap_or(false);
+    let format_id = if is_drc {
+        format!("{itag}-drc")
+    } else {
+        itag.to_string()
+    };
+
+    let bitrate_kbps = v
+        .get("averageBitrate")
+        .or_else(|| v.get("bitrate"))
+        .and_then(Value::as_f64)
+        .map(|b| b / 1000.0);
+    let is_audio_only = vcodec == "none" && acodec != "none";
+
+    let audio_track = v.get("audioTrack");
+    let language = audio_track
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| s.split('.').next().unwrap_or(s).to_string())
+        .filter(|s| !s.is_empty());
+    let language_name = audio_track
+        .and_then(|t| t.get("displayName"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let asr = v.get("audioSampleRate").and_then(|n| {
+        n.as_u64()
+            .map(|x| x as u32)
+            .or_else(|| n.as_str().and_then(|s| s.parse::<u32>().ok()))
+    });
+    let audio_channels = v
+        .get("audioChannels")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+
+    let mut http_headers = HashMap::new();
+    http_headers.insert("User-Agent".into(), IOS_INNERTUBE_USER_AGENT.into());
+
+    Some(StreamFormat {
+        format_id,
+        url: url.to_string(),
+        ext,
+        vcodec,
+        acodec,
+        width: v.get("width").and_then(Value::as_u64).map(|n| n as u32),
+        height: v.get("height").and_then(Value::as_u64).map(|n| n as u32),
+        fps: v.get("fps").and_then(Value::as_f64),
+        tbr: bitrate_kbps,
+        abr: if is_audio_only { bitrate_kbps } else { None },
+        language,
+        language_name,
+        mime_type: if mime_type.is_empty() {
+            None
+        } else {
+            Some(mime_type)
+        },
+        init_range: parse_innertube_range(v.get("initRange")),
+        index_range: parse_innertube_range(v.get("indexRange")),
+        asr,
+        audio_channels,
+        http_headers,
+    })
+}
+
+fn parse_innertube_player_json(
+    data: &Value,
+    video_id: &str,
+    original_url: &str,
+) -> Result<CachedRawVideo> {
+    let status = data
+        .get("playabilityStatus")
+        .and_then(|p| p.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if status != "OK" {
+        return Err(CoreError::External(format!(
+            "InnerTube playabilityStatus={status}"
+        )));
+    }
+
+    let details = data.get("videoDetails").ok_or_else(|| {
+        CoreError::External("InnerTube response missing videoDetails".into())
+    })?;
+    if details
+        .get("isLive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(CoreError::External(
+            "Live streams fall back to yt-dlp HLS".into(),
+        ));
+    }
+
+    let streaming = data.get("streamingData").ok_or_else(|| {
+        CoreError::External("InnerTube response missing streamingData".into())
+    })?;
+
+    let mut formats = Vec::new();
+    for key in ["formats", "adaptiveFormats"] {
+        if let Some(arr) = streaming.get(key).and_then(Value::as_array) {
+            for entry in arr {
+                if let Some(fmt) = parse_innertube_format(entry) {
+                    formats.push(fmt);
+                }
+            }
+        }
+    }
+
+    let has_dash_audio = formats
+        .iter()
+        .any(|f| (f.vcodec.is_empty() || f.vcodec == "none") && is_dash_format(f));
+    let has_dash_video = formats
+        .iter()
+        .any(|f| !f.vcodec.is_empty() && f.vcodec != "none" && is_dash_format(f));
+    let has_muxed = formats.iter().any(|f| {
+        !f.vcodec.is_empty()
+            && f.vcodec != "none"
+            && !f.acodec.is_empty()
+            && f.acodec != "none"
+    });
+    if !(has_dash_audio && has_dash_video) && !has_muxed {
+        return Err(CoreError::External(
+            "InnerTube response has no playable DASH or muxed formats".into(),
+        ));
+    }
+
+    let duration = details
+        .get("lengthSeconds")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| v.as_f64())
+        })
+        .unwrap_or(0.0);
+    let id = details
+        .get("videoId")
+        .and_then(Value::as_str)
+        .unwrap_or(video_id)
+        .to_string();
+    let title = details
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(original_url)
+        .to_string();
+    let channel = details
+        .get("author")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let thumbnail = details
+        .get("thumbnail")
+        .and_then(|t| t.get("thumbnails"))
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.last())
+        .and_then(|t| t.get("url"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+
+    let loudness_db = data
+        .get("playerConfig")
+        .and_then(|p| p.get("audioConfig"))
+        .and_then(|a| a.get("loudnessDb"))
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && (-60.0..=30.0).contains(v));
+
+    let expires_at = formats
+        .iter()
+        .filter_map(|f| extract_url_expire(&f.url))
+        .min();
+
+    let item = json!({
+        "id": id,
+        "title": title,
+        "channel": channel,
+        "thumbnail": thumbnail,
+        "url": original_url,
+        "duration": duration as u64,
+        "durationText": format_duration((duration > 0.0).then_some(duration as u64)),
+    });
+
+    Ok(CachedRawVideo {
+        item,
+        duration,
+        formats,
+        direct_url: None,
+        loudness_db,
+        expires_at,
+        cached_at: Instant::now(),
+    })
 }
 
 /// Extracts YouTube's `loudnessDb` (relative to -14 LUFS) from a watch page HTML response.
@@ -1673,6 +2135,14 @@ fn parse_format_value(v: &Value) -> Option<StreamFormat> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        mime_type: None,
+        init_range: None,
+        index_range: None,
+        asr: v.get("asr").and_then(Value::as_u64).map(|n| n as u32),
+        audio_channels: v
+            .get("audio_channels")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32),
         http_headers,
     })
 }
@@ -1716,20 +2186,29 @@ fn select_best_hls_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
         .cloned()
 }
 
+fn is_dash_format(f: &StreamFormat) -> bool {
+    !is_hls_url(&f.url)
+        && f.init_range.as_deref().is_some_and(|s| !s.is_empty())
+        && f.index_range.as_deref().is_some_and(|s| !s.is_empty())
+}
+
 fn video_compat_tier(f: &StreamFormat) -> u8 {
     let is_hls = is_hls_url(&f.url);
+    let is_dash = is_dash_format(f);
     let has_audio = !f.acodec.is_empty() && f.acodec != "none";
     let vcodec = f.vcodec.to_lowercase();
     if is_hls && has_audio {
         5
-    } else if is_hls && vcodec.starts_with("avc1") {
+    } else if (is_hls || is_dash) && vcodec.starts_with("avc1") {
         4
-    } else if is_hls && (vcodec.starts_with("vp09.00") || vcodec == "vp09" || vcodec == "vp9") {
+    } else if (is_hls || is_dash)
+        && (vcodec.starts_with("vp09.00") || vcodec == "vp09" || vcodec == "vp9")
+    {
         // Prefer 8-bit SDR VP9 (Profile 0) over 10-bit HDR VP9 (Profile 2) for universal MSE playback.
         3
-    } else if is_hls && (vcodec.starts_with("vp09") || vcodec.starts_with("vp9")) {
+    } else if (is_hls || is_dash) && (vcodec.starts_with("vp09") || vcodec.starts_with("vp9")) {
         2
-    } else if is_hls {
+    } else if is_hls || is_dash {
         1
     } else {
         0
@@ -1739,6 +2218,7 @@ fn video_compat_tier(f: &StreamFormat) -> u8 {
 fn collect_playable_videos<'a>(
     formats: &'a [StreamFormat],
     has_hls_audio: bool,
+    has_dash_audio: bool,
 ) -> Vec<&'a StreamFormat> {
     let all_video: Vec<&StreamFormat> = formats
         .iter()
@@ -1757,6 +2237,18 @@ fn collect_playable_videos<'a>(
         .collect();
     if !hls_playable.is_empty() {
         return hls_playable;
+    }
+
+    // Include DASH adaptive video-only streams (InnerTube IOS fast path) when DASH audio exists.
+    if has_dash_audio {
+        let dash_playable: Vec<&StreamFormat> = all_video
+            .iter()
+            .copied()
+            .filter(|f| is_dash_format(f))
+            .collect();
+        if !dash_playable.is_empty() {
+            return dash_playable;
+        }
     }
 
     // Otherwise prefer muxed direct HTTP (e.g. itag 18 mp4) over silent video-only streams.
@@ -1781,8 +2273,12 @@ fn collect_playable_videos<'a>(
     all_video
 }
 
-fn extract_available_qualities(formats: &[StreamFormat], has_hls_audio: bool) -> Vec<String> {
-    let playable = collect_playable_videos(formats, has_hls_audio);
+fn extract_available_qualities(
+    formats: &[StreamFormat],
+    has_hls_audio: bool,
+    has_dash_audio: bool,
+) -> Vec<String> {
+    let playable = collect_playable_videos(formats, has_hls_audio, has_dash_audio);
     let mut heights: Vec<u32> = playable
         .into_iter()
         .filter_map(|f| f.height)
@@ -1797,8 +2293,9 @@ fn select_best_video(
     formats: &[StreamFormat],
     max_height: Option<u32>,
     has_hls_audio: bool,
+    has_dash_audio: bool,
 ) -> Option<StreamFormat> {
-    let mut candidates = collect_playable_videos(formats, has_hls_audio);
+    let mut candidates = collect_playable_videos(formats, has_hls_audio, has_dash_audio);
     if let Some(limit) = max_height {
         let within: Vec<&StreamFormat> = candidates
             .iter()
@@ -1890,13 +2387,135 @@ pub struct ProxiedStreamResponse {
     pub bytes: Vec<u8>,
 }
 
-/// Builds a reusable `reqwest::Client` configured for proxying YouTube HLS playlists and segments.
+/// Builds a reusable `reqwest::Client` configured for proxying YouTube HLS/DASH playlists and segments.
 pub fn build_stream_proxy_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
+        .pool_max_idle_per_host(12)
+        .tcp_nodelay(true)
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| CoreError::External(format!("Failed to build stream proxy client: {err}")))
+}
+
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Builds a static DASH `isoff-on-demand:2011` `.mpd` manifest combining a video-only and
+/// audio-only adaptive stream through the local `playzi-stream` proxy.
+pub fn build_dash_mpd_manifest(
+    duration: f64,
+    video: &StreamFormat,
+    audio: &StreamFormat,
+    proxy_prefix: &str,
+) -> Result<String> {
+    let v_init = video
+        .init_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Video stream missing DASH initRange".into()))?;
+    let v_index = video
+        .index_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Video stream missing DASH indexRange".into()))?;
+    let a_init = audio
+        .init_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Audio stream missing DASH initRange".into()))?;
+    let a_index = audio
+        .index_range
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CoreError::External("Audio stream missing DASH indexRange".into()))?;
+
+    let dur = if duration > 0.0 && duration.is_finite() {
+        duration
+    } else {
+        36000.0
+    };
+    let video_mime = video.mime_type.as_deref().unwrap_or_else(|| {
+        if video.ext.eq_ignore_ascii_case("webm") {
+            "video/webm"
+        } else {
+            "video/mp4"
+        }
+    });
+    let audio_mime = audio.mime_type.as_deref().unwrap_or_else(|| {
+        if audio.ext.eq_ignore_ascii_case("webm") {
+            "audio/webm"
+        } else {
+            "audio/mp4"
+        }
+    });
+    let video_codec = xml_escape(if video.vcodec.is_empty() || video.vcodec == "none" {
+        "avc1.640028"
+    } else {
+        &video.vcodec
+    });
+    let audio_codec = xml_escape(if audio.acodec.is_empty() || audio.acodec == "none" {
+        "mp4a.40.2"
+    } else {
+        &audio.acodec
+    });
+    let video_url = xml_escape(&encode_proxy_url(proxy_prefix, &video.url));
+    let audio_url = xml_escape(&encode_proxy_url(proxy_prefix, &audio.url));
+    let width = video.width.unwrap_or(1280);
+    let height = video.height.unwrap_or(720);
+    let fps = video.fps.unwrap_or(30.0).round().max(1.0) as u32;
+    let bw_v = ((video.tbr.unwrap_or(2000.0) * 1000.0).round() as u64).max(100_000);
+    let bw_a = ((audio.abr.or(audio.tbr).unwrap_or(128.0) * 1000.0).round() as u64).max(32_000);
+    let asr = audio.asr.unwrap_or(44100);
+    let channels = audio.audio_channels.unwrap_or(2);
+    let v_id = xml_escape(if video.format_id.is_empty() {
+        "video"
+    } else {
+        &video.format_id
+    });
+    let a_id = xml_escape(if audio.format_id.is_empty() {
+        "audio"
+    } else {
+        &audio.format_id
+    });
+
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT{dur:.3}S" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+  <Period duration="PT{dur:.3}S">
+    <AdaptationSet id="video" contentType="video" mimeType="{video_mime}" codecs="{video_codec}" width="{width}" height="{height}" frameRate="{fps}" startWithSAP="1" subsegmentAlignment="true">
+      <Representation id="{v_id}" bandwidth="{bw_v}" width="{width}" height="{height}">
+        <BaseURL>{video_url}</BaseURL>
+        <SegmentBase indexRange="{v_index}" indexRangeExact="true">
+          <Initialization range="{v_init}" />
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet id="audio" contentType="audio" mimeType="{audio_mime}" codecs="{audio_codec}" startWithSAP="1" subsegmentAlignment="true">
+      <Representation id="{a_id}" bandwidth="{bw_a}" audioSamplingRate="{asr}">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="{channels}" />
+        <BaseURL>{audio_url}</BaseURL>
+        <SegmentBase indexRange="{a_index}" indexRangeExact="true">
+          <Initialization range="{a_init}" />
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"#
+    ))
 }
 
 fn encode_proxy_url(proxy_prefix: &str, absolute_url: &str) -> String {
@@ -2182,6 +2801,9 @@ pub async fn fetch_proxied_stream(
     let (status, final_url, content_type, content_range, accept_ranges, bytes) = loop {
         attempt += 1;
         let mut req = client.get(parsed.clone()).header("Accept", "*/*");
+        if parsed.query().is_some_and(|q| q.contains("c=IOS")) {
+            req = req.header("User-Agent", IOS_INNERTUBE_USER_AGENT);
+        }
         if let Some(range) = range_header.filter(|r| !r.trim().is_empty()) {
             req = req.header("Range", range);
         }
@@ -3270,5 +3892,114 @@ mod tests {
         assert!(!rewritten.contains("begin%2F254866"));
         assert!(!rewritten.contains("#EXTINF:0.065,"));
         assert!(rewritten.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn parse_innertube_player_json_projects_qualities_and_builds_dash_mpd() {
+        let payload = json!({
+            "playabilityStatus": { "status": "OK" },
+            "videoDetails": {
+                "videoId": "LXb3EKWsInQ",
+                "title": "Costa Rica 4K",
+                "author": "Jacob + Katie Schwarz",
+                "lengthSeconds": "314",
+                "isLive": false,
+                "thumbnail": {
+                    "thumbnails": [
+                        { "url": "https://i.ytimg.com/vi/LXb3EKWsInQ/hqdefault.jpg" }
+                    ]
+                }
+            },
+            "playerConfig": {
+                "audioConfig": { "loudnessDb": -1.25 }
+            },
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "itag": 137,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=137&c=IOS",
+                        "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+                        "bitrate": 4500000,
+                        "width": 1920,
+                        "height": 1080,
+                        "fps": 30,
+                        "initRange": { "start": "0", "end": "740" },
+                        "indexRange": { "start": "741", "end": "1480" }
+                    },
+                    {
+                        "itag": 136,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=136&c=IOS",
+                        "mimeType": "video/mp4; codecs=\"avc1.4d401f\"",
+                        "bitrate": 2200000,
+                        "width": 1280,
+                        "height": 720,
+                        "fps": 30,
+                        "initRange": { "start": "0", "end": "738" },
+                        "indexRange": { "start": "739", "end": "1420" }
+                    },
+                    {
+                        "itag": 140,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=140&c=IOS",
+                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                        "bitrate": 129500,
+                        "audioSampleRate": "44100",
+                        "audioChannels": 2,
+                        "initRange": { "start": "0", "end": "631" },
+                        "indexRange": { "start": "632", "end": "1090" }
+                    }
+                ]
+            }
+        });
+
+        let raw = parse_innertube_player_json(
+            &payload,
+            "LXb3EKWsInQ",
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        )
+        .expect("should parse valid InnerTube IOS payload");
+        assert_eq!(raw.loudness_db, Some(-1.25));
+        assert_eq!(raw.expires_at, Some(1899999999));
+
+        // Same CachedRawVideo projects 1080p, 720p, and audio-only without re-fetching.
+        let best = raw.project("best", false);
+        assert_eq!(best.available_qualities, vec!["1080p", "720p"]);
+        assert_eq!(best.video.as_ref().and_then(|v| v.height), Some(1080));
+        assert_eq!(best.audio.as_ref().map(|a| a.format_id.as_str()), Some("140"));
+
+        let q720 = raw.project("720p", false);
+        assert_eq!(q720.video.as_ref().and_then(|v| v.height), Some(720));
+
+        let audio = raw.project("audio", true);
+        assert!(audio.video.is_none());
+        assert_eq!(audio.audio.as_ref().map(|a| a.format_id.as_str()), Some("140"));
+
+        let mpd = build_dash_mpd_manifest(
+            best.duration,
+            best.video.as_ref().unwrap(),
+            best.audio.as_ref().unwrap(),
+            "http://playzi-stream.localhost/",
+        )
+        .expect("should build valid DASH MPD");
+        assert!(mpd.contains("mediaPresentationDuration=\"PT314.000S\""));
+        assert!(mpd.contains("codecs=\"avc1.640028\""));
+        assert!(mpd.contains("codecs=\"mp4a.40.2\""));
+        assert!(mpd.contains("indexRange=\"741-1480\""));
+        assert!(mpd.contains("<Initialization range=\"0-740\" />"));
+        assert!(mpd.contains("http://playzi-stream.localhost/?url="));
+    }
+
+    #[test]
+    fn parse_innertube_player_json_rejects_live_and_unplayable_for_ytdlp_fallback() {
+        let live = json!({
+            "playabilityStatus": { "status": "OK" },
+            "videoDetails": { "videoId": "live1234567", "isLive": true },
+            "streamingData": { "adaptiveFormats": [] }
+        });
+        assert!(parse_innertube_player_json(&live, "live1234567", "https://www.youtube.com/watch?v=live1234567").is_err());
+
+        let blocked = json!({
+            "playabilityStatus": { "status": "LOGIN_REQUIRED" }
+        });
+        assert!(parse_innertube_player_json(&blocked, "blk12345678", "https://www.youtube.com/watch?v=blk12345678").is_err());
     }
 }

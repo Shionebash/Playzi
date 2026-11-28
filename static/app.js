@@ -323,6 +323,20 @@ function streamMasterProxyUrl(videoUrl, audioUrl, meta = null) {
   return videoUrl;
 }
 
+function streamDashProxyUrl(videoPageUrl, quality = "best") {
+  if (!videoPageUrl) return "";
+  if (IS_TAURI) {
+    const base = (location.protocol === "http:" && location.hostname.endsWith("localhost"))
+      ? "http://playzi-stream.localhost/"
+      : "playzi-stream://localhost/";
+    const params = new URLSearchParams();
+    params.set("url", videoPageUrl);
+    if (quality) params.set("quality", String(quality));
+    return `${base}manifest.mpd?${params.toString()}`;
+  }
+  return `/api/player/manifest.mpd?url=${encodeURIComponent(videoPageUrl)}&quality=${encodeURIComponent(quality || "best")}`;
+}
+
 function thumbAttrs(url, eager = false) {
   const rawUrl = upgradeThumbUrl(url, false);
   const origUrl = normalizeThumbUrl(url);
@@ -4396,18 +4410,24 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
       const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
       const hlsAudioUrl = info.hlsAudio?.url || "";
-      const proxiedSrc = (isHls && !videoHasAudio && hlsAudioUrl)
-        ? streamMasterProxyUrl(rawSrc, hlsAudioUrl, {
-            vcodec: info.video?.vcodec || "",
-            acodec: info.hlsAudio?.acodec || "",
-            width: info.video?.width || 0,
-            height: info.video?.height || 0,
-            bandwidth: info.video?.tbr ? Math.round(info.video.tbr * 1000) : 0,
-          })
-        : streamProxyUrl(rawSrc);
-      const mimeType = isHls
-        ? "application/x-mpegURL"
-        : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+      const isDashPair = !isHls && !videoHasAudio
+        && Boolean(info.video?.initRange && info.video?.indexRange && info.audio?.initRange && info.audio?.indexRange);
+      const proxiedSrc = isDashPair
+        ? streamDashProxyUrl(item.url, rawQuality)
+        : (isHls && !videoHasAudio && hlsAudioUrl)
+          ? streamMasterProxyUrl(rawSrc, hlsAudioUrl, {
+              vcodec: info.video?.vcodec || "",
+              acodec: info.hlsAudio?.acodec || "",
+              width: info.video?.width || 0,
+              height: info.video?.height || 0,
+              bandwidth: info.video?.tbr ? Math.round(info.video.tbr * 1000) : 0,
+            })
+          : streamProxyUrl(rawSrc);
+      const mimeType = isDashPair
+        ? "application/dash+xml"
+        : isHls
+          ? "application/x-mpegURL"
+          : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
       _setLoadingStage("Cargando video en búfer...");
       _applySavedVolumeToVideo(player);
       player.src({ src: proxiedSrc, type: mimeType });
@@ -4765,18 +4785,24 @@ function _registerQualityMenu(player) {
           const isHls = rawSrc.includes(".m3u8") || rawSrc.includes("hls_playlist") || rawSrc.includes("/manifest/hls");
           const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
           const hlsAudioUrl = info.hlsAudio?.url || "";
-          const proxiedSrc = (isHls && !videoHasAudio && hlsAudioUrl)
-            ? streamMasterProxyUrl(rawSrc, hlsAudioUrl, {
-                vcodec: info.video?.vcodec || "",
-                acodec: info.hlsAudio?.acodec || "",
-                width: info.video?.width || 0,
-                height: info.video?.height || 0,
-                bandwidth: info.video?.tbr ? Math.round(info.video.tbr * 1000) : 0,
-              })
-            : streamProxyUrl(rawSrc);
-          const mimeType = isHls
-            ? "application/x-mpegURL"
-            : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
+          const isDashPair = !isHls && !videoHasAudio
+            && Boolean(info.video?.initRange && info.video?.indexRange && info.audio?.initRange && info.audio?.indexRange);
+          const proxiedSrc = isDashPair
+            ? streamDashProxyUrl(url, selectedQ)
+            : (isHls && !videoHasAudio && hlsAudioUrl)
+              ? streamMasterProxyUrl(rawSrc, hlsAudioUrl, {
+                  vcodec: info.video?.vcodec || "",
+                  acodec: info.hlsAudio?.acodec || "",
+                  width: info.video?.width || 0,
+                  height: info.video?.height || 0,
+                  bandwidth: info.video?.tbr ? Math.round(info.video.tbr * 1000) : 0,
+                })
+              : streamProxyUrl(rawSrc);
+          const mimeType = isDashPair
+            ? "application/dash+xml"
+            : isHls
+              ? "application/x-mpegURL"
+              : (info.video?.ext === "webm" ? "video/webm" : "video/mp4");
           p.src({ src: proxiedSrc, type: mimeType });
           p.one("canplay", () => {
             _applyingPartySync = true;
