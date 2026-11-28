@@ -476,18 +476,22 @@ impl DownloadManager {
         let url = job.get("url").and_then(Value::as_str).unwrap_or("");
         let is_youtube = matches!(source_for_url(url), "youtube" | "ytmusic");
 
-        // For YouTube, try unauthenticated web_safari/default first to avoid SABR-only
-        // account restrictions that drop formats; fall back to cookies when sign-in is required.
+        // For YouTube, prefer cookies first when available so IP bot-checks resolve in a single
+        // yt-dlp invocation; fall back to unauthenticated if cookies are stale or restricted.
         // Never send YouTube cookies to non-YouTube domains.
-        let first_cookie: Option<&Path> = None;
+        let first_cookie: Option<&Path> = if is_youtube {
+            cookie_file.as_deref()
+        } else {
+            None
+        };
         let first_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, first_cookie);
         let mut outcome = self.run_ytdlp_once(&job_id, &first_args, &mut cancel_rx).await;
 
-        if is_youtube {
-            if let (YtdlpAttemptOutcome::Failed(_), Some(cf)) = (&outcome, cookie_file.as_deref()) {
+        if is_youtube && first_cookie.is_some() {
+            if matches!(&outcome, YtdlpAttemptOutcome::Failed(_)) {
                 let _ = self.patch_job(&job_id, "starting", Some(0.0), "", "", "", None);
-                let auth_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, Some(cf));
-                outcome = self.run_ytdlp_once(&job_id, &auth_args, &mut cancel_rx).await;
+                let unauth_args = self.build_ytdlp_args_with_cookies(&job, &out_tmpl, None);
+                outcome = self.run_ytdlp_once(&job_id, &unauth_args, &mut cancel_rx).await;
             }
         }
 

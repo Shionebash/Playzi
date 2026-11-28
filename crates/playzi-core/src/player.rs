@@ -22,6 +22,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 const DEFAULT_STREAM_CACHE_TTL_SECS: u64 = 600;
 const STREAM_URL_FALLBACK_TTL_SECS: u64 = 3 * 3600;
 const STREAM_UPGRADE_COOLDOWN_SECS: u64 = 15;
+const BOT_CHECK_COOLDOWN_SECS: u64 = 180;
 const EXPIRE_SAFETY_MARGIN_SECS: i64 = 60;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -359,6 +360,7 @@ pub struct PlayerManager {
     in_flight: Arc<Mutex<InFlightMap>>,
     stream_urls: Arc<Mutex<HashMap<(String, String), UpstreamStreamEntry>>>,
     upgrade_in_flight: Arc<Mutex<UpgradeInFlightMap>>,
+    bot_check_until: Arc<Mutex<Option<Instant>>>,
     loudness_cache: Arc<Mutex<HashMap<String, Option<f64>>>>,
     loudness_client: reqwest::Client,
     innertube_client: reqwest::Client,
@@ -390,6 +392,7 @@ impl PlayerManager {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             stream_urls: Arc::new(Mutex::new(HashMap::new())),
             upgrade_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            bot_check_until: Arc::new(Mutex::new(None)),
             loudness_cache: Arc::new(Mutex::new(HashMap::new())),
             loudness_client,
             innertube_client,
@@ -464,6 +467,23 @@ impl PlayerManager {
             Some(cfg.cookies_file.as_str())
         };
         store.resolve_cookie_file(configured).ok()
+    }
+
+    fn is_bot_check_active(&self) -> bool {
+        let mut guard = self.bot_check_until.lock().expect("bot_check_until lock");
+        match *guard {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_bot_check_active(&self) {
+        let mut guard = self.bot_check_until.lock().expect("bot_check_until lock");
+        *guard = Some(Instant::now() + Duration::from_secs(BOT_CHECK_COOLDOWN_SECS));
     }
 
     /// Launches playback in `mpv` (with GPU hwdec + JSON IPC + optional `--wid`) or `vlc`,
@@ -872,20 +892,30 @@ impl PlayerManager {
     ) -> Result<CachedRawVideo> {
         // Fast path: direct InnerTube IOS /youtubei/v1/player (~240-350ms warm vs ~5.8s yt-dlp).
         // Skip fast path on explicit force_refresh (auto-recovery after playback error) so
-        // recovery transparently switches to yt-dlp HLS.
-        if !force_refresh && is_youtube_url(url) {
+        // recovery transparently switches to yt-dlp HLS, or during an active IP bot-check
+        // cooldown when cookies are available for yt-dlp.
+        let skip_ios_for_bot_check =
+            self.is_bot_check_active() && self.resolve_cookie_file().is_some();
+        if !force_refresh && !skip_ios_for_bot_check && is_youtube_url(url) {
             if let Some(vid) = extract_video_id(url) {
-                if let Ok(mut fast_raw) = self.resolve_via_innertube_ios(&vid, url).await {
-                    if fast_raw.loudness_db.is_none() {
-                        // Reuse cached loudness if already known, without blocking playback on HTML scraping.
-                        if let Ok(lcache) = self.loudness_cache.lock() {
-                            if let Some(Some(db)) = lcache.get(&vid) {
-                                fast_raw.loudness_db = Some(*db);
+                match self.resolve_via_innertube_ios(&vid, url).await {
+                    Ok(mut fast_raw) => {
+                        if fast_raw.loudness_db.is_none() {
+                            // Reuse cached loudness if already known, without blocking playback on HTML scraping.
+                            if let Ok(lcache) = self.loudness_cache.lock() {
+                                if let Some(Some(db)) = lcache.get(&vid) {
+                                    fast_raw.loudness_db = Some(*db);
+                                }
                             }
                         }
+                        self.put_cached_raw(cache_key.to_string(), fast_raw.clone());
+                        return Ok(fast_raw);
                     }
-                    self.put_cached_raw(cache_key.to_string(), fast_raw.clone());
-                    return Ok(fast_raw);
+                    Err(err) => {
+                        if is_bot_check_error(&err.to_string()) {
+                            self.mark_bot_check_active();
+                        }
+                    }
                 }
             }
         }
@@ -1251,8 +1281,10 @@ impl PlayerManager {
             return self.run_ytdlp_json_once(&ytdlp, &args).await;
         }
 
-        // Try unauthenticated web_safari/default first (avoids YouTube SABR/PO-token 403);
-        // fall back to cookies when YouTube requires sign-in (bot check, age-restricted, private).
+        // For YouTube, prefer authenticated cookies first when available so IP bot-checks
+        // and login-gated videos resolve in a single yt-dlp invocation (~6s faster on Windows),
+        // falling back to unauthenticated if cookies are stale or restricted.
+        // Never send YouTube cookies to non-YouTube domains.
         let unauth_args = build_ytdlp_json_args(
             &cache_dir,
             js_runtime.as_ref(),
@@ -1261,24 +1293,30 @@ impl PlayerManager {
             false,
             None,
         );
-        match self.run_ytdlp_json_once(&ytdlp, &unauth_args).await {
-            Ok(val) => Ok(val),
-            Err(first_err) => {
-                if let Some(cookie_file) = self.resolve_cookie_file() {
-                    let auth_args = build_ytdlp_json_args(
-                        &cache_dir,
-                        js_runtime.as_ref(),
-                        Some(cookie_file.as_path()),
-                        url,
-                        false,
-                        None,
-                    );
-                    self.run_ytdlp_json_once(&ytdlp, &auth_args).await
-                } else {
-                    Err(first_err)
-                }
+        if is_youtube_url(url) {
+            if let Some(cookie_file) = self.resolve_cookie_file() {
+                let auth_args = build_ytdlp_json_args(
+                    &cache_dir,
+                    js_runtime.as_ref(),
+                    Some(cookie_file.as_path()),
+                    url,
+                    false,
+                    None,
+                );
+                return match self.run_ytdlp_json_once(&ytdlp, &auth_args).await {
+                    Ok(val) => Ok(val),
+                    Err(_) => self.run_ytdlp_json_once(&ytdlp, &unauth_args).await,
+                };
             }
         }
+
+        let res = self.run_ytdlp_json_once(&ytdlp, &unauth_args).await;
+        if let Err(ref err) = res {
+            if is_bot_check_error(&err.to_string()) {
+                self.mark_bot_check_active();
+            }
+        }
+        res
     }
 
     async fn run_ytdlp_json_once(&self, ytdlp: &str, args: &[String]) -> Result<Value> {
@@ -2112,9 +2150,18 @@ fn parse_innertube_player_json(
         .and_then(Value::as_str)
         .unwrap_or("");
     if status != "OK" {
-        return Err(CoreError::External(format!(
-            "InnerTube playabilityStatus={status}"
-        )));
+        let reason = data
+            .get("playabilityStatus")
+            .and_then(|p| p.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let detail = if reason.is_empty() {
+            format!("InnerTube playabilityStatus={status}")
+        } else {
+            format!("InnerTube playabilityStatus={status}: {reason}")
+        };
+        return Err(CoreError::External(detail));
     }
 
     let details = data.get("videoDetails").ok_or_else(|| {
@@ -2227,6 +2274,11 @@ fn parse_innertube_player_json(
         expires_at,
         cached_at: Instant::now(),
     })
+}
+
+fn is_bot_check_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("not a bot") || lower.contains("no eres un bot")
 }
 
 /// Extracts YouTube's `loudnessDb` (relative to -14 LUFS) from a watch page HTML response.
@@ -4508,9 +4560,51 @@ mod tests {
         assert!(parse_innertube_player_json(&live, "live1234567", "https://www.youtube.com/watch?v=live1234567").is_err());
 
         let blocked = json!({
-            "playabilityStatus": { "status": "LOGIN_REQUIRED" }
+            "playabilityStatus": {
+                "status": "LOGIN_REQUIRED",
+                "reason": "Inicia sesión para confirmar que no eres un bot"
+            }
         });
-        assert!(parse_innertube_player_json(&blocked, "blk12345678", "https://www.youtube.com/watch?v=blk12345678").is_err());
+        let blocked_err = parse_innertube_player_json(
+            &blocked,
+            "blk12345678",
+            "https://www.youtube.com/watch?v=blk12345678",
+        )
+        .err()
+        .expect("LOGIN_REQUIRED must fail");
+        assert!(blocked_err.to_string().contains("LOGIN_REQUIRED"));
+        assert!(is_bot_check_error(&blocked_err.to_string()));
+    }
+
+    #[test]
+    fn bot_check_error_classifier_distinguishes_ip_bot_check_from_other_errors() {
+        assert!(is_bot_check_error(
+            "ERROR: [youtube] oa-D2KlvjbU: Sign in to confirm you're not a bot."
+        ));
+        assert!(is_bot_check_error(
+            "ERROR: [youtube] oa-D2KlvjbU: Sign in to confirm you’re not a bot."
+        ));
+        assert!(is_bot_check_error(
+            "InnerTube playabilityStatus=LOGIN_REQUIRED: Inicia sesión para confirmar que no eres un bot"
+        ));
+        assert!(!is_bot_check_error(
+            "InnerTube playabilityStatus=LOGIN_REQUIRED: Sign in to confirm your age"
+        ));
+        assert!(!is_bot_check_error("InnerTube playabilityStatus=LOGIN_REQUIRED"));
+        assert!(!is_bot_check_error("network timeout"));
+    }
+
+    #[test]
+    fn bot_check_cooldown_activates_on_mark() {
+        let tmp = std::env::temp_dir().join(format!("playzi-botcheck-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state = StateStore::new(tmp.join("state.json"));
+        let cfg = ConfigStore::load_from_root(&tmp);
+        let mgr = PlayerManager::new(state, cfg);
+        assert!(!mgr.is_bot_check_active());
+        mgr.mark_bot_check_active();
+        assert!(mgr.is_bot_check_active());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
