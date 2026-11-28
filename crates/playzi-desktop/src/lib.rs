@@ -262,10 +262,18 @@ pub fn run() {
                         return;
                     };
 
+                    // Video.js VHS probes DASH SegmentBase URLs without a Range header to detect
+                    // the container type. Cap rangeless /yt-stream probes to 64 KiB for ALL upstream
+                    // clients (IOS, WEB, YTMUSIC, TVHTML5) so the proxy never buffers a full video.
+                    let effective_range = range_header
+                        .as_deref()
+                        .filter(|r| !r.trim().is_empty())
+                        .or(Some("bytes=0-65535"));
+
                     let mut proxied_res = playzi_core::player::fetch_proxied_stream(
                         &client,
                         &entry.url,
-                        range_header.as_deref(),
+                        effective_range,
                         &proxy_prefix,
                     )
                     .await;
@@ -281,7 +289,7 @@ pub fn run() {
                             proxied_res = playzi_core::player::fetch_proxied_stream(
                                 &client,
                                 &upgraded_entry.url,
-                                range_header.as_deref(),
+                                effective_range,
                                 &proxy_prefix,
                             )
                             .await;
@@ -687,6 +695,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let runtime = app_handle.state::<AppRuntime>().inner().clone();
                         let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                            runtime.player.shutdown().await;
                             runtime.discord.shutdown().await;
                             runtime.party.leave_or_stop().await;
                             runtime.social.shutdown_notify().await;

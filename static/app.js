@@ -2466,7 +2466,7 @@ function _musicLayoutHtml() {
             <button class="btn btn-ghost btn-with-ico" type="button" id="watchBack">${PLAYER_ICONS.back(14)}<span>Volver</span></button>
           </div>
           <div id="musicStatus" class="player-status" style="display:none"></div>
-          <audio id="webPlayerAudio" autoplay></audio>
+          <audio id="webPlayerAudio" autoplay crossorigin="anonymous"></audio>
         </div>
       </div>
       ${_watchSidebarHtml()}
@@ -3096,8 +3096,10 @@ function _updateMusicMeta(error = "") {
 
 const _VOL_KEY = "playzi-volume";
 const _MUTE_KEY = "playzi-muted";
+const _LOUDNESS_MIN_GAIN = 0.15;
+const _LOUDNESS_MAX_BOOST_GAIN = 2.82; // +9 dB makeup gain cap for quiet tracks (protected by limiter)
 let _suppressVolumeSaveUntil = 0;
-const _videoAudioGraphs = new WeakMap();
+const _mediaAudioGraphs = new WeakMap();
 
 function _markProgrammaticVolumeApply(ms = 150) {
   _suppressVolumeSaveUntil = Math.max(_suppressVolumeSaveUntil, performance.now() + ms);
@@ -3107,6 +3109,12 @@ function _clampVolume(v, fallback = 1) {
   const n = Number(v);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(1, n));
+}
+
+function _clampGain(v, fallback = 1) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(_LOUDNESS_MAX_BOOST_GAIN, n));
 }
 
 // Perceptual quadratic curve so low slider positions match human logarithmic hearing
@@ -3121,22 +3129,32 @@ function _linearToSliderVolume(linearVal) {
   return Math.round(Math.sqrt(g) * 100) / 100;
 }
 
-// YouTube-style loudness normalization (attenuate-only toward -14 LUFS reference).
-// loudnessDb > 0 means the track is mastered louder than -14 LUFS, so we apply 10^(-loudnessDb / 20).
+// Loudness normalization toward -14 LUFS reference.
+// loudnessDb > 0 attenuates loud tracks; loudnessDb < 0 applies capped makeup gain
+// (+9 dB max) when routed through Web Audio GainNode + anti-clipping limiter.
 function _isVolumeNormalizationEnabled() {
   return state.config?.volumeNormalization !== false;
 }
 
 function _setCurrentLoudnessDb(loudnessDb) {
+  if (loudnessDb === null || loudnessDb === undefined || loudnessDb === "") {
+    state.player.currentLoudnessDb = null;
+    return;
+  }
   const db = Number(loudnessDb);
   state.player.currentLoudnessDb = Number.isFinite(db) ? db : null;
 }
 
-function _getLoudnessGainFactor(loudnessDb = state.player.currentLoudnessDb) {
+function _getLoudnessGainFactor(loudnessDb = state.player.currentLoudnessDb, allowBoost = false) {
   if (!_isVolumeNormalizationEnabled()) return 1;
+  if (loudnessDb === null || loudnessDb === undefined || loudnessDb === "") return 1;
   const db = Number(loudnessDb);
-  if (!Number.isFinite(db) || db <= 0) return 1;
-  return Math.max(0.15, Math.min(1, Math.pow(10, -db / 20)));
+  if (!Number.isFinite(db) || db === 0) return 1;
+  if (db > 0) {
+    return Math.max(_LOUDNESS_MIN_GAIN, Math.min(1, Math.pow(10, -db / 20)));
+  }
+  if (!allowBoost) return 1;
+  return Math.max(1, Math.min(_LOUDNESS_MAX_BOOST_GAIN, Math.pow(10, -db / 20)));
 }
 
 function _getVideoMediaEl(player, fallbackEl = null) {
@@ -3151,31 +3169,64 @@ function _getVideoMediaEl(player, fallbackEl = null) {
   return rawEl && rawEl.tagName === "VIDEO" ? rawEl : null;
 }
 
-function _ensureVideoAudioGraph(videoEl) {
-  if (!videoEl || videoEl.tagName !== "VIDEO") return null;
-  if (_videoAudioGraphs.has(videoEl)) return _videoAudioGraphs.get(videoEl);
+function _ensureMediaAudioGraph(mediaEl) {
+  if (!mediaEl || (mediaEl.tagName !== "VIDEO" && mediaEl.tagName !== "AUDIO")) return null;
+  if (_mediaAudioGraphs.has(mediaEl)) return _mediaAudioGraphs.get(mediaEl);
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) return null;
   try {
     const ctx = new AudioCtx();
-    const source = ctx.createMediaElementSource(videoEl);
+    const source = ctx.createMediaElementSource(mediaEl);
     const gain = ctx.createGain();
+    let tail = gain;
+    let limiter = null;
+    if (typeof ctx.createDynamicsCompressor === "function") {
+      limiter = ctx.createDynamicsCompressor();
+      limiter.threshold.value = -1.5;
+      limiter.knee.value = 3;
+      limiter.ratio.value = 12;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.12;
+      gain.connect(limiter);
+      tail = limiter;
+    }
     source.connect(gain);
-    gain.connect(ctx.destination);
-    const graph = { ctx, source, gain };
-    _videoAudioGraphs.set(videoEl, graph);
+    tail.connect(ctx.destination);
+    const graph = { ctx, source, gain, limiter };
+    _mediaAudioGraphs.set(mediaEl, graph);
     return graph;
   } catch (_) {
     return null;
   }
 }
 
-function _resumeVideoAudioGraph(player) {
-  const videoEl = _getVideoMediaEl(player);
-  const graph = videoEl ? _videoAudioGraphs.get(videoEl) : null;
+function _setGraphGain(graph, value) {
+  if (!graph) return;
+  const target = _clampGain(value, 0);
+  try {
+    if (target === 0 || graph.ctx.state !== "running") {
+      graph.gain.gain.setValueAtTime(target, graph.ctx.currentTime);
+    } else {
+      graph.gain.gain.setTargetAtTime(target, graph.ctx.currentTime, 0.015);
+    }
+  } catch (_) {
+    graph.gain.gain.value = target;
+  }
+}
+
+function _resumeMediaAudioGraph(mediaEl) {
+  const graph = mediaEl ? _mediaAudioGraphs.get(mediaEl) : null;
   if (graph && graph.ctx.state === "suspended") {
     graph.ctx.resume().catch(() => {});
   }
+}
+
+function _resumeVideoAudioGraph(player) {
+  _resumeMediaAudioGraph(_getVideoMediaEl(player));
+}
+
+function _resumeMusicAudioGraph() {
+  _resumeMediaAudioGraph(_getAudioEl());
 }
 
 function _getSavedVolumeState() {
@@ -3213,33 +3264,47 @@ function _syncMusicVolumeUi(volume, muted) {
 
 function _applySavedVolumeToMusic() {
   const { volume, muted } = _getSavedVolumeState();
-  const normGain = _getLoudnessGainFactor();
-  const effectiveVol = muted ? 0 : _clampVolume(volume * normGain, 0);
-  _markProgrammaticVolumeApply();
-  if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
-    state.player.audioVjs.muted(muted);
-    state.player.audioVjs.volume(effectiveVol);
-  }
+  const sliderVal = _linearToSliderVolume(volume);
   const audio = _getAudioEl();
-  if (audio) {
-    audio.muted = muted;
-    audio.volume = effectiveVol;
+  const graph = _ensureMediaAudioGraph(audio);
+  const normGain = _getLoudnessGainFactor(undefined, Boolean(graph));
+  _markProgrammaticVolumeApply();
+  if (graph) {
+    _setGraphGain(graph, muted ? 0 : sliderVal * normGain);
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      state.player.audioVjs.muted(muted);
+      state.player.audioVjs.volume(sliderVal);
+    }
+    if (audio) {
+      audio.muted = muted;
+      audio.volume = sliderVal;
+    }
+  } else {
+    const effectiveVol = muted ? 0 : _clampVolume(volume * normGain, 0);
+    if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
+      state.player.audioVjs.muted(muted);
+      state.player.audioVjs.volume(effectiveVol);
+    }
+    if (audio) {
+      audio.muted = muted;
+      audio.volume = effectiveVol;
+    }
   }
   _syncMusicVolumeUi(volume, muted);
 }
 
 function _applySavedVolumeToVideo(player, videoEl = null) {
   const { volume, muted } = _getSavedVolumeState();
-  const normGain = _getLoudnessGainFactor();
   const sliderVal = _linearToSliderVolume(volume);
   const mediaEl = _getVideoMediaEl(player, videoEl);
-  const graph = _ensureVideoAudioGraph(mediaEl);
+  const graph = _ensureMediaAudioGraph(mediaEl);
+  const normGain = _getLoudnessGainFactor(undefined, Boolean(graph));
   _markProgrammaticVolumeApply();
   if (graph) {
     // Keep Video.js slider at the perceptual position s while the GainNode applies
-    // the second factor (s * normGain), giving total amplitude s^2 * normGain
+    // (s * normGain) + DynamicsCompressorNode limiter, giving total amplitude s^2 * normGain
     // — identical to music mode without moving the Video.js volume bar per track.
-    graph.gain.gain.value = muted ? 0 : _clampVolume(sliderVal * normGain, 0);
+    _setGraphGain(graph, muted ? 0 : sliderVal * normGain);
     if (mediaEl) {
       mediaEl.muted = muted;
       mediaEl.volume = sliderVal;
@@ -3325,6 +3390,7 @@ function _setupMusicListeners(sig) {
 
   if (volSlider) {
     volSlider.addEventListener("input", () => {
+      _resumeMusicAudioGraph();
       const s = _clampVolume(parseFloat(volSlider.value), 0);
       const linear = _sliderToLinearVolume(s);
       _saveVolumeState(linear, s === 0);
@@ -3333,6 +3399,7 @@ function _setupMusicListeners(sig) {
   }
   if (volIcon) {
     volIcon.addEventListener("click", () => {
+      _resumeMusicAudioGraph();
       const { volume, muted } = _getSavedVolumeState();
       if (muted || volume === 0) {
         const restoreVol = volume > 0 ? volume : _sliderToLinearVolume(0.7);
@@ -3378,6 +3445,7 @@ function _setupMusicListeners(sig) {
   }, sig);
 
   audio.addEventListener("playing", () => {
+    _resumeMusicAudioGraph();
     _setMusicBuffering(false);
   }, sig);
 
@@ -3386,6 +3454,7 @@ function _setupMusicListeners(sig) {
   }, sig);
 
   audio.addEventListener("play", () => {
+    _resumeMusicAudioGraph();
     const btn = $("#musicPlayPause");
     if (btn) btn.innerHTML = PLAYER_ICONS.pause(23);
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
@@ -4248,7 +4317,11 @@ async function _loadMusicItem(item, loadId, opts = {}) {
           );
         }
       });
+      state.player.audioVjs.on("play", () => {
+        _resumeMusicAudioGraph();
+      });
       state.player.audioVjs.on("playing", () => {
+        _resumeMusicAudioGraph();
         _setMusicBuffering(false);
       });
       state.player.audioVjs.on("canplay", () => {
@@ -4308,6 +4381,10 @@ async function _loadMusicItem(item, loadId, opts = {}) {
     }
     _applySavedVolumeToMusic();
     state.player.audioVjs.play().catch(() => {});
+    _armMusicStallWatchdog(
+      () => state.player.audioVjs?.currentTime() || 0,
+      () => !state.player.audioVjs || state.player.audioVjs.isDisposed() || state.player.audioVjs.paused(),
+    );
   } else {
     let targetAudio = audio;
     if (state.player.audioVjs && !state.player.audioVjs.isDisposed()) {
@@ -4319,6 +4396,7 @@ async function _loadMusicItem(item, loadId, opts = {}) {
         const fresh = document.createElement("audio");
         fresh.id = "webPlayerAudio";
         fresh.autoplay = true;
+        fresh.crossOrigin = "anonymous";
         card.appendChild(fresh);
         if (state.player._listenerAbort) {
           state.player._listenerAbort.abort();
@@ -4355,6 +4433,7 @@ async function _loadMusicItem(item, loadId, opts = {}) {
     targetAudio.load();
     _applySavedVolumeToMusic();
     targetAudio.play().catch(() => {});
+    _armMusicStallWatchdog(() => targetAudio.currentTime, () => targetAudio.paused);
   }
   _updateWatchMeta();
   _updateWatchQueue();
@@ -4368,7 +4447,7 @@ async function _loadMusicItem(item, loadId, opts = {}) {
 const PREFETCH_DEFAULT_COUNT = 1;
 const PREFETCH_DEFAULT_DELAY_SECONDS = 5;
 const PREFETCH_NEW_ITEM_GRACE_MS = 5000;
-const PREFETCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const PREFETCH_CACHE_TTL_MS = 20 * 60 * 1000;
 const PREFETCH_MAX_CONCURRENT = 2;
 const _prefetchedStreamMap = new Map();
 const _queueItemAddedAt = new Map();
@@ -4613,7 +4692,15 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       _setLoadingStage("Cargando video en búfer...");
       _applySavedVolumeToVideo(player);
       player.src({ src: proxiedSrc, type: mimeType });
+      let initBufferTimer = null;
+      const clearInitBufferTimer = () => {
+        if (initBufferTimer) {
+          clearTimeout(initBufferTimer);
+          initBufferTimer = null;
+        }
+      };
       const finishLoad = () => {
+        clearInitBufferTimer();
         if (state.player._loadingId !== loadId) return;
         if (state.player.loading) {
           console.info(
@@ -4623,6 +4710,23 @@ async function _loadVideoItem(item, loadId, opts = {}) {
           _updateWatchMeta();
         }
       };
+      initBufferTimer = setTimeout(() => {
+        initBufferTimer = null;
+        if (state.player._loadingId !== loadId || !state.player.loading || player.isDisposed()) return;
+        const recoverKey = `video|${item.url}|${state.player.activeQuality || "best"}`;
+        if (state.player._autoRecoverKey !== recoverKey) {
+          state.player._autoRecoverKey = recoverKey;
+          toast("Reconectando stream...");
+          loadWebPlayerItem(state.player.index, {
+            forceRefresh: true,
+            isAutoRecovery: true,
+            resumeTime: opts?.resumeTime > 1 ? opts.resumeTime : 0,
+          });
+        } else {
+          _stopLoadingStatus();
+          _updateWatchMeta("El búfer de video tardó demasiado en responder. Pulsa 'Reintentar' o prueba con otra calidad.");
+        }
+      }, 15000);
       player.one("canplay", finishLoad);
       player.one("playing", finishLoad);
       player.one("loadeddata", finishLoad);
@@ -4926,14 +5030,15 @@ async function ensureVideoPlayer() {
   player.on("volumechange", () => {
     if (!volumeReady || performance.now() < _suppressVolumeSaveUntil) return;
     const mediaEl = _getVideoMediaEl(player);
-    const graph = mediaEl ? _videoAudioGraphs.get(mediaEl) : null;
-    const normGain = _getLoudnessGainFactor();
+    const graph = mediaEl ? _mediaAudioGraphs.get(mediaEl) : null;
+    const normGain = _getLoudnessGainFactor(undefined, Boolean(graph));
     const isMuted = player.muted();
     if (graph) {
+      _resumeMediaAudioGraph(mediaEl);
       const s = _clampVolume(player.volume(), 0);
       const linear = _sliderToLinearVolume(s);
       _saveVolumeState(linear, isMuted || s === 0);
-      graph.gain.gain.value = (isMuted || s === 0) ? 0 : _clampVolume(s * normGain, 0);
+      _setGraphGain(graph, (isMuted || s === 0) ? 0 : s * normGain);
     } else {
       const rawVol = _clampVolume(player.volume(), 0);
       const unnormalized = normGain > 0 ? _clampVolume(rawVol / normGain, 1) : rawVol;

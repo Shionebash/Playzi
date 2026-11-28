@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use url::Url;
 use uuid::Uuid;
 
@@ -17,11 +17,13 @@ use crate::error::{CoreError, Result};
 use crate::history::add_history_event;
 use crate::state::StateStore;
 use crate::youtube::{extract_video_id, format_duration, is_youtube_url};
+use crate::yt_worker::YtWorkerClient;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
-const DEFAULT_STREAM_CACHE_TTL_SECS: u64 = 600;
+const DEFAULT_STREAM_CACHE_TTL_SECS: u64 = 1800;
 const STREAM_URL_FALLBACK_TTL_SECS: u64 = 3 * 3600;
 const STREAM_UPGRADE_COOLDOWN_SECS: u64 = 15;
+const BG_UPGRADE_MAX_CONCURRENT: usize = 2;
 const BOT_CHECK_COOLDOWN_SECS: u64 = 180;
 const EXPIRE_SAFETY_MARGIN_SECS: i64 = 60;
 #[cfg(windows)]
@@ -227,18 +229,18 @@ pub enum PlayerControlCommand {
 }
 
 #[derive(Clone)]
-struct CachedRawVideo {
-    item: Value,
-    duration: f64,
-    formats: Vec<StreamFormat>,
-    direct_url: Option<String>,
-    loudness_db: Option<f64>,
-    expires_at: Option<i64>,
-    cached_at: Instant,
+pub(crate) struct CachedRawVideo {
+    pub(crate) item: Value,
+    pub(crate) duration: f64,
+    pub(crate) formats: Vec<StreamFormat>,
+    pub(crate) direct_url: Option<String>,
+    pub(crate) loudness_db: Option<f64>,
+    pub(crate) expires_at: Option<i64>,
+    pub(crate) cached_at: Instant,
 }
 
 impl CachedRawVideo {
-    fn project(&self, quality: &str, audio_only: bool) -> ResolvedStreamInfo {
+    pub(crate) fn project(&self, quality: &str, audio_only: bool) -> ResolvedStreamInfo {
         let max_h = quality_to_height(quality);
         let selected_hls_audio = select_best_hls_audio(&self.formats);
         let selected_audio = select_best_audio(&self.formats);
@@ -360,10 +362,12 @@ pub struct PlayerManager {
     in_flight: Arc<Mutex<InFlightMap>>,
     stream_urls: Arc<Mutex<HashMap<(String, String), UpstreamStreamEntry>>>,
     upgrade_in_flight: Arc<Mutex<UpgradeInFlightMap>>,
+    bg_upgrade_sem: Arc<Semaphore>,
     bot_check_until: Arc<Mutex<Option<Instant>>>,
     loudness_cache: Arc<Mutex<HashMap<String, Option<f64>>>>,
     loudness_client: reqwest::Client,
     innertube_client: reqwest::Client,
+    yt_worker: YtWorkerClient,
     playback: Arc<Mutex<PlaybackState>>,
     session: Arc<Mutex<ManagedSession>>,
     events: broadcast::Sender<PlayerEvent>,
@@ -384,6 +388,7 @@ impl PlayerManager {
             .tcp_nodelay(true)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let yt_worker = YtWorkerClient::new(config.clone());
         Self {
             state_store,
             config,
@@ -392,10 +397,12 @@ impl PlayerManager {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             stream_urls: Arc::new(Mutex::new(HashMap::new())),
             upgrade_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            bg_upgrade_sem: Arc::new(Semaphore::new(BG_UPGRADE_MAX_CONCURRENT)),
             bot_check_until: Arc::new(Mutex::new(None)),
             loudness_cache: Arc::new(Mutex::new(HashMap::new())),
             loudness_client,
             innertube_client,
+            yt_worker,
             playback: Arc::new(Mutex::new(PlaybackState::default())),
             session: Arc::new(Mutex::new(ManagedSession {
                 child: None,
@@ -708,6 +715,12 @@ impl PlayerManager {
         Ok(updated)
     }
 
+    /// Gracefully stops any managed external player and the persistent yt-worker process.
+    pub async fn shutdown(&self) {
+        let _ = self.stop();
+        self.yt_worker.shutdown().await;
+    }
+
     /// Sends a control command to the active `mpv` JSON IPC server and updates local state.
     pub fn control(&self, cmd: PlayerControlCommand) -> Result<PlaybackState> {
         if matches!(cmd, PlayerControlCommand::Stop) {
@@ -920,6 +933,45 @@ impl PlayerManager {
             }
         }
 
+        // Tier 2 fast path: persistent MIT YouTube.js + BgUtils Node worker (~0.5-2s warm
+        // even under IP bot-check with cookies). Registers DASH formats immediately via
+        // /yt-stream?v=<vid>&itag=<itag> and upgrades tail URLs in background before 60s cutoff.
+        if !force_refresh && is_youtube_url(url) {
+            if let Some(vid) = extract_video_id(url) {
+                let cookie_file = self.resolve_cookie_file();
+                if let Ok(mut worker_raw) = self
+                    .yt_worker
+                    .resolve_video(&vid, url, cookie_file.as_deref())
+                    .await
+                {
+                    if worker_raw.loudness_db.is_none() {
+                        if let Ok(lcache) = self.loudness_cache.lock() {
+                            if let Some(Some(db)) = lcache.get(&vid) {
+                                worker_raw.loudness_db = Some(*db);
+                            }
+                        }
+                    }
+                    self.register_stream_urls(&vid, &worker_raw.formats, false);
+                    let audio_probe =
+                        select_best_audio(&worker_raw.formats).map(|a| (a.url, a.content_length));
+                    let video_probe = worker_raw
+                        .formats
+                        .iter()
+                        .filter(|f| !f.vcodec.is_empty() && f.vcodec != "none" && is_dash_format(f))
+                        .max_by_key(|f| (f.height.unwrap_or(0), f.tbr.unwrap_or(0.0) as u64))
+                        .map(|v| (v.url.clone(), v.content_length));
+                    self.spawn_ios_tail_verify_and_upgrade(
+                        vid.clone(),
+                        url.to_string(),
+                        audio_probe,
+                        video_probe,
+                    );
+                    self.put_cached_raw(cache_key.to_string(), worker_raw.clone());
+                    return Ok(worker_raw);
+                }
+            }
+        }
+
         let cached_loudness = extract_video_id(url).and_then(|vid| {
             self.loudness_cache
                 .lock()
@@ -951,6 +1003,16 @@ impl PlayerManager {
         video_id: &str,
         original_url: &str,
     ) -> Result<CachedRawVideo> {
+        let yt_hl = std::env::var("PLAYZI_YT_LANG")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "es".to_string());
+        let yt_gl = std::env::var("PLAYZI_YT_REGION")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "EC".to_string());
         let body = json!({
             "videoId": video_id,
             "context": {
@@ -961,8 +1023,8 @@ impl PlayerManager {
                     "deviceModel": "iPhone16,2",
                     "osName": "iPhone",
                     "osVersion": "18.3.2.22D82",
-                    "hl": "es",
-                    "gl": "EC",
+                    "hl": yt_hl,
+                    "gl": yt_gl,
                 }
             },
             "contentCheckOk": true,
@@ -1043,6 +1105,7 @@ impl PlayerManager {
             if audio_ok && video_ok {
                 mgr.mark_stream_urls_verified(&video_id);
             } else {
+                let _permit = mgr.bg_upgrade_sem.clone().acquire_owned().await.ok();
                 let _ = mgr.ensure_yt_stream_upgraded(&video_id, &original_url).await;
             }
         });
@@ -1121,7 +1184,13 @@ impl PlayerManager {
         if map.len() >= 1024 {
             map.retain(|_, v| !v.is_expired());
             if map.len() >= 1024 {
-                map.clear();
+                let mut entries: Vec<((String, String), Instant)> =
+                    map.iter().map(|(k, v)| (k.clone(), v.updated_at)).collect();
+                entries.sort_by_key(|(_, ts)| *ts);
+                let remove_count = entries.len().saturating_sub(768);
+                for (k, _) in entries.into_iter().take(remove_count) {
+                    map.remove(&k);
+                }
             }
         }
         for fmt in formats {
@@ -1170,10 +1239,15 @@ impl PlayerManager {
 
     async fn probe_innertube_stream_tail(&self, url: &str, content_length: Option<u64>) -> bool {
         let range = compute_ios_tail_probe_range(content_length);
+        let ua = if url.contains("c=IOS") {
+            IOS_INNERTUBE_USER_AGENT
+        } else {
+            DEFAULT_USER_AGENT
+        };
         let resp = self
             .innertube_client
             .get(url)
-            .header("User-Agent", IOS_INNERTUBE_USER_AGENT)
+            .header("User-Agent", ua)
             .header("Range", range)
             .timeout(Duration::from_secs(5))
             .send()
@@ -1366,7 +1440,13 @@ impl PlayerManager {
     fn put_cached_raw(&self, key: String, entry: CachedRawVideo) {
         let mut cache = self.raw_cache.lock().expect("raw_cache lock");
         if cache.len() >= 128 {
-            cache.clear();
+            let mut entries: Vec<(String, Instant)> =
+                cache.iter().map(|(k, v)| (k.clone(), v.cached_at)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let remove_count = entries.len().saturating_sub(96);
+            for (k, _) in entries.into_iter().take(remove_count) {
+                cache.remove(&k);
+            }
         }
         cache.insert(key, entry);
     }
@@ -2243,11 +2323,16 @@ fn parse_innertube_player_json(
         .map(str::to_string)
         .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
 
-    let loudness_db = data
-        .get("playerConfig")
-        .and_then(|p| p.get("audioConfig"))
-        .and_then(|a| a.get("loudnessDb"))
+    let audio_config = data.get("playerConfig").and_then(|p| p.get("audioConfig"));
+    let loudness_db = audio_config
+        .and_then(|a| a.get("perceptualLoudnessDb"))
         .and_then(Value::as_f64)
+        .map(|p| p + 14.0)
+        .or_else(|| {
+            audio_config
+                .and_then(|a| a.get("loudnessDb"))
+                .and_then(Value::as_f64)
+        })
         .filter(|v| v.is_finite() && (-60.0..=30.0).contains(v));
 
     let expires_at = formats
@@ -2522,7 +2607,7 @@ fn is_isobmff_container(f: &StreamFormat) -> bool {
     matches!(f.ext.to_ascii_lowercase().as_str(), "mp4" | "m4a")
 }
 
-fn is_dash_format(f: &StreamFormat) -> bool {
+pub(crate) fn is_dash_format(f: &StreamFormat) -> bool {
     // Video.js VHS requires ISOBMFF sidx boxes for SegmentBase DASH manifests;
     // WebM uses EBML Cues which fails with MEDIA_ERR_SRC_NOT_SUPPORTED.
     !is_hls_url(&f.url)
@@ -4501,6 +4586,37 @@ mod tests {
         .expect("should parse valid InnerTube IOS payload");
         assert_eq!(raw.loudness_db, Some(-1.25));
         assert_eq!(raw.expires_at, Some(1899999999));
+
+        // InnerTube IOS omits loudnessDb and sends perceptualLoudnessDb (absolute LUFS).
+        let mut ios_perceptual_payload = payload.clone();
+        ios_perceptual_payload["playerConfig"]["audioConfig"] = json!({
+            "perceptualLoudnessDb": -8.29
+        });
+        let raw_ios = parse_innertube_player_json(
+            &ios_perceptual_payload,
+            "LXb3EKWsInQ",
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        )
+        .expect("should parse InnerTube IOS perceptualLoudnessDb");
+        assert!(
+            (raw_ios.loudness_db.expect("should derive loudnessDb") - 5.71).abs() < 1e-6
+        );
+
+        // When both are present, perceptualLoudnessDb + 14.0 takes precedence over client-shifted loudnessDb.
+        let mut shifted_payload = payload.clone();
+        shifted_payload["playerConfig"]["audioConfig"] = json!({
+            "loudnessDb": -1.29,
+            "perceptualLoudnessDb": -8.29
+        });
+        let raw_shifted = parse_innertube_player_json(
+            &shifted_payload,
+            "LXb3EKWsInQ",
+            "https://www.youtube.com/watch?v=LXb3EKWsInQ",
+        )
+        .expect("should prefer perceptualLoudnessDb");
+        assert!(
+            (raw_shifted.loudness_db.expect("should derive loudnessDb") - 5.71).abs() < 1e-6
+        );
 
         // Same CachedRawVideo projects ISOBMFF MP4/M4A qualities (never WebM) without re-fetching.
         let best = raw.project("best", false);

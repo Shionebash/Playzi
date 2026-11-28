@@ -1,0 +1,14 @@
+{
+  "name": "playzi-yt-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Persistent MIT YouTube.js + BgUtils stream resolver worker for Playzi",
+  "main": "worker.mjs",
+  "dependencies": {
+    "bgutils-js": "^4.0.3",
+    "jsdom": "^26.0.0",
+    "youtubei.js": "^18.3.0"
+  }
+}

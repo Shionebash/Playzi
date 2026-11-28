@@ -1074,22 +1074,31 @@ pub fn candidates_for_config(cookies_browser: &str) -> Vec<BrowserCandidate> {
 
 /// Opens `url` in the operating system's default web browser.
 pub fn open_url_in_default_browser(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|_| CoreError::Validation("URL inválida para abrir en el navegador".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(CoreError::Validation(
+            "Solo se permiten enlaces http/https para abrir en el navegador".into(),
+        ));
+    }
+    let safe_url = parsed.as_str();
     #[cfg(windows)]
     {
         let mut cmd = std::process::Command::new("rundll32.exe");
-        cmd.args(["url.dll,FileProtocolHandler", url]);
+        cmd.args(["url.dll,FileProtocolHandler", safe_url]);
         hide_window_std(&mut cmd);
         cmd.spawn()?;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn()?;
+        std::process::Command::new("open").arg(safe_url).spawn()?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        std::process::Command::new("xdg-open").arg(safe_url).spawn()?;
         return Ok(());
     }
 }

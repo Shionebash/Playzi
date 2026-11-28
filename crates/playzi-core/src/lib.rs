@@ -14,6 +14,7 @@ pub mod state;
 pub mod thumbs;
 pub mod updater;
 pub mod youtube;
+mod yt_worker;
 pub mod ytmusic;
 
 #[cfg(test)]
