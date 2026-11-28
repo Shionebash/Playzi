@@ -4411,6 +4411,7 @@ async function _loadVideoItem(item, loadId, opts = {}) {
       const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
       const hlsAudioUrl = info.hlsAudio?.url || "";
       const isDashPair = !isHls && !videoHasAudio
+        && info.video?.ext !== "webm" && info.audio?.ext !== "webm"
         && Boolean(info.video?.initRange && info.video?.indexRange && info.audio?.initRange && info.audio?.indexRange);
       const proxiedSrc = isDashPair
         ? streamDashProxyUrl(item.url, rawQuality)
@@ -4538,8 +4539,7 @@ async function ensureVideoPlayer() {
     if (
       IS_TAURI &&
       curUrl &&
-      !state.player.loading &&
-      (isVhsPlaylistErr || err?.code === 2 || err?.code === 3) &&
+      (isVhsPlaylistErr || err?.code === 2 || err?.code === 3 || err?.code === 4) &&
       state.player._autoRecoverKey !== recoverKey
     ) {
       state.player._autoRecoverKey = recoverKey;
@@ -4786,6 +4786,7 @@ function _registerQualityMenu(player) {
           const videoHasAudio = Boolean(info.video?.acodec && info.video.acodec !== "none");
           const hlsAudioUrl = info.hlsAudio?.url || "";
           const isDashPair = !isHls && !videoHasAudio
+            && info.video?.ext !== "webm" && info.audio?.ext !== "webm"
             && Boolean(info.video?.initRange && info.video?.indexRange && info.audio?.initRange && info.audio?.indexRange);
           const proxiedSrc = isDashPair
             ? streamDashProxyUrl(url, selectedQ)

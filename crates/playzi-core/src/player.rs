@@ -2186,8 +2186,24 @@ fn select_best_hls_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
         .cloned()
 }
 
+fn is_isobmff_container(f: &StreamFormat) -> bool {
+    if let Some(mt) = f.mime_type.as_deref() {
+        let mt_lc = mt.to_ascii_lowercase();
+        if mt_lc.starts_with("video/mp4") || mt_lc.starts_with("audio/mp4") {
+            return true;
+        }
+        if mt_lc.starts_with("video/webm") || mt_lc.starts_with("audio/webm") {
+            return false;
+        }
+    }
+    matches!(f.ext.to_ascii_lowercase().as_str(), "mp4" | "m4a")
+}
+
 fn is_dash_format(f: &StreamFormat) -> bool {
+    // Video.js VHS requires ISOBMFF sidx boxes for SegmentBase DASH manifests;
+    // WebM uses EBML Cues which fails with MEDIA_ERR_SRC_NOT_SUPPORTED.
     !is_hls_url(&f.url)
+        && is_isobmff_container(f)
         && f.init_range.as_deref().is_some_and(|s| !s.is_empty())
         && f.index_range.as_deref().is_some_and(|s| !s.is_empty())
 }
@@ -2365,7 +2381,20 @@ fn select_best_audio(formats: &[StreamFormat]) -> Option<StreamFormat> {
         .copied()
         .filter(|f| !is_drc_format(f))
         .collect();
-    let final_pool = if !non_drc.is_empty() { non_drc } else { pool };
+    let non_drc_pool = if !non_drc.is_empty() { non_drc } else { pool };
+
+    // Prefer ISOBMFF DASH audio (audio/mp4 / m4a with init+index ranges) over WebM/Opus
+    // so DASH MPD manifests always pair ISOBMFF video + ISOBMFF audio for Video.js VHS.
+    let dash_mp4: Vec<&StreamFormat> = non_drc_pool
+        .iter()
+        .copied()
+        .filter(|f| is_dash_format(f))
+        .collect();
+    let final_pool = if !dash_mp4.is_empty() {
+        dash_mp4
+    } else {
+        non_drc_pool
+    };
 
     final_pool
         .into_iter()
@@ -2421,6 +2450,11 @@ pub fn build_dash_mpd_manifest(
     audio: &StreamFormat,
     proxy_prefix: &str,
 ) -> Result<String> {
+    if !is_isobmff_container(video) || !is_isobmff_container(audio) {
+        return Err(CoreError::External(
+            "DASH manifest requires ISOBMFF (mp4/m4a) video and audio streams".into(),
+        ));
+    }
     let v_init = video
         .init_range
         .as_deref()
@@ -3916,6 +3950,28 @@ mod tests {
             "streamingData": {
                 "adaptiveFormats": [
                     {
+                        "itag": 313,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=313&c=IOS",
+                        "mimeType": "video/webm; codecs=\"vp09.00.50.08\"",
+                        "bitrate": 13500000,
+                        "width": 3840,
+                        "height": 2160,
+                        "fps": 30,
+                        "initRange": { "start": "0", "end": "220" },
+                        "indexRange": { "start": "221", "end": "893" }
+                    },
+                    {
+                        "itag": 401,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=401&c=IOS",
+                        "mimeType": "video/mp4; codecs=\"av01.0.12M.08\"",
+                        "bitrate": 9024958,
+                        "width": 3840,
+                        "height": 2160,
+                        "fps": 30,
+                        "initRange": { "start": "0", "end": "700" },
+                        "indexRange": { "start": "701", "end": "1188" }
+                    },
+                    {
                         "itag": 137,
                         "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=137&c=IOS",
                         "mimeType": "video/mp4; codecs=\"avc1.640028\"",
@@ -3936,6 +3992,16 @@ mod tests {
                         "fps": 30,
                         "initRange": { "start": "0", "end": "738" },
                         "indexRange": { "start": "739", "end": "1420" }
+                    },
+                    {
+                        "itag": 251,
+                        "url": "https://rr1.googlevideo.com/videoplayback?expire=1899999999&itag=251&c=IOS",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "bitrate": 160000,
+                        "audioSampleRate": "48000",
+                        "audioChannels": 2,
+                        "initRange": { "start": "0", "end": "258" },
+                        "indexRange": { "start": "259", "end": "629" }
                     },
                     {
                         "itag": 140,
@@ -3960,11 +4026,15 @@ mod tests {
         assert_eq!(raw.loudness_db, Some(-1.25));
         assert_eq!(raw.expires_at, Some(1899999999));
 
-        // Same CachedRawVideo projects 1080p, 720p, and audio-only without re-fetching.
+        // Same CachedRawVideo projects ISOBMFF MP4/M4A qualities (never WebM) without re-fetching.
         let best = raw.project("best", false);
-        assert_eq!(best.available_qualities, vec!["1080p", "720p"]);
-        assert_eq!(best.video.as_ref().and_then(|v| v.height), Some(1080));
+        assert_eq!(best.available_qualities, vec!["2160p", "1080p", "720p"]);
+        assert_eq!(best.video.as_ref().map(|v| v.format_id.as_str()), Some("401"));
         assert_eq!(best.audio.as_ref().map(|a| a.format_id.as_str()), Some("140"));
+
+        let q1080 = raw.project("1080p", false);
+        assert_eq!(q1080.video.as_ref().map(|v| v.format_id.as_str()), Some("137"));
+        assert_eq!(q1080.audio.as_ref().map(|a| a.format_id.as_str()), Some("140"));
 
         let q720 = raw.project("720p", false);
         assert_eq!(q720.video.as_ref().and_then(|v| v.height), Some(720));
@@ -3974,13 +4044,15 @@ mod tests {
         assert_eq!(audio.audio.as_ref().map(|a| a.format_id.as_str()), Some("140"));
 
         let mpd = build_dash_mpd_manifest(
-            best.duration,
-            best.video.as_ref().unwrap(),
-            best.audio.as_ref().unwrap(),
+            q1080.duration,
+            q1080.video.as_ref().unwrap(),
+            q1080.audio.as_ref().unwrap(),
             "http://playzi-stream.localhost/",
         )
         .expect("should build valid DASH MPD");
         assert!(mpd.contains("mediaPresentationDuration=\"PT314.000S\""));
+        assert!(mpd.contains("mimeType=\"video/mp4\""));
+        assert!(mpd.contains("mimeType=\"audio/mp4\""));
         assert!(mpd.contains("codecs=\"avc1.640028\""));
         assert!(mpd.contains("codecs=\"mp4a.40.2\""));
         assert!(mpd.contains("indexRange=\"741-1480\""));
